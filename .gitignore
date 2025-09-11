@@ -258,5 +258,8 @@ figs/*
 *.log
 *.out
 *.err
+# macOS system files
+*.DS_Store
+
 
 
