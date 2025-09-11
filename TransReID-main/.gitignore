@@ -221,41 +221,42 @@ ENV/
 .ropeproject
 
 # ==========================================
-# Project-specific ignores (Deep Learning / ML)
+# Project-specific ignores (keep folder structure)
 # ==========================================
 
-# Datasets and pretrained models
-data/
-datasets/
-pretrained/
+# Datasets (keep folder, ignore large files)
+datasets/*
+!datasets/.gitkeep
+!datasets/README.md
 
-# Training logs and checkpoints
-logs/
-*.log
-*.out
-*.err
+# Pretrained models
+pretrained/*
+!pretrained/.gitkeep
+!pretrained/README.md
 
-# Training outputs
-outputs/
-runs/
-cache/
-.tmp/
+# Logs and checkpoints
+logs/*
+!logs/.gitkeep
+!logs/README.md
 
-# Figures and visualization results
-figs/
-*.png
-*.jpg
-*.jpeg
-*.svg
+# Figures (visualization results)
+figs/*
+!figs/.gitkeep
+!figs/README.md
 
-# Archives
+# Common large file extensions
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.npz
+*.h5
 *.zip
 *.tar
 *.tar.gz
 *.7z
+*.log
+*.out
+*.err
 
-# ==========================================
-# Modified by: Hang Zhang (hzha0521)
-# Date: 2025-09-10
-# Added project-specific large file ignore rules
-# ==========================================
+
