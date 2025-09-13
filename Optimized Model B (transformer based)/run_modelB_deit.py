@@ -20,7 +20,7 @@ within the TransReID framework and trained/evaluated on the VeRi-776 dataset.
 [2025-09-13 | Hang Zhang] Changed default --config to b0 baseline and auto-derived tag from config when --tag is not provided.
 [2025-09-13 | Hang Zhang] Append `_deit` suffix to output directories for clarity.
 [2025-09-14 | Hang Zhang] Changed default epochs to 30 for quicker experiments.
-[2025-09-14 | Hang Zhang] Auto-save logs/checkpoints to Google Drive if running GitHub repo and Drive is mounted.
+[2025-09-14 | Hang Zhang] Added dataset/pretrained path fallback (relative → Google Drive).
 """
 
 import argparse
