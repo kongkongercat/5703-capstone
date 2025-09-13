@@ -21,6 +21,7 @@ within the TransReID framework and trained/evaluated on the VeRi-776 dataset.
 [2025-09-13 | Hang Zhang] Append `_deit` suffix to output directories for clarity.
 [2025-09-14 | Hang Zhang] Changed default epochs to 30 for quicker experiments.
 [2025-09-14 | Hang Zhang] Added dataset/pretrained path fallback (relative → Google Drive).
+[2025-09-14 | Hang Zhang] Finalize dataset fallback: default ./datasets; if missing, use Drive datasets/VeRi.
 """
 
 import argparse
@@ -106,21 +107,28 @@ def drive_mounted() -> bool:
 def main():
     parser = argparse.ArgumentParser(description="TransReID VeRi-776 launcher (Model B - DeiT backbone).")
 
+    # Core training controls
     parser.add_argument("--epochs", type=int, default=30, help="Training epochs for THIS run (default: 30).")
     parser.add_argument("--target-global", dest="target_global", type=int, default=None,
                         help="Global target epoch index; e.g., 20 means you want transformer_1..20 in total.")
     parser.add_argument("--batch", type=int, default=64, help="Batch size (default: 64)")
-    parser.add_argument("--num-workers", type=int, default=None, help="Dataloader workers (default: 8 if cuda/mps else 0)")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="Dataloader workers (default: 8 if cuda/mps else 0)")
+
+    # Config & paths
     parser.add_argument("--config", type=str,
                         default="configs/VeRi/deit_transreid_stride_b0_baseline.yml",
                         help="DeiT config (default: b0 baseline).")
-    parser.add_argument("--data-root", type=str, default="./data", help="Dataset root containing VeRi/")
+    parser.add_argument("--data-root", type=str, default="./datasets",
+                        help="Dataset root containing VeRi/ (default: ./datasets)")
     parser.add_argument("--pretrained", type=str, default="pretrained/deit_base_distilled_patch16_224-df68dfff.pth",
-                        help="DeiT ImageNet weight")
+                        help="DeiT ImageNet weight (no fallback by design)")
     parser.add_argument("--device", type=str, default=None, choices=["cuda", "mps", "cpu"],
                         help="Force device; if omitted, auto-detect")
     parser.add_argument("--require-viewpoint", action="store_true", help="Check datasets/keypoint_*.txt exist")
     parser.add_argument("--python", type=str, default=sys.executable, help="Python executable for train/test")
+
+    # Eval & run control
     parser.add_argument("--skip-train", action="store_true", help="Skip training and only evaluate")
     parser.add_argument("--start-epoch", type=int, default=1, help="Eval from this epoch (default: 1)")
     parser.add_argument("--only-epoch", type=int, default=None,
@@ -128,22 +136,36 @@ def main():
     parser.add_argument("--tag", type=str, default=None,
                         help="Short tag for log folders (e.g., b0 / b1 / b2 / b3_pre / b3_fine). "
                              "If omitted, a tag is derived from the config basename.")
+
     args = parser.parse_args()
 
+    # Device & worker setup
     device = args.device or detect_device()
     workers = args.num_workers if args.num_workers is not None else (8 if device in ("cuda", "mps") else 0)
 
+    # Resolve paths
     cfg = Path(args.config).resolve()
-    data_root = Path(args.data_root).resolve()
     pretrained = Path(args.pretrained).resolve()
 
+    # --- New: dataset root with fallback (local → Google Drive) ---
+    # Default expects: ./datasets/VeRi/{image_train,image_query,image_test}
+    data_root = Path(args.data_root).resolve()
+    if not (data_root / "VeRi").exists():
+        drive_data = Path("/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/datasets/VeRi")
+        if drive_data.exists():
+            data_root = drive_data.parent
+            print(f"[info] Local dataset not found → using Google Drive dataset at: {data_root}")
+        else:
+            print(f"[warn] VeRi dataset not found at {data_root} or Google Drive; will fail in sanity_checks.")
+
+    # Tag derivation from config
     if args.tag is None or not args.tag.strip():
         stem = cfg.stem
         tag = stem[len("deit_transreid_stride_"):] if stem.startswith("deit_transreid_stride_") else stem
     else:
         tag = args.tag.strip()
 
-    # --- New: Decide log root (Drive vs local) ---
+    # Decide log root (Drive vs local)
     cwd = Path.cwd().resolve()
     drive_root = Path("/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)")
     if is_github_repo(cwd) and drive_mounted():
@@ -161,6 +183,7 @@ def main():
     out_test.mkdir(parents=True, exist_ok=True)
     Path("pretrained").mkdir(parents=True, exist_ok=True)
 
+    # Pre-flight checks (will stop with actionable error messages)
     sanity_checks(cfg, data_root, pretrained, args.require_viewpoint)
 
     latest_ckpt = find_latest_ckpt(out_run)
@@ -172,6 +195,7 @@ def main():
         if m:
             prev_max = max(prev_max, int(m.group(1)))
 
+    # Target-global logic: make new epochs count relative to previous
     if args.target_global is not None:
         if prev_max >= args.target_global:
             print(f"[info] Already reached target-global {args.target_global}, nothing to do.")
@@ -180,17 +204,22 @@ def main():
 
     start_ts = time.time()
 
-    print(f"Using device: {device} (num_workers={workers})")
-    print(f"Epochs: {args.epochs} | Batch: {args.batch}")
-    print(f"Config: {cfg}")
-    print(f"Tag: {tag}")
-    print(f"Data root: {data_root}")
+    # ----- Start banner -----
+    print("========== Run Settings (DeiT / TransReID / VeRi-776) ==========")
+    print(f"Using device      : {device} (num_workers={workers})")
+    print(f"Epochs (this run) : {args.epochs} | Batch: {args.batch}")
+    print(f"Config            : {cfg}")
+    print(f"Tag               : {tag}")
+    print(f"Data root (final) : {data_root}  (expects VeRi/*)")
+    print(f"Logs / checkpoints: {out_run}")
+    print(f"Eval outputs      : {out_test}")
     if is_resume:
-        print(f"Resume training from: {latest_ckpt}")
+        print(f"Resume from       : {latest_ckpt}")
     else:
         if not pretrained.exists():
             raise SystemExit(f"ERROR: Pretrained weight not found: {pretrained}")
-        print(f"Pretrained: {pretrained}")
+        print(f"Pretrained weight : {pretrained}")
+    print("===============================================================")
 
     py = shutil.which(args.python) or args.python
 
@@ -219,10 +248,12 @@ def main():
         print(">> Skipping training (--skip-train).")
 
     # ------------------- Post-rename -------------------
+    # Make checkpoint numbering continuous across multiple incremental runs
     try:
         new_count = 0
         for e in range(1, args.epochs + 1):
             src = out_run / f"transformer_{e}.pth"
+            # Only rename files created/modified after this run started
             if src.exists() and os.path.getmtime(src) >= start_ts - 1:
                 dst = out_run / f"transformer_{prev_max + e}.pth"
                 if not dst.exists():
