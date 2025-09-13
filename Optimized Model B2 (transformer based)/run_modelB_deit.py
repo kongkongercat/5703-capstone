@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TransReID - VeRi-776 launcher (DeiT only)
+TransReID - VeRi-776 launcher (Model B experiments, DeiT backbone)
+
+This launcher is dedicated to Model B experiments, which are based on the DeiT backbone
+within the TransReID framework and trained/evaluated on the VeRi-776 dataset.
 
 - Auto-detect device (cuda > mps > cpu)
 - Auto-resume from latest checkpoint in OUTPUT_DIR
@@ -13,6 +16,10 @@ TransReID - VeRi-776 launcher (DeiT only)
 [2025-08-30 | Hang Zhang] Updated CLI help; added --target-global.
 [2025-08-30 | Hang Zhang] Fixed argparse mapping: use args.target_global.
 [2025-08-30 | Hang Zhang] Ensure training/rename/eval blocks always run.
+[2025-09-13 | Hang Zhang] Added --tag argument to isolate output dirs for different experiments.
+[2025-09-13 | Hang Zhang] Changed default --config to b0 baseline and auto-derived tag from config when --tag is not provided.
+[2025-09-13 | Hang Zhang] Append `_deit` suffix to output directories for clarity.
+[2025-09-14 | Hang Zhang] Changed default epochs to 30 for quicker experiments.
 """
 
 import argparse
@@ -80,25 +87,39 @@ def find_latest_ckpt(run_dir: Path) -> Path | None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TransReID VeRi-776 launcher (DeiT only).")
+    parser = argparse.ArgumentParser(description="TransReID VeRi-776 launcher (Model B - DeiT backbone).")
 
-    # [2025-08-30 | Hang Zhang] Clarify CLI help and fix argparse mapping.
-    parser.add_argument("--epochs", type=int, default=10,
-                        help="Training epochs for THIS run (not global total).")
+    # [2025-09-14 | Hang Zhang] Changed default epochs to 30.
+    parser.add_argument("--epochs", type=int, default=30,
+                        help="Training epochs for THIS run (default: 30).")
     parser.add_argument("--target-global", dest="target_global", type=int, default=None,
                         help="Global target epoch index; e.g., 20 means you want transformer_1..20 in total.")
 
     parser.add_argument("--batch", type=int, default=64, help="Batch size (default: 64)")
     parser.add_argument("--num-workers", type=int, default=None, help="Dataloader workers (default: 8 if cuda/mps else 0)")
+
+    # [2025-09-13 | Hang Zhang] Default to b0 baseline to reduce CLI typing.
+    parser.add_argument("--config", type=str,
+                        default="configs/VeRi/deit_transreid_stride_b0_baseline.yml",
+                        help="DeiT config (default: b0 baseline).")
+
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset root containing VeRi/")
-    parser.add_argument("--config", type=str, default="configs/VeRi/deit_transreid_stride.yml", help="DeiT config")
-    parser.add_argument("--pretrained", type=str, default="pretrained/deit_base_distilled_patch16_224-df68dfff.pth", help="DeiT ImageNet weight")
-    parser.add_argument("--device", type=str, default=None, choices=["cuda", "mps", "cpu"], help="Force device; if omitted, auto-detect")
+    parser.add_argument("--pretrained", type=str, default="pretrained/deit_base_distilled_patch16_224-df68dfff.pth",
+                        help="DeiT ImageNet weight")
+    parser.add_argument("--device", type=str, default=None, choices=["cuda", "mps", "cpu"],
+                        help="Force device; if omitted, auto-detect")
     parser.add_argument("--require-viewpoint", action="store_true", help="Check datasets/keypoint_*.txt exist")
     parser.add_argument("--python", type=str, default=sys.executable, help="Python executable for train/test")
     parser.add_argument("--skip-train", action="store_true", help="Skip training and only evaluate")
     parser.add_argument("--start-epoch", type=int, default=1, help="Eval from this epoch (default: 1)")
-    parser.add_argument("--only-epoch", type=int, default=None, help="If set, only evaluate this epoch (e.g., 120). Overrides start-epoch/epochs.")
+    parser.add_argument("--only-epoch", type=int, default=None,
+                        help="If set, only evaluate this epoch (e.g., 120). Overrides start-epoch/epochs.")
+
+    # [2025-09-13 | Hang Zhang] Added --tag argument to isolate output dirs; if omitted, derive from config filename.
+    parser.add_argument("--tag", type=str, default=None,
+                        help="Short tag for log folders (e.g., b0 / b1 / b2 / b3_pre / b3_fine). "
+                             "If omitted, a tag is derived from the config basename.")
+
     args = parser.parse_args()
 
     device = args.device or detect_device()
@@ -108,8 +129,19 @@ def main():
     data_root = Path(args.data_root).resolve()
     pretrained = Path(args.pretrained).resolve()
 
-    out_run = Path("logs/veri776_deit_run").resolve()
-    out_test = Path("logs/veri776_deit_test").resolve()
+    # [2025-09-13 | Hang Zhang] Auto-derive tag from config basename when --tag is not provided.
+    if args.tag is None or not args.tag.strip():
+        stem = cfg.stem  # e.g., "deit_transreid_stride_b0_baseline"
+        if stem.startswith("deit_transreid_stride_"):
+            tag = stem[len("deit_transreid_stride_"):]
+        else:
+            tag = stem
+    else:
+        tag = args.tag.strip()
+
+    # [2025-09-13 | Hang Zhang] Use tag to isolate log directories and append `_deit`.
+    out_run = Path(f"logs/veri776_{tag}_deit_run").resolve()
+    out_test = Path(f"logs/veri776_{tag}_deit_test").resolve()
     train_log = out_run / "train.log"
     test_log = out_test / "test_all.log"
 
@@ -142,6 +174,7 @@ def main():
     print(f"Using device: {device} (num_workers={workers})")
     print(f"Epochs: {args.epochs} | Batch: {args.batch}")
     print(f"Config: {cfg}")
+    print(f"Tag: {tag}")
     print(f"Data root: {data_root}")
     if is_resume:
         print(f"Resume training from: {latest_ckpt}")
@@ -177,9 +210,7 @@ def main():
     else:
         print(">> Skipping training (--skip-train).")
 
-    # ------------------- Post-rename (safe no-op when already global-numbered) -------------------
-    # [2025-08-30 | Hang Zhang] If processor saves checkpoints as global indices (recommended),
-    # this section will likely rename 0 files, which is safe.
+    # ------------------- Post-rename -------------------
     try:
         new_count = 0
         for e in range(1, args.epochs + 1):

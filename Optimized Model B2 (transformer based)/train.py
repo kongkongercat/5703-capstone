@@ -13,6 +13,21 @@ import argparse
 # from timm.scheduler import create_scheduler
 from config import cfg
 
+# =========================================================================================
+# [Modified by] Hang Zhang (张航)
+# [Date] 2025-09-12
+# [Content] SupCon integration (part 1/2) for training pipeline:
+#   - Import SupConLoss
+#   - Build supcon_criterion (temperature from cfg, default 0.07)
+#   - Read supcon_weight from cfg (default 0.2)
+#   - Pass {use_supcon, supcon_criterion, supcon_weight} to do_train(...)
+#   - No breaking changes to existing CE/Triplet setup
+# =========================================================================================
+try:
+    from loss.supcon_loss import SupConLoss  # requires your supcon_loss.py
+except Exception:
+    SupConLoss = None  # graceful fallback; do_train should handle None
+
 # ==============================
 # [2025-08-30 | Hang Zhang] Utils added for seamless resume on CUDA/MPS/CPU
 # ==============================
@@ -150,6 +165,46 @@ if __name__ == '__main__':
         else:
             logger.info(f"[resume] PRETRAIN_PATH not found: {weight_path}; start_epoch remains {start_epoch}")
 
+    # =====================================================================================
+    # [Modified by] Hang Zhang (张航)
+    # [Date] 2025-09-12
+    # [Content] SupCon integration (part 2/2):
+    #   - Build supcon_criterion and read weight from cfg
+    #   - Log enabling message
+    #   - Pass into do_train(...) without breaking existing signature (add kwargs)
+    #   Expected cfg fields (with defaults if missing):
+    #       cfg.LOSS.SUPCON.ENABLE: bool
+    #       cfg.LOSS.SUPCON.TEMPERATURE: float = 0.07
+    #       cfg.LOSS.SUPCON.WEIGHT: float = 0.2
+    #   Notes:
+    #       * do_train(...) should be updated to accept these kwargs:
+    #           use_supcon: bool
+    #           supcon_criterion: callable or None
+    #           supcon_weight: float
+    #       * In forward pass, model returns z_supcon when training & enabled.
+    # =====================================================================================
+    use_supcon = False
+    supcon_criterion = None
+    supcon_weight = 0.2  # default
+
+    # Robustly read cfg flags
+    has_loss = hasattr(cfg, "LOSS")
+    has_supcon = has_loss and hasattr(cfg.LOSS, "SUPCON")
+    supcon_enable = bool(getattr(cfg.LOSS.SUPCON, "ENABLE", False)) if has_supcon else False
+    supcon_temp = float(getattr(cfg.LOSS.SUPCON, "TEMPERATURE", 0.07)) if has_supcon else 0.07
+    supcon_weight = float(getattr(cfg.LOSS.SUPCON, "WEIGHT", 0.2)) if has_supcon else 0.2
+
+    if supcon_enable and SupConLoss is not None:
+        use_supcon = True
+        supcon_criterion = SupConLoss(temperature=supcon_temp)
+        logger.info(f"[SupCon] ENABLED: temperature={supcon_temp}, weight={supcon_weight}")
+    elif supcon_enable and SupConLoss is None:
+        logger.info("[SupCon] ENABLE requested but SupConLoss is not importable. Falling back to disabled.")
+        use_supcon = False
+        supcon_criterion = None
+    else:
+        logger.info("[SupCon] DISABLED")
+
     # === run training ===
     do_train(
         cfg,
@@ -162,5 +217,14 @@ if __name__ == '__main__':
         scheduler,
         loss_func,
         num_query, args.local_rank,
-        start_epoch=start_epoch  # [2025-08-30 | Hang Zhang] pass start_epoch for seamless resume
+        start_epoch=start_epoch,  # [2025-08-30 | Hang Zhang] pass start_epoch for seamless resume
+
+        # -------------------------------------------------------------------------
+        # [Modified by] Hang Zhang (张航) | [Date] 2025-09-12
+        # [Content] Pass SupCon controls/objects for use inside training loop
+        #           (Update processor/do_train to accept these kwargs)
+        # -------------------------------------------------------------------------
+        use_supcon=use_supcon,
+        supcon_criterion=supcon_criterion,
+        supcon_weight=supcon_weight
     )

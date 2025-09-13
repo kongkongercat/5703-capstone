@@ -63,10 +63,22 @@ _C.MODEL.SHUFFLE_GROUP = 2
 _C.MODEL.DEVIDE_LENGTH = 4
 _C.MODEL.RE_ARRANGE = True
 
-# SIE Parameter
+# SIE Parameter 
 _C.MODEL.SIE_COE = 3.0
 _C.MODEL.SIE_CAMERA = False
 _C.MODEL.SIE_VIEW = False
+
+# -----------------------------------------------------------------------------
+# 🔹 LOSS (New)
+# Added by hzha0521 on 2025-09-11
+# -----------------------------------------------------------------------------
+_C.LOSS = CN()
+_C.LOSS.SUPCON = CN()
+_C.LOSS.SUPCON.ENABLE = False   # Whether to enable SupCon
+_C.LOSS.SUPCON.W = 0.3           # Weight of SupCon loss
+_C.LOSS.SUPCON.T = 0.07           # Temperature for SupCon
+
+
 
 # -----------------------------------------------------------------------------
 # INPUT

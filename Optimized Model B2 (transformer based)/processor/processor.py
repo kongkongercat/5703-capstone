@@ -82,6 +82,18 @@ def do_train(
     num_query: int,
     local_rank: int,
     start_epoch: int = 1,  # [2025-08-30 | Hang Zhang] Added start_epoch for seamless resume
+
+    # =====================================================================================
+    # [Modified by] Hang Zhang (张航)
+    # [Date] 2025-09-12
+    # [Content] SupCon integration (accept kwargs from train.py)
+    #   - use_supcon: bool
+    #   - supcon_criterion: callable or None (features, labels, camids) -> loss
+    #   - supcon_weight: float
+    # =====================================================================================
+    use_supcon: bool = False,
+    supcon_criterion=None,
+    supcon_weight: float = 0.2,
 ):
     """
     Main training loop.
@@ -90,6 +102,9 @@ def do_train(
     - The outer script/train.py is responsible for restoring optimizer/scheduler/scaler and
       passing correct `start_epoch` (k+1) when resuming from transformer_k.pth and state_k.pth.
     - Here we start from `start_epoch` and save both model weights and training state at each epoch.
+    - SupCon integration:
+        * model.forward(...) may return z_supcon in training mode when enabled in cfg.
+        * This function will detect and add SupCon loss if (use_supcon and supcon_criterion is not None).
     """
 
     logger = logging.getLogger("transreid.train")
@@ -105,6 +120,8 @@ def do_train(
     use_cuda = (device_str == "cuda")
 
     logger.info(f"start training (device={device_str})")
+    if use_supcon:
+        logger.info(f"[SupCon] training enabled (weight={supcon_weight})")
 
     # Move model to device
     model.to(device)
@@ -168,11 +185,55 @@ def do_train(
             target = vid.to(device, non_blocking=use_cuda)
             target_cam = target_cam.to(device, non_blocking=use_cuda)
             target_view = target_view.to(device, non_blocking=use_cuda)
+            camids = camids.to(device, non_blocking=use_cuda)
 
-            # Forward + loss (with AMP if CUDA)
+            # ---------------------------------------------------------------------------------
+            # [Modified by] Hang Zhang (张航) | [Date] 2025-09-12
+            # [Content] Forward & loss with SupCon (auto-unpack outputs):
+            #   * Backbone/build_transformer:
+            #       - (score, feat) or (score, feat, z_supcon)
+            #   * build_transformer_local (JPM):
+            #       - (scores, feats) or (scores, feats, z_supcon)
+            #   Then:
+            #       loss_total = loss_func(score, feat, target, target_cam)
+            #       + supcon_weight * SupConLoss(z_supcon, target, camids)   [when enabled]
+            # ---------------------------------------------------------------------------------
             with torch.amp.autocast("cuda", enabled=use_cuda):
-                score, feat = model(img, target, cam_label=target_cam, view_label=target_view)
-                loss = loss_func(score, feat, target, target_cam)
+                out = model(img, target, cam_label=target_cam, view_label=target_view)
+
+                # Init containers
+                score = None
+                feat = None
+                z_supcon = None
+
+                # Unpack by type/length safely
+                if isinstance(out, tuple) or isinstance(out, list):
+                    # JPM/Local branch often returns multiple heads
+                    if len(out) == 3:
+                        # could be (score, feat, z_supcon) or (scores, feats, z_supcon)
+                        maybe_scores, maybe_feats, z_supcon = out
+                        score = maybe_scores
+                        feat = maybe_feats
+                    elif len(out) == 2:
+                        score, feat = out
+                    else:
+                        # unexpected length, best effort
+                        score = out[0]
+                        feat = out[1] if len(out) > 1 else None
+                        z_supcon = out[2] if len(out) > 2 else None
+                else:
+                    # not expected, but keep compatibility
+                    score = out
+
+                # Base loss (CE + Triplet + Center inside make_loss)
+                base_loss = loss_func(score, feat, target, target_cam)
+
+                # Optional SupCon loss
+                if use_supcon and (supcon_criterion is not None) and (z_supcon is not None):
+                    supcon_loss = supcon_criterion(z_supcon, target, camids)
+                    loss = base_loss + supcon_weight * supcon_loss
+                else:
+                    loss = base_loss
 
             # Backward & step with AMP
             scaler.scale(loss).backward()
@@ -204,12 +265,25 @@ def do_train(
                     lr_val = optimizer.param_groups[0]["lr"]
                 except Exception:
                     lr_val = 0.0
-                logger.info(
-                    "Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}".format(
-                        epoch, (n_iter + 1), len(train_loader),
-                        loss_meter.avg, acc_meter.avg, lr_val
+                # Log SupCon piece when enabled
+                if use_supcon and (supcon_criterion is not None) and (z_supcon is not None):
+                    try:
+                        supcon_val = float((supcon_weight * supcon_loss).item())
+                    except Exception:
+                        supcon_val = 0.0
+                    logging.getLogger("transreid.train").info(
+                        "Epoch[{}] Iter[{}/{}] Loss: {:.3f} (SupCon+: {:.3f}), Acc: {:.3f}, LR: {:.2e}".format(
+                            epoch, (n_iter + 1), len(train_loader),
+                            loss_meter.avg, supcon_val, acc_meter.avg, lr_val
+                        )
                     )
-                )
+                else:
+                    logging.getLogger("transreid.train").info(
+                        "Epoch[{}] Iter[{}/{}] Loss: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}".format(
+                            epoch, (n_iter + 1), len(train_loader),
+                            loss_meter.avg, acc_meter.avg, lr_val
+                        )
+                    )
 
         end_time = time.time()
         time_per_batch = (end_time - start_time) / max((n_iter + 1), 1)
