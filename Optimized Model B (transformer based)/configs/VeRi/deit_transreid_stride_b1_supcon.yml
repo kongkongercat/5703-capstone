@@ -19,7 +19,7 @@ MODEL:
   PRETRAIN_CHOICE: 'imagenet'
   PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
   PRETRAIN_FALLBACKS:
-    - '/content/drive/MyDrive/5703(mfy)/pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
+    - '/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
 
   METRIC_LOSS_TYPE: 'triplet'
   IF_LABELSMOOTH: 'off'
@@ -54,8 +54,8 @@ INPUT:
 # DATASETS
 # ==========================================
 DATASETS:
-  NAMES: ('veri')
-  ROOT_DIR: ('./data')
+  NAMES: ('veri')                  # Dataset name
+  ROOT_DIR: ('../../datasets')     # Root directory containing the veri dataset
 
 # ==========================================
 # DATALOADER
