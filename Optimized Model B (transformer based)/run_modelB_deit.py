@@ -20,6 +20,7 @@ within the TransReID framework and trained/evaluated on the VeRi-776 dataset.
 [2025-09-13 | Hang Zhang] Changed default --config to b0 baseline and auto-derived tag from config when --tag is not provided.
 [2025-09-13 | Hang Zhang] Append `_deit` suffix to output directories for clarity.
 [2025-09-14 | Hang Zhang] Changed default epochs to 30 for quicker experiments.
+[2025-09-14 | Hang Zhang] Auto-save logs/checkpoints to Google Drive if running GitHub repo and Drive is mounted.
 """
 
 import argparse
@@ -86,23 +87,33 @@ def find_latest_ckpt(run_dir: Path) -> Path | None:
     return ckpts[-1] if ckpts else None
 
 
+def is_github_repo(cwd: Path) -> bool:
+    """Return True if current code is a Git repo cloned from GitHub."""
+    try:
+        if (cwd / ".git").exists():
+            remotes = subprocess.check_output(["git", "remote", "-v"], text=True)
+            return "github.com" in remotes
+        return False
+    except Exception:
+        return False
+
+
+def drive_mounted() -> bool:
+    """Return True if Google Drive is mounted at /content/drive/MyDrive."""
+    return Path("/content/drive/MyDrive").exists()
+
+
 def main():
     parser = argparse.ArgumentParser(description="TransReID VeRi-776 launcher (Model B - DeiT backbone).")
 
-    # [2025-09-14 | Hang Zhang] Changed default epochs to 30.
-    parser.add_argument("--epochs", type=int, default=30,
-                        help="Training epochs for THIS run (default: 30).")
+    parser.add_argument("--epochs", type=int, default=30, help="Training epochs for THIS run (default: 30).")
     parser.add_argument("--target-global", dest="target_global", type=int, default=None,
                         help="Global target epoch index; e.g., 20 means you want transformer_1..20 in total.")
-
     parser.add_argument("--batch", type=int, default=64, help="Batch size (default: 64)")
     parser.add_argument("--num-workers", type=int, default=None, help="Dataloader workers (default: 8 if cuda/mps else 0)")
-
-    # [2025-09-13 | Hang Zhang] Default to b0 baseline to reduce CLI typing.
     parser.add_argument("--config", type=str,
                         default="configs/VeRi/deit_transreid_stride_b0_baseline.yml",
                         help="DeiT config (default: b0 baseline).")
-
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset root containing VeRi/")
     parser.add_argument("--pretrained", type=str, default="pretrained/deit_base_distilled_patch16_224-df68dfff.pth",
                         help="DeiT ImageNet weight")
@@ -114,12 +125,9 @@ def main():
     parser.add_argument("--start-epoch", type=int, default=1, help="Eval from this epoch (default: 1)")
     parser.add_argument("--only-epoch", type=int, default=None,
                         help="If set, only evaluate this epoch (e.g., 120). Overrides start-epoch/epochs.")
-
-    # [2025-09-13 | Hang Zhang] Added --tag argument to isolate output dirs; if omitted, derive from config filename.
     parser.add_argument("--tag", type=str, default=None,
                         help="Short tag for log folders (e.g., b0 / b1 / b2 / b3_pre / b3_fine). "
                              "If omitted, a tag is derived from the config basename.")
-
     args = parser.parse_args()
 
     device = args.device or detect_device()
@@ -129,40 +137,41 @@ def main():
     data_root = Path(args.data_root).resolve()
     pretrained = Path(args.pretrained).resolve()
 
-    # [2025-09-13 | Hang Zhang] Auto-derive tag from config basename when --tag is not provided.
     if args.tag is None or not args.tag.strip():
-        stem = cfg.stem  # e.g., "deit_transreid_stride_b0_baseline"
-        if stem.startswith("deit_transreid_stride_"):
-            tag = stem[len("deit_transreid_stride_"):]
-        else:
-            tag = stem
+        stem = cfg.stem
+        tag = stem[len("deit_transreid_stride_"):] if stem.startswith("deit_transreid_stride_") else stem
     else:
         tag = args.tag.strip()
 
-    # [2025-09-13 | Hang Zhang] Use tag to isolate log directories and append `_deit`.
-    out_run = Path(f"logs/veri776_{tag}_deit_run").resolve()
-    out_test = Path(f"logs/veri776_{tag}_deit_test").resolve()
+    # --- New: Decide log root (Drive vs local) ---
+    cwd = Path.cwd().resolve()
+    drive_root = Path("/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)")
+    if is_github_repo(cwd) and drive_mounted():
+        log_root = drive_root / "logs"
+        print("[info] Detected GitHub repo + mounted Drive → saving logs/checkpoints to Google Drive.")
+    else:
+        log_root = Path("logs").resolve()
+        print("[info] Saving logs/checkpoints locally under ./logs")
+
+    out_run = (log_root / f"veri776_{tag}_deit_run").resolve()
+    out_test = (log_root / f"veri776_{tag}_deit_test").resolve()
     train_log = out_run / "train.log"
     test_log = out_test / "test_all.log"
-
     out_run.mkdir(parents=True, exist_ok=True)
     out_test.mkdir(parents=True, exist_ok=True)
     Path("pretrained").mkdir(parents=True, exist_ok=True)
 
     sanity_checks(cfg, data_root, pretrained, args.require_viewpoint)
 
-    # Detect latest checkpoint
     latest_ckpt = find_latest_ckpt(out_run)
     is_resume = latest_ckpt is not None
 
-    # Compute existing max epoch index for continuous numbering
     prev_max = 0
     for p in out_run.glob("transformer_*.pth"):
         m = re.search(r"transformer_(\d+)\.pth$", p.name)
         if m:
             prev_max = max(prev_max, int(m.group(1)))
 
-    # [2025-08-30 | Hang Zhang] Support target-global semantics.
     if args.target_global is not None:
         if prev_max >= args.target_global:
             print(f"[info] Already reached target-global {args.target_global}, nothing to do.")
@@ -199,7 +208,6 @@ def main():
             "OUTPUT_DIR", str(out_run),
         ]
         if is_resume:
-            # [2025-08-30 | Hang Zhang] Seamless resume (train.py restores optimizer/scheduler/scaler if state_k.pth exists).
             train_cmd += ["MODEL.PRETRAIN_CHOICE", "resume", "MODEL.PRETRAIN_PATH", str(latest_ckpt)]
         else:
             train_cmd += ["MODEL.PRETRAIN_CHOICE", "imagenet", "MODEL.PRETRAIN_PATH", str(pretrained)]
