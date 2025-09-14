@@ -1,6 +1,14 @@
 from yacs.config import CfgNode as CN
 
 # -----------------------------------------------------------------------------
+# Change Log (for this file only)
+# [2025-09-11 | Hang Zhang] Added basic SupCon configs (LOSS.SUPCON: ENABLE/W/T).
+# [2025-09-14 | Hang Zhang] Added SupCon SEARCH grid (LOSS.SUPCON.SEARCH) for B1.
+# [2025-09-15 | Hang Zhang] Narrowed SEARCH to W=[0.25,0.30,0.35], T=[0.07].
+# [2025-09-15 | Hang Zhang] Added TripletX stub (LOSS.TRIPLETX) for B2 YAML merge.
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
 # Convention about Training / Test specific parameters
 # -----------------------------------------------------------------------------
 # Whenever an argument can be either used for training or for testing, the
@@ -9,8 +17,8 @@ from yacs.config import CfgNode as CN
 # -----------------------------------------------------------------------------
 # Config definition
 # -----------------------------------------------------------------------------
-
 _C = CN()
+
 # -----------------------------------------------------------------------------
 # MODEL
 # -----------------------------------------------------------------------------
@@ -25,14 +33,13 @@ _C.MODEL.NAME = 'resnet50'
 _C.MODEL.LAST_STRIDE = 1
 # Path to pretrained model of backbone
 _C.MODEL.PRETRAIN_PATH = ''
-
-# Use ImageNet pretrained model to initialize backbone or use self trained model to initialize the whole model
+# Use ImageNet pretrained model to initialize backbone or use self trained model
 # Options: 'imagenet' , 'self' , 'finetune'
 _C.MODEL.PRETRAIN_CHOICE = 'imagenet'
 
 # If train with BNNeck, options: 'bnneck' or 'no'
 _C.MODEL.NECK = 'bnneck'
-# If train loss include center loss, options: 'yes' or 'no'. Loss with center loss has different optimizer configuration
+# If train loss include center loss, options: 'yes' or 'no'
 _C.MODEL.IF_WITH_CENTER = 'no'
 
 _C.MODEL.ID_LOSS_TYPE = 'softmax'
@@ -40,13 +47,13 @@ _C.MODEL.ID_LOSS_WEIGHT = 1.0
 _C.MODEL.TRIPLET_LOSS_WEIGHT = 1.0
 
 _C.MODEL.METRIC_LOSS_TYPE = 'triplet'
-# If train with multi-gpu ddp mode, options: 'True', 'False'
+# If train with multi-gpu ddp mode
 _C.MODEL.DIST_TRAIN = False
-# If train with soft triplet loss, options: 'True', 'False'
+# If train with soft triplet loss
 _C.MODEL.NO_MARGIN = False
-# If train with label smooth, options: 'on', 'off'
+# If train with label smooth
 _C.MODEL.IF_LABELSMOOTH = 'on'
-# If train with arcface loss, options: 'True', 'False'
+# If train with arcface loss
 _C.MODEL.COS_LAYER = False
 
 # Transformer setting
@@ -69,16 +76,35 @@ _C.MODEL.SIE_CAMERA = False
 _C.MODEL.SIE_VIEW = False
 
 # -----------------------------------------------------------------------------
-# 🔹 LOSS (New)
-# Added by hzha0521 on 2025-09-11
+# LOSS
 # -----------------------------------------------------------------------------
 _C.LOSS = CN()
+
+# ----- Supervised Contrastive (SupCon) -----
 _C.LOSS.SUPCON = CN()
-_C.LOSS.SUPCON.ENABLE = False   # Whether to enable SupCon
-_C.LOSS.SUPCON.W = 0.3           # Weight of SupCon loss
-_C.LOSS.SUPCON.T = 0.07           # Temperature for SupCon
+_C.LOSS.SUPCON.ENABLE = False          # toggle by runner or YAML
+_C.LOSS.SUPCON.W = 0.30                # default weight
+_C.LOSS.SUPCON.T = 0.07                # default temperature
+_C.LOSS.SUPCON.CAM_AWARE = False       # optional: camera-aware positives
+_C.LOSS.SUPCON.POS_RULE = "class"      # "class" or "class+camera"
 
+# Grid for B1 auto search
+_C.LOSS.SUPCON.SEARCH = CN()
+_C.LOSS.SUPCON.SEARCH.W = [0.25, 0.30, 0.35]
+_C.LOSS.SUPCON.SEARCH.T = [0.07]
 
+# ----- TripletX (B2) : stub to avoid KeyError on YAML merge -----
+_C.LOSS.TRIPLETX = CN()
+_C.LOSS.TRIPLETX.ENABLE = False
+_C.LOSS.TRIPLETX.W = 1.0
+_C.LOSS.TRIPLETX.MARGIN = 0.30
+_C.LOSS.TRIPLETX.SOFT_WARMUP = True
+_C.LOSS.TRIPLETX.WARMUP_EPOCHS = 10
+_C.LOSS.TRIPLETX.K = 5
+_C.LOSS.TRIPLETX.ALPHA = 2.0
+_C.LOSS.TRIPLETX.CROSS_CAM_POS = True
+_C.LOSS.TRIPLETX.SAME_CAM_NEG_BOOST = 1.2
+_C.LOSS.TRIPLETX.NORM_FEAT = True
 
 # -----------------------------------------------------------------------------
 # INPUT
@@ -108,7 +134,6 @@ _C.DATASETS.NAMES = ('market1501')
 # Root directory where datasets should be used (and downloaded if not found)
 _C.DATASETS.ROOT_DIR = ('../data')
 
-
 # -----------------------------------------------------------------------------
 # DataLoader
 # -----------------------------------------------------------------------------
@@ -126,7 +151,7 @@ _C.DATALOADER.NUM_INSTANCE = 16
 _C.SOLVER = CN()
 # Name of optimizer
 _C.SOLVER.OPTIMIZER_NAME = "Adam"
-# Number of max epoches
+# Number of max epochs
 _C.SOLVER.MAX_EPOCHS = 100
 # Base learning rate
 _C.SOLVER.BASE_LR = 3e-4
@@ -134,7 +159,7 @@ _C.SOLVER.BASE_LR = 3e-4
 _C.SOLVER.LARGE_FC_LR = False
 # Factor of learning bias
 _C.SOLVER.BIAS_LR_FACTOR = 1
-# Factor of learning bias
+# Seed
 _C.SOLVER.SEED = 1234
 # Momentum
 _C.SOLVER.MOMENTUM = 0.9
@@ -144,56 +169,45 @@ _C.SOLVER.MARGIN = 0.3
 _C.SOLVER.CENTER_LR = 0.5
 # Balanced weight of center loss
 _C.SOLVER.CENTER_LOSS_WEIGHT = 0.0005
-
-# Settings of weight decay
+# Weight decay
 _C.SOLVER.WEIGHT_DECAY = 0.0005
 _C.SOLVER.WEIGHT_DECAY_BIAS = 0.0005
-
-# decay rate of learning rate
+# LR decay
 _C.SOLVER.GAMMA = 0.1
-# decay step of learning rate
 _C.SOLVER.STEPS = (40, 70)
-# warm up factor
+# warm up
 _C.SOLVER.WARMUP_FACTOR = 0.01
-#  warm up epochs
 _C.SOLVER.WARMUP_EPOCHS = 5
-# method of warm up, option: 'constant','linear'
 _C.SOLVER.WARMUP_METHOD = "linear"
-
+# cosine head defaults
 _C.SOLVER.COSINE_MARGIN = 0.5
 _C.SOLVER.COSINE_SCALE = 30
-
-# epoch number of saving checkpoints
+# checkpoint / log / eval
 _C.SOLVER.CHECKPOINT_PERIOD = 10
-# iteration of display training log
 _C.SOLVER.LOG_PERIOD = 100
-# epoch number of validation
 _C.SOLVER.EVAL_PERIOD = 10
-# Number of images per batch
-# This is global, so if we have 8 GPUs and IMS_PER_BATCH = 128, each GPU will
-# contain 16 images per batch
+# global batch size
 _C.SOLVER.IMS_PER_BATCH = 64
 
 # ---------------------------------------------------------------------------- #
 # TEST
 # ---------------------------------------------------------------------------- #
-
 _C.TEST = CN()
 # Number of images per batch during test
 _C.TEST.IMS_PER_BATCH = 128
-# If test with re-ranking, options: 'True','False'
+# If test with re-ranking
 _C.TEST.RE_RANKING = False
 # Path to trained model
 _C.TEST.WEIGHT = ""
-# Which feature of BNNeck to be used for test, before or after BNNneck, options: 'before' or 'after'
+# Which feature of BNNeck to be used for test
 _C.TEST.NECK_FEAT = 'after'
-# Whether feature is nomalized before test, if yes, it is equivalent to cosine distance
+# Whether feature is normalized before test
 _C.TEST.FEAT_NORM = 'yes'
-
 # Name for saving the distmat after testing.
 _C.TEST.DIST_MAT = "dist_mat.npy"
-# Whether calculate the eval score option: 'True', 'False'
+# Whether calculate the eval score
 _C.TEST.EVAL = False
+
 # ---------------------------------------------------------------------------- #
 # Misc options
 # ---------------------------------------------------------------------------- #

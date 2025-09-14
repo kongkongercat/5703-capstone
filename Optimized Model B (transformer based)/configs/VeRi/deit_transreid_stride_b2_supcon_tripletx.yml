@@ -1,16 +1,12 @@
 # ==========================================
 # Model B (built upon the baseline: TransReID + DeiT + official stride)
-# B2: SupCon + TripletX enhancement
+# B2: TripletX enhancement (+ SupCon injected by runner)
 # File: deit_transreid_stride_b2_supcon_tripletx.yml
-# Modified by: Hang Zhang (hzha0521)
-# Date: 2025-09-14
-# Based on: deit_transreid_stride.yml  (baseline config in this repo)
-# Notes:
-#   - This is a full, self-contained config (no _BASE_ include).
-#   - Part of Model B’s progressive optimization pipeline on top of the baseline.
-#   - Enables SupCon (complementary) and enhanced Triplet (TripletLossX).
-#   - Switches PK-sampler K to 8 in B2 (set NUM_INSTANCE=8; adjust batch).
-#   - Uses fixed margin for TripletX with early soft warmup.
+#
+# Change Log
+# [2025-09-14 | Hang Zhang] Initial B2 config (SupCon + TripletX; K=8 PK-sampler).
+# [2025-09-14 | Hang Zhang] Remove LOSS.SUPCON from YAML; SupCon (T/W/ENABLE) will be injected by run_b2.py.
+# [2025-09-14 | Hang Zhang] Comment out OUTPUT_DIR to avoid override conflicts with runner.
 # ==========================================
 
 # ==========================================
@@ -25,15 +21,12 @@ MODEL:
   IF_WITH_CENTER: 'no'
 
   NAME: 'transformer'
-  # Align to DeiT distilled since PRETRAIN_PATH is DeiT-distilled
   TRANSFORMER_TYPE: 'deit_base_distilled_patch16_224_TransReID'
 
-  # Use explicit margin in TripletX (warmup handled below)
   NO_MARGIN: False
-
   DEVICE_ID: ('0')
 
-  # Baseline components (official stride setting enabled)
+  # Official stride setting
   STRIDE_SIZE: [12, 12]
   SIE_CAMERA: True
   SIE_VIEW: True
@@ -56,15 +49,15 @@ INPUT:
 # DATASETS
 # ==========================================
 DATASETS:
-  NAMES: ('veri')        # VeRi-776
-  ROOT_DIR: ('../../datasets')     # Root directory containing the veri dataset
+  NAMES: ('veri')                  # VeRi-776
+  ROOT_DIR: ('../../datasets')
 
 # ==========================================
 # DATALOADER  (B2: K = 8)
 # ==========================================
 DATALOADER:
-  SAMPLER: 'softmax_triplet'  # PK sampler => CE + Triplet in training loop
-  NUM_INSTANCE: 8             # K=8 (B2 only)
+  SAMPLER: 'softmax_triplet'
+  NUM_INSTANCE: 8                  # K=8
   NUM_WORKERS: 8
 
 # ==========================================
@@ -74,9 +67,7 @@ SOLVER:
   OPTIMIZER_NAME: 'SGD'
   MAX_EPOCHS: 120
   BASE_LR: 0.01
-
-  # Ensure batch is divisible by K (P * K). Example: 96 = P(12) * K(8)
-  IMS_PER_BATCH: 96
+  IMS_PER_BATCH: 96                # P*K (e.g., 12*8)
 
   WARMUP_METHOD: 'linear'
   LARGE_FC_LR: False
@@ -99,34 +90,22 @@ TEST:
   FEAT_NORM: 'yes'
 
 # ==========================================
-# LOSS (B2: SupCon + TripletX)
+# LOSS (B2: TripletX only; SupCon is injected by run_b2.py)
 # ==========================================
 LOSS:
-  # ----- Supervised Contrastive (complementary to CE+Triplet) -----
-  SUPCON:
-    ENABLE: true
-    W: 0.20                  # typical choices: {0.10, 0.20, 0.30}
-    T: 0.07
-    # Minimal sweep (optional)
-    SEARCH:
-      W: [0.10, 0.20, 0.30]
-      T: [0.07]
-
-  # ----- Enhanced Triplet (TripletLossX; register in code) -----
-  # Expect your make_loss to read these keys and instantiate TripletLossX accordingly.
   TRIPLETX:
     ENABLE: true
-    W: 1.00                  # loss weight for TripletX
-    MARGIN: 0.30             # fixed margin after warmup
-    SOFT_WARMUP: true        # early epochs use soft-style
+    W: 1.00
+    MARGIN: 0.30
+    SOFT_WARMUP: true
     WARMUP_EPOCHS: 10
-    K: 5                     # top-k hard mining (pos: largest k, neg: smallest k)
-    ALPHA: 2.0               # hardness-aware weighting strength
-    CROSS_CAM_POS: true      # positives only across cameras
-    SAME_CAM_NEG_BOOST: 1.2  # emphasize same-camera negatives when mining
-    NORM_FEAT: true          # L2 normalize Triplet branch
+    K: 5
+    ALPHA: 2.0
+    CROSS_CAM_POS: true
+    SAME_CAM_NEG_BOOST: 1.2
+    NORM_FEAT: true
 
 # ==========================================
 # OUTPUT
 # ==========================================
-OUTPUT_DIR: '../logs/veri_deit_transreid_stride_b2_supcon_tripletx_k8'
+# OUTPUT_DIR: '../logs/veri_deit_transreid_stride_b2_supcon_tripletx_k8'  # handled by runner
