@@ -22,6 +22,7 @@ within the TransReID framework and trained/evaluated on the VeRi-776 dataset.
 [2025-09-14 | Hang Zhang] Changed default epochs to 30 for quicker experiments.
 [2025-09-14 | Hang Zhang] Added dataset/pretrained path fallback (relative → Google Drive).
 [2025-09-14 | Hang Zhang] Finalize dataset fallback: default ./datasets; if missing, use Drive datasets/VeRi.
+[2025-09-14 | Hang Zhang] Added PRETRAIN fallback (local → Google Drive) with clear logs.  # --- New
 """
 
 import argparse
@@ -104,6 +105,13 @@ def drive_mounted() -> bool:
     return Path("/content/drive/MyDrive").exists()
 
 
+# --- New: fixed Google Drive pretrained path (fallback target)
+# [2025-09-14 | Hang Zhang] This is only used when local pretrained is missing.
+DRIVE_PRETRAIN_PATH = Path(
+    "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/pretrained/deit_base_distilled_patch16_224-df68dfff.pth"
+)
+
+
 def main():
     parser = argparse.ArgumentParser(description="TransReID VeRi-776 launcher (Model B - DeiT backbone).")
 
@@ -121,8 +129,12 @@ def main():
                         help="DeiT config (default: b0 baseline).")
     parser.add_argument("--data-root", type=str, default="./datasets",
                         help="Dataset root containing VeRi/ (default: ./datasets)")
-    parser.add_argument("--pretrained", type=str, default="pretrained/deit_base_distilled_patch16_224-df68dfff.pth",
-                        help="DeiT ImageNet weight (no fallback by design)")
+    parser.add_argument(
+        "--pretrained",
+        type=str,
+        default="pretrained/deit_base_distilled_patch16_224-df68dfff.pth",
+        help="DeiT ImageNet weight. Will fallback to fixed Google Drive path if local file is missing and Drive is mounted.  # --- New"
+    )
     parser.add_argument("--device", type=str, default=None, choices=["cuda", "mps", "cpu"],
                         help="Force device; if omitted, auto-detect")
     parser.add_argument("--require-viewpoint", action="store_true", help="Check datasets/keypoint_*.txt exist")
@@ -147,7 +159,19 @@ def main():
     cfg = Path(args.config).resolve()
     pretrained = Path(args.pretrained).resolve()
 
-    # --- New: dataset root with fallback (local → Google Drive) ---
+    # --- New: PRETRAIN fallback (local → Google Drive) ----------------------------------------
+    # [2025-09-14 | Hang Zhang] If local pretrained is missing, try Google Drive path once.
+    # This happens before sanity_checks so that the resolved path is used everywhere.
+    if not pretrained.exists():
+        if drive_mounted() and DRIVE_PRETRAIN_PATH.exists():
+            print(f"[info] Local pretrained not found → using Google Drive pretrained: {DRIVE_PRETRAIN_PATH}")
+            pretrained = DRIVE_PRETRAIN_PATH
+        else:
+            print(f"[warn] Pretrained not found at {pretrained}; no Drive fallback available. "
+                  f"Training will fail unless you provide a valid file.")
+    # -------------------------------------------------------------------------------------------
+
+    # --- Existing: dataset root with fallback (local → Google Drive) ---
     # Default expects: ./datasets/VeRi/{image_train,image_query,image_test}
     data_root = Path(args.data_root).resolve()
     if not (data_root / "VeRi").exists():
@@ -218,7 +242,8 @@ def main():
     else:
         if not pretrained.exists():
             raise SystemExit(f"ERROR: Pretrained weight not found: {pretrained}")
-        print(f"Pretrained weight : {pretrained}")
+        loc = "Google Drive" if str(pretrained).startswith("/content/drive/") else "local"  # --- New (display)
+        print(f"Pretrained weight : {pretrained}  ({loc})")
     print("===============================================================")
 
     py = shutil.which(args.python) or args.python
