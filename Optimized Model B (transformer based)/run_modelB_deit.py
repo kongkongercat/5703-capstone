@@ -22,7 +22,8 @@ within the TransReID framework and trained/evaluated on the VeRi-776 dataset.
 [2025-09-14 | Hang Zhang] Changed default epochs to 30 for quicker experiments.
 [2025-09-14 | Hang Zhang] Added dataset/pretrained path fallback (relative → Google Drive).
 [2025-09-14 | Hang Zhang] Finalize dataset fallback: default ./datasets; if missing, use Drive datasets/VeRi.
-[2025-09-14 | Hang Zhang] Added PRETRAIN fallback (local → Google Drive) with clear logs.  # --- New
+[2025-09-14 | Hang Zhang] Added PRETRAIN fallback (local → Google Drive) with clear logs.
+[2025-09-15 | Hang Zhang] Add --opts passthrough (YACS overrides). Accept TAG/OUTPUT_DIR via --opts to override local tag/log root safely.
 """
 
 import argparse
@@ -105,8 +106,7 @@ def drive_mounted() -> bool:
     return Path("/content/drive/MyDrive").exists()
 
 
-# --- New: fixed Google Drive pretrained path (fallback target)
-# [2025-09-14 | Hang Zhang] This is only used when local pretrained is missing.
+# Fixed Google Drive pretrained path (fallback target)
 DRIVE_PRETRAIN_PATH = Path(
     "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/pretrained/deit_base_distilled_patch16_224-df68dfff.pth"
 )
@@ -133,7 +133,7 @@ def main():
         "--pretrained",
         type=str,
         default="pretrained/deit_base_distilled_patch16_224-df68dfff.pth",
-        help="DeiT ImageNet weight. Will fallback to fixed Google Drive path if local file is missing and Drive is mounted.  # --- New"
+        help="DeiT ImageNet weight. Will fallback to fixed Google Drive path if local file is missing and Drive is mounted."
     )
     parser.add_argument("--device", type=str, default=None, choices=["cuda", "mps", "cpu"],
                         help="Force device; if omitted, auto-detect")
@@ -149,7 +149,34 @@ def main():
                         help="Short tag for log folders (e.g., b0 / b1 / b2 / b3_pre / b3_fine). "
                              "If omitted, a tag is derived from the config basename.")
 
+    # NEW: passthrough YACS overrides; safe-handle TAG/OUTPUT_DIR coming from --opts
+    parser.add_argument(
+        "--opts",
+        nargs=argparse.REMAINDER,
+        help="Extra YACS overrides as KEY VALUE pairs, e.g. "
+             "LOSS.SUPCON.ENABLE True LOSS.SUPCON.T 0.07 LOSS.SUPCON.W 0.30 "
+             "SOLVER.MAX_EPOCHS 12 OUTPUT_DIR ./logs TAG myrun"
+    )
+
     args = parser.parse_args()
+
+    # ---- Parse --opts into pairs; capture OUTPUT_DIR/TAG overrides, forward the rest ----
+    forwarded_opts: list[str] = []
+    tag_from_opts: str | None = None
+    output_root_from_opts: Path | None = None
+    if args.opts:
+        if len(args.opts) % 2 != 0:
+            raise SystemExit("ERROR: --opts must contain KEY VALUE pairs (even number of tokens).")
+        for k, v in zip(args.opts[0::2], args.opts[1::2]):
+            if k == "OUTPUT_DIR":
+                output_root_from_opts = Path(v).resolve()
+                print(f"[opts] OUTPUT_DIR captured as log root override: {output_root_from_opts}")
+                continue
+            if k == "TAG":
+                tag_from_opts = str(v)
+                print(f"[opts] TAG captured as tag override: {tag_from_opts}")
+                continue
+            forwarded_opts += [k, v]
 
     # Device & worker setup
     device = args.device or detect_device()
@@ -159,9 +186,7 @@ def main():
     cfg = Path(args.config).resolve()
     pretrained = Path(args.pretrained).resolve()
 
-    # --- New: PRETRAIN fallback (local → Google Drive) ----------------------------------------
-    # [2025-09-14 | Hang Zhang] If local pretrained is missing, try Google Drive path once.
-    # This happens before sanity_checks so that the resolved path is used everywhere.
+    # PRETRAIN fallback (local → Google Drive)
     if not pretrained.exists():
         if drive_mounted() and DRIVE_PRETRAIN_PATH.exists():
             print(f"[info] Local pretrained not found → using Google Drive pretrained: {DRIVE_PRETRAIN_PATH}")
@@ -169,10 +194,8 @@ def main():
         else:
             print(f"[warn] Pretrained not found at {pretrained}; no Drive fallback available. "
                   f"Training will fail unless you provide a valid file.")
-    # -------------------------------------------------------------------------------------------
 
-    # --- Existing: dataset root with fallback (local → Google Drive) ---
-    # Default expects: ./datasets/VeRi/{image_train,image_query,image_test}
+    # Dataset root with fallback (local → Google Drive)
     data_root = Path(args.data_root).resolve()
     if not (data_root / "VeRi").exists():
         drive_data = Path("/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/datasets/VeRi")
@@ -182,17 +205,22 @@ def main():
         else:
             print(f"[warn] VeRi dataset not found at {data_root} or Google Drive; will fail in sanity_checks.")
 
-    # Tag derivation from config
-    if args.tag is None or not args.tag.strip():
+    # Tag derivation (CLI --tag > --opts TAG > derive from config)
+    if args.tag is not None and args.tag.strip():
+        tag = args.tag.strip()
+    elif tag_from_opts is not None and tag_from_opts.strip():
+        tag = tag_from_opts.strip()
+    else:
         stem = cfg.stem
         tag = stem[len("deit_transreid_stride_"):] if stem.startswith("deit_transreid_stride_") else stem
-    else:
-        tag = args.tag.strip()
 
-    # Decide log root (Drive vs local)
+    # Decide log root (override via --opts OUTPUT_DIR; else Drive vs local heuristic)
     cwd = Path.cwd().resolve()
     drive_root = Path("/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)")
-    if is_github_repo(cwd) and drive_mounted():
+    if output_root_from_opts is not None:
+        log_root = output_root_from_opts
+        print(f"[info] Using log root from --opts OUTPUT_DIR: {log_root}")
+    elif is_github_repo(cwd) and drive_mounted():
         log_root = drive_root / "logs"
         print("[info] Detected GitHub repo + mounted Drive → saving logs/checkpoints to Google Drive.")
     else:
@@ -207,7 +235,7 @@ def main():
     out_test.mkdir(parents=True, exist_ok=True)
     Path("pretrained").mkdir(parents=True, exist_ok=True)
 
-    # Pre-flight checks (will stop with actionable error messages)
+    # Pre-flight checks
     sanity_checks(cfg, data_root, pretrained, args.require_viewpoint)
 
     latest_ckpt = find_latest_ckpt(out_run)
@@ -219,7 +247,7 @@ def main():
         if m:
             prev_max = max(prev_max, int(m.group(1)))
 
-    # Target-global logic: make new epochs count relative to previous
+    # Target-global logic
     if args.target_global is not None:
         if prev_max >= args.target_global:
             print(f"[info] Already reached target-global {args.target_global}, nothing to do.")
@@ -242,8 +270,12 @@ def main():
     else:
         if not pretrained.exists():
             raise SystemExit(f"ERROR: Pretrained weight not found: {pretrained}")
-        loc = "Google Drive" if str(pretrained).startswith("/content/drive/") else "local"  # --- New (display)
+        loc = "Google Drive" if str(pretrained).startswith("/content/drive/") else "local"
         print(f"Pretrained weight : {pretrained}  ({loc})")
+    if forwarded_opts:
+        # Show only keys for readability
+        keys = ", ".join(forwarded_opts[0::2])
+        print(f"[opts] Forwarding YACS keys to train/test: {keys}")
     print("===============================================================")
 
     py = shutil.which(args.python) or args.python
@@ -266,6 +298,10 @@ def main():
         else:
             train_cmd += ["MODEL.PRETRAIN_CHOICE", "imagenet", "MODEL.PRETRAIN_PATH", str(pretrained)]
 
+        # Append forwarded --opts (without TAG/OUTPUT_DIR)
+        if forwarded_opts:
+            train_cmd += forwarded_opts
+
         code = run_and_tee(train_cmd, train_log)
         if code != 0:
             raise SystemExit(code)
@@ -273,12 +309,10 @@ def main():
         print(">> Skipping training (--skip-train).")
 
     # ------------------- Post-rename -------------------
-    # Make checkpoint numbering continuous across multiple incremental runs
     try:
         new_count = 0
         for e in range(1, args.epochs + 1):
             src = out_run / f"transformer_{e}.pth"
-            # Only rename files created/modified after this run started
             if src.exists() and os.path.getmtime(src) >= start_ts - 1:
                 dst = out_run / f"transformer_{prev_max + e}.pth"
                 if not dst.exists():
@@ -316,6 +350,10 @@ def main():
                 "TEST.WEIGHT", str(ckpt),
                 "OUTPUT_DIR", str(subtest),
             ]
+            # Forward the same YACS overrides to test (safe subset)
+            if forwarded_opts:
+                test_cmd += forwarded_opts
+
             code = run_and_tee(test_cmd, test_log)
             if code != 0:
                 raise SystemExit(code)

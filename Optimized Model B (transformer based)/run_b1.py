@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# =============================================================================
+# B1 SupCon grid search with YAML-driven grid (LOSS.SUPCON.SEARCH)
+#
+# Change Log
+# [2025-09-14 | Hang Zhang] Initial version: load grid from YAML; quick screen;
+#                            parse latest epoch_*; save best; retrain full.
+# [2025-09-15 | Hang Zhang] Ensure SupCon is explicitly enabled via --opts
+#                            (add LOSS.SUPCON.ENABLE True in all launches).
+# =============================================================================
 """
 B1 SupCon grid search (minimal) with grid loaded from YAML (LOSS.SUPCON.SEARCH).
 
@@ -28,7 +37,7 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 
 # ====== User settings ======
-CONFIG = "configs/VeRi/deit_transreid_stride_b1_supcon.yml"
+CONFIG = "configs/VeiRi/deit_transreid_stride_b1_supcon.yml".replace("VeiRi", "VeRi")
 SEARCH_EPOCHS = 12       # 12–15 recommended for quick screening
 FULL_EPOCHS   = 30
 # ===========================
@@ -87,10 +96,15 @@ def load_grid_from_yaml(cfg_path: str) -> Tuple[List[float], List[float]]:
             if hasattr(cfg, "set_new_allowed"):
                 cfg.set_new_allowed(True)
         cfg.merge_from_file(cfg_path)
-        t_list = _to_float_list(cfg.LOSS.SUPCON.SEARCH.T) if "LOSS" in cfg else []
-        w_list = _to_float_list(cfg.LOSS.SUPCON.SEARCH.W) if "LOSS" in cfg else []
-        if t_list and w_list:
-            return sorted(set(t_list)), sorted(set(w_list))
+
+        loss = getattr(cfg, "LOSS", None)
+        supc = getattr(loss, "SUPCON", None) if loss is not None else None
+        search = getattr(supc, "SEARCH", None) if supc is not None else None
+        if search is not None:
+            t_list = _to_float_list(getattr(search, "T", []))
+            w_list = _to_float_list(getattr(search, "W", []))
+            if t_list and w_list:
+                return sorted(set(t_list)), sorted(set(w_list))
     except Exception:
         pass
 
@@ -98,10 +112,10 @@ def load_grid_from_yaml(cfg_path: str) -> Tuple[List[float], List[float]]:
     try:
         import yaml  # type: ignore
         with open(cfg_path, "r", encoding="utf-8") as f:
-            y = yaml.safe_load(f)
-        loss = (y or {}).get("LOSS", {})
-        supc = (loss or {}).get("SUPCON", {})
-        search = (supc or {}).get("SEARCH", {})
+            y = yaml.safe_load(f) or {}
+        loss = y.get("LOSS", {}) or {}
+        supc = loss.get("SUPCON", {}) or {}
+        search = supc.get("SEARCH", {}) or {}
         t_list = _to_float_list(search.get("T"))
         w_list = _to_float_list(search.get("W"))
         if t_list and w_list:
@@ -115,8 +129,10 @@ def load_grid_from_yaml(cfg_path: str) -> Tuple[List[float], List[float]]:
 # ---------- Parse metrics ----------
 def _latest_epoch_dir(out_test_dir: Path) -> Optional[Path]:
     """Pick the newest epoch_* subfolder inside out_test_dir."""
-    epochs = sorted([p for p in out_test_dir.glob("epoch_*") if p.is_dir()],
-                    key=lambda p: int(p.name.split("_")[-1]))
+    epochs = sorted(
+        [p for p in out_test_dir.glob("epoch_*") if p.is_dir()],
+        key=lambda p: int(p.name.split("_")[-1])
+    )
     return epochs[-1] if epochs else None
 
 def parse_map_rank1(out_test_dir: Path) -> Tuple[float, float]:
@@ -161,6 +177,7 @@ def run_one(t: float, w: float):
         sys.executable, "run_modelB_deit.py",
         "--config", CONFIG,
         "--opts",
+        "LOSS.SUPCON.ENABLE", "True",   # ensure SupCon is ON
         "LOSS.SUPCON.T", str(t),
         "LOSS.SUPCON.W", str(w),
         "SOLVER.MAX_EPOCHS", str(SEARCH_EPOCHS),
@@ -181,6 +198,8 @@ def main():
 
     # 2) Sweep grid and collect metrics
     runs = [run_one(t, w) for t, w in itertools.product(T_list, W_list)]
+    if not runs:
+        raise SystemExit("[B1] No runs executed. Check your SEARCH grid or paths.")
 
     # 3) Select best by (mAP, Rank-1)
     best = max(runs, key=lambda x: (x["mAP"], x["R1"]))
@@ -196,6 +215,7 @@ def main():
         sys.executable, "run_modelB_deit.py",
         "--config", CONFIG,
         "--opts",
+        "LOSS.SUPCON.ENABLE", "True",   # ensure SupCon is ON
         "LOSS.SUPCON.T", str(best["T"]),
         "LOSS.SUPCON.W", str(best["W"]),
         "SOLVER.MAX_EPOCHS", str(FULL_EPOCHS),
