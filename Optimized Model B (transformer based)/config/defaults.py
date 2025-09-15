@@ -6,6 +6,7 @@ from yacs.config import CfgNode as CN
 # [2025-09-14 | Hang Zhang] Added SupCon SEARCH grid (LOSS.SUPCON.SEARCH) for B1.
 # [2025-09-15 | Hang Zhang] Narrowed SEARCH to W=[0.25,0.30,0.35], T=[0.07].
 # [2025-09-15 | Hang Zhang] Added TripletX stub (LOSS.TRIPLETX) for B2 YAML merge.
+# [2025-09-16 | Zeyu Yang] Added `TRAINING_MODE` to toggle between self-supervised and supervised training.
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
@@ -42,11 +43,12 @@ _C.MODEL.NECK = 'bnneck'
 # If train loss include center loss, options: 'yes' or 'no'
 _C.MODEL.IF_WITH_CENTER = 'no'
 
+# Loss function settings for supervised training
 _C.MODEL.ID_LOSS_TYPE = 'softmax'
 _C.MODEL.ID_LOSS_WEIGHT = 1.0
 _C.MODEL.TRIPLET_LOSS_WEIGHT = 1.0
-
 _C.MODEL.METRIC_LOSS_TYPE = 'triplet'
+
 # If train with multi-gpu ddp mode
 _C.MODEL.DIST_TRAIN = False
 # If train with soft triplet loss
@@ -74,6 +76,9 @@ _C.MODEL.RE_ARRANGE = True
 _C.MODEL.SIE_COE = 3.0
 _C.MODEL.SIE_CAMERA = False
 _C.MODEL.SIE_VIEW = False
+
+# Training mode configuration (new)
+_C.MODEL.TRAINING_MODE = "self_supervised"  # Options: "supervised", "self_supervised"
 
 # -----------------------------------------------------------------------------
 # LOSS
