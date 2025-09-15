@@ -87,7 +87,7 @@ _C.LOSS = CN()
 
 # ----- Supervised Contrastive (SupCon) -----
 _C.LOSS.SUPCON = CN()
-_C.LOSS.SUPCON.ENABLE = False          # toggle by runner or YAML
+_C.LOSS.SUPCON.ENABLE = True if _C.MODEL.TRAINING_MODE == "self_supervised" else False  # Toggle based on TRAINING_MODE
 _C.LOSS.SUPCON.W = 0.30                # default weight
 _C.LOSS.SUPCON.T = 0.07                # default temperature
 _C.LOSS.SUPCON.CAM_AWARE = False       # optional: camera-aware positives
