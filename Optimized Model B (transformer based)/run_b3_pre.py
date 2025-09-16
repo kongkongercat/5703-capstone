@@ -22,7 +22,7 @@ from typing import List, Tuple, Optional, Dict, Any
 import statistics as stats
 
 # ====== User settings ======
-CONFIG = "configs/VeiRi/deit_transreid_stride_b1_supcon.yml".replace("VeiRi", "VeRi")
+CONFIG = "configs/VeiRi/deit_transreid_stride_b3_ssl_pretrain.yml".replace("VeiRi", "VeRi")
 SEARCH_EPOCHS = 12        # 12–15 recommended for quick screening
 FULL_EPOCHS   = 30        # long training for the best (T,W)
 # Seeds policy
