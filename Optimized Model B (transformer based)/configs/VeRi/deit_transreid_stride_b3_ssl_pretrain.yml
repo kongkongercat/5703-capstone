@@ -19,7 +19,7 @@ MODEL:
   IF_WITH_CENTER: 'no'
 
   NAME: 'transformer'
-  TRANSFORMER_TYPE: 'deit_base_distilled_patch16_224_TransReID'  # Backbone type
+  TRANSFORMER_TYPE: 'vit_base_patch16_224_TransReID'  # Backbone type
 
   NO_MARGIN: False
   DEVICE_ID: ('0')  # Specify the GPU ID
@@ -106,3 +106,4 @@ LOSS:
 # OUTPUT
 # ==========================================
 # OUTPUT_DIR: '../logs/veri_deit_transreid_stride_b3_ssl_pretrain'  # handled by runner
+
