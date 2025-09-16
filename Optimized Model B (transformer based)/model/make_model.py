@@ -1,24 +1,18 @@
-# =========================================================================================
+# =============================================================================
 # File: make_model.py
-# Note:
-#   This file integrates a supervised contrastive (SupCon) projection head so that
-#   training loops can compute SupConLoss with camera-aware positives (see supcon_loss.py).
+# Purpose: Build backbone/transformer/transformer_local models with optional SupCon head
 #
-# [Modified by] Zhang Hang (张航), Meng Fanyi (孟凡义)
-# [Modified on] 2025-09-12
-# [Modification Summary]
-#   - Add an optional SupCon projection head (2048 -> 128) to three backbones:
-#       * Backbone (ResNet-based)
-#       * build_transformer (global branch)
-#       * build_transformer_local (global + local branches)
-#   - In training mode, forward() returns an extra L2-normalized vector `z_supcon`
-#     when SupCon is enabled via cfg.LOSS.SUPCON.ENABLE.
-#   - No change to evaluation behavior or existing classification/triplet interfaces.
-# =========================================================================================
+# Change Log
+# [2025-09-12 | Zhang Hang & Meng Fanyi] Added SupCon projection head (->128) to Backbone,
+#                                       build_transformer, build_transformer_local; training
+#                                       forwards return extra L2-normalized z_supcon when enabled.
+# [2025-09-15 | Zhang Hang]            Added load_param() to build_transformer_local for
+#                                       evaluation/test checkpoint loading.
+# =============================================================================
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # [Added by Zhang Hang & Meng Fanyi | 2025-09-12] For SupCon normalize
+import torch.nn.functional as F  # For SupCon normalize
 from .backbones.resnet import ResNet, Bottleneck
 import copy
 from .backbones.vit_pytorch import (
@@ -44,7 +38,6 @@ def shuffle_unit(features, shift, group, begin=1):
 
     x = torch.transpose(x, 1, 2).contiguous()
     x = x.view(batchsize, -1, dim)
-
     return x
 
 
@@ -103,11 +96,7 @@ class Backbone(nn.Module):
         self.bottleneck.bias.requires_grad_(False)
         self.bottleneck.apply(weights_init_kaiming)
 
-        # ---------------------------------------------------------------------------------
-        # [Modified by] Zhang Hang & Meng Fanyi | [Date] 2025-09-12
-        # [Content] Add optional SupCon projection head (2048 -> 128) gated by cfg.LOSS.SUPCON.ENABLE.
-        #           This head maps BNNeck features into contrastive space.
-        # ---------------------------------------------------------------------------------
+        # SupCon projection head (2048 -> 128)
         if hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "SUPCON") and getattr(cfg.LOSS.SUPCON, "ENABLE", False):
             self.supcon_head = nn.Sequential(
                 nn.Linear(self.in_planes, 2048),
@@ -118,7 +107,7 @@ class Backbone(nn.Module):
     def forward(self, x, label=None):  # label is unused if self.cos_layer == 'no'
         x = self.base(x)
         global_feat = nn.functional.avg_pool2d(x, x.shape[2:4])
-        global_feat = global_feat.view(global_feat.shape[0], -1)  # flatten to (bs, 2048)
+        global_feat = global_feat.view(global_feat.shape[0], -1)  # (bs, 2048)
 
         if self.neck == 'no':
             feat = global_feat
@@ -131,10 +120,6 @@ class Backbone(nn.Module):
             else:
                 cls_score = self.classifier(feat)
 
-            # -------------------------------------------------------------------------
-            # [Modified by] Zhang Hang & Meng Fanyi | [Date] 2025-09-12
-            # [Content] When SupCon is enabled, also return L2-normalized projection z_supcon.
-            # -------------------------------------------------------------------------
             if hasattr(self, "supcon_head"):
                 z_supcon = self.supcon_head(feat)
                 z_supcon = F.normalize(z_supcon, dim=1)
@@ -220,10 +205,7 @@ class build_transformer(nn.Module):
         self.bottleneck.bias.requires_grad_(False)
         self.bottleneck.apply(weights_init_kaiming)
 
-        # ---------------------------------------------------------------------------------
-        # [Modified by] Zhang Hang & Meng Fanyi | [Date] 2025-09-12
-        # [Content] Add optional SupCon projection head (in_planes -> 128) for transformer.
-        # ---------------------------------------------------------------------------------
+        # SupCon projection head (in_planes -> 128)
         if hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "SUPCON") and getattr(cfg.LOSS.SUPCON, "ENABLE", False):
             self.supcon_head = nn.Sequential(
                 nn.Linear(self.in_planes, 2048),
@@ -241,10 +223,6 @@ class build_transformer(nn.Module):
             else:
                 cls_score = self.classifier(feat)
 
-            # -------------------------------------------------------------------------
-            # [Modified by] Zhang Hang & Meng Fanyi | [Date] 2025-09-12
-            # [Content] When SupCon is enabled, also return L2-normalized projection z_supcon.
-            # -------------------------------------------------------------------------
             if hasattr(self, "supcon_head"):
                 z_supcon = self.supcon_head(feat)
                 z_supcon = F.normalize(z_supcon, dim=1)
@@ -353,10 +331,7 @@ class build_transformer_local(nn.Module):
         self.divide_length = cfg.MODEL.DEVIDE_LENGTH
         self.rearrange = rearrange
 
-        # ---------------------------------------------------------------------------------
-        # [Modified by] Zhang Hang & Meng Fanyi | [Date] 2025-09-12
-        # [Content] Add optional SupCon projection head (in_planes -> 128) for transformer-local.
-        # ---------------------------------------------------------------------------------
+        # SupCon projection head (in_planes -> 128)
         if hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "SUPCON") and getattr(cfg.LOSS.SUPCON, "ENABLE", False):
             self.supcon_head = nn.Sequential(
                 nn.Linear(self.in_planes, 2048),
@@ -413,10 +388,6 @@ class build_transformer_local(nn.Module):
                 ]
             feats = [global_feat, local_feat_1, local_feat_2, local_feat_3, local_feat_4]
 
-            # -------------------------------------------------------------------------
-            # [Modified by] Zhang Hang & Meng Fanyi | [Date] 2025-09-12
-            # [Content] When SupCon is enabled, also return L2-normalized projection z_supcon.
-            # -------------------------------------------------------------------------
             if hasattr(self, "supcon_head"):
                 z_supcon = self.supcon_head(feat)
                 z_supcon = F.normalize(z_supcon, dim=1)
@@ -436,6 +407,33 @@ class build_transformer_local(nn.Module):
                                   local_feat_2 / 4,
                                   local_feat_3 / 4,
                                   local_feat_4 / 4], dim=1)
+
+    # =============================================================================
+    # [2025-09-15 | Zhang Hang] Added load_param() for evaluation checkpoint loading
+    # =============================================================================
+    def load_param(self, trained_path: str, strict: bool = False):
+        import torch, os
+        assert os.path.isfile(trained_path), f"Weight file not found: {trained_path}"
+        state = torch.load(trained_path, map_location="cpu")
+
+        # compatible formats
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        elif isinstance(state, dict) and "model" in state:
+            state = state["model"]
+
+        # strip DataParallel prefix
+        clean = {k.replace("module.", ""): v for k, v in state.items()}
+
+        incompatible = self.load_state_dict(clean, strict=strict)
+        missing = getattr(incompatible, "missing_keys", [])
+        unexpected = getattr(incompatible, "unexpected_keys", [])
+        print(f"[build_transformer_local.load_param] loaded '{trained_path}' | "
+              f"missing={len(missing)} unexpected={len(unexpected)} strict={strict}")
+        if missing:
+            print("  missing:", missing[:12], "..." if len(missing) > 12 else "")
+        if unexpected:
+            print("  unexpected:", unexpected[:12], "..." if len(unexpected) > 12 else "")
 
 
 __factory_T_type = {
