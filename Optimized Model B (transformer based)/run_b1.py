@@ -16,22 +16,28 @@
 #                            save full metrics in JSON and stdout.
 # [2025-09-15 | Hang Zhang] Add b1_supcon_best_summary.json:
 #                            pick best epoch per seed, then compute mean/std.
+# [2025-09-16 | Hang Zhang] Auto-progress detection & seamless resume:
+#                            - Skip/Resume based on finished epoch_* folders
+#                            - Ensure test results exist; auto trigger eval-only
+#                              if training finished but no epoch summaries exist
+#                            - Idempotent re-entry for both search/full runs
 # ==========================================
 """
-B1 SupCon grid search (minimal) with grid loaded from YAML (LOSS.SUPCON.SEARCH).
+B1 SupCon grid search with auto-resume & test-guarantee.
 
 What it does:
-- Reads T/W candidates from the experiment YAML: LOSS.SUPCON.SEARCH.{T,W}
-- Loops over (T, W), runs short training to screen (single-seed, fast)
-- Parses metrics (mAP / Rank-1 / Rank-5 / Rank-10) from latest epoch_* subfolder
-- Saves the best combo to logs/b1_supcon_best.json
-- Retrains the best combo for FULL_EPOCHS with seeds = [0, 1, 2]
-- Aggregates the 3 seeds: pick best epoch per seed, compute mean/std, and save to
-  logs/b1_supcon_best_summary.json
+- Reads T/W candidates from YAML: LOSS.SUPCON.SEARCH.{T,W}
+- For each (T,W), run short training (single-seed) to screen
+- Parse metrics (mAP / Rank-1 / Rank-5 / Rank-10) from epoch_* subfolders
+- Save the best to logs/b1_supcon_best.json
+- Retrain best (T,W) with seeds=[0,1,2] for FULL_EPOCHS, pick each seed's best
+- Aggregate mean/std → logs/b1_supcon_best_summary.json
 
-Notes:
-- Uses a local/Colab-aware log root; override via env OUTPUT_ROOT if desired.
-- If SEARCH.{T,W} is missing in YAML, falls back to sensible defaults.
+Robustness:
+- Auto-picks LOG_ROOT (local/Colab)
+- If a run already reached target epochs, it skips training
+- If training finished but no per-epoch test results exist, it triggers eval-only
+- If SEARCH.{T,W} missing in YAML, falls back to defaults
 """
 
 import itertools
@@ -138,7 +144,7 @@ def load_grid_from_yaml(cfg_path: str) -> Tuple[List[float], List[float]]:
     # Fallback defaults (your current common choices)
     return [0.07], [0.25, 0.30, 0.35]
 
-# ---------- Parse metrics (latest-epoch helper) ----------
+# ---------- Metric parsing helpers ----------
 def _latest_epoch_dir(out_test_dir: Path) -> Optional[Path]:
     """Pick the newest epoch_* subfolder inside out_test_dir."""
     epochs = sorted(
@@ -198,7 +204,6 @@ def parse_metrics(out_test_dir: Path) -> Tuple[float, float, float, float]:
 
     return -1.0, -1.0, -1.0, -1.0
 
-# ---------- Per-epoch parsing & aggregation for summary ----------
 def parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, float]:
     """
     Read metrics from a single epoch_* directory.
@@ -258,32 +263,141 @@ def safe_stdev(values: List[float]) -> float:
     vals = [v for v in values if v >= 0]
     return round(stats.stdev(vals), 4) if len(vals) >= 2 else 0.0
 
-# ---------- One run (search, single-seed) ----------
-def run_one_search(t: float, w: float):
+# ---------- Progress & test guards ----------
+def count_finished_epochs(test_dir: Path) -> int:
+    """Return how many epoch_* subfolders exist under test_dir."""
+    return len([p for p in test_dir.glob("epoch_*") if p.is_dir() and p.name.split("_")[-1].isdigit()])
+
+def has_any_epoch_results(test_dir: Path) -> bool:
+    """Check if any epoch_* contains summary.json or known result files."""
+    for ep in test_dir.glob("epoch_*"):
+        if not ep.is_dir():
+            continue
+        if (ep / "summary.json").exists():
+            return True
+        for name in ("test_summary.txt", "results.txt", "log.txt"):
+            if (ep / name).exists():
+                return True
+    # also accept aggregated test_all.log as a weak signal
+    if (test_dir / "test_all.log").exists():
+        return True
+    return False
+
+def try_eval_only(tag: str) -> None:
     """
-    Run one (T,W) combo for SEARCH_EPOCHS with SEARCH_SEED only.
-    Tag does NOT carry seed suffix to keep compatibility with older logs,
-    but seed is passed via SOLVER.SEED.
+    Try to trigger an evaluation-only pass for the given TAG.
+    We attempt several common switches to be compatible with different trainers.
+    """
+    test_dir = LOG_ROOT / f"veri776_{tag}_deit_test"
+    print(f"[B1] Trying eval-only to produce test results for tag={tag} ...")
+
+    # 1) A common pattern: a dedicated CLI switch
+    candidate_cmds = [
+        # (args, description)
+        ([sys.executable, "run_modelB_deit.py", "--config", CONFIG, "--only-test",
+          "--opts", "OUTPUT_DIR", str(LOG_ROOT), "TAG", tag], "--only-test"),
+        ([sys.executable, "run_modelB_deit.py", "--config", CONFIG, "--eval-only",
+          "--opts", "OUTPUT_DIR", str(LOG_ROOT), "TAG", tag], "--eval-only"),
+        # 2) Via opts flag (some repos use this)
+        ([sys.executable, "run_modelB_deit.py", "--config", CONFIG,
+          "--opts", "EVAL_ONLY", "True", "OUTPUT_DIR", str(LOG_ROOT), "TAG", tag], "EVAL_ONLY True"),
+        ([sys.executable, "run_modelB_deit.py", "--config", CONFIG,
+          "--opts", "TEST.ONLY", "True", "OUTPUT_DIR", str(LOG_ROOT), "TAG", tag], "TEST.ONLY True"),
+    ]
+    for cmd, desc in candidate_cmds:
+        try:
+            print(f"[B1] Eval-only attempt: {desc}")
+            subprocess.check_call(cmd)
+            # If any attempt succeeds and results appear, break
+            if has_any_epoch_results(test_dir):
+                print(f"[B1] Eval-only success via {desc}")
+                return
+        except Exception as e:
+            print(f"[B1] Eval-only attempt failed ({desc}): {e}")
+
+    print("[B1][warn] Could not trigger eval-only with known switches. "
+          "If your trainer requires a specific flag, please adjust try_eval_only().")
+
+# ---------- Idempotent wrappers ----------
+def ensure_search_run(t: float, w: float) -> Dict[str, Any]:
+    """
+    Ensure one (T,W) search run is completed with results.
+    If already finished → parse. If finished but no results → eval-only. Otherwise → (re)run training.
     """
     tag = f"b1_supcon_T{_fmt(t)}_W{_fmt(w)}"
+    out_test_dir = LOG_ROOT / f"veri776_{tag}_deit_test"
+    finished = count_finished_epochs(out_test_dir)
+
+    if finished >= SEARCH_EPOCHS:
+        if has_any_epoch_results(out_test_dir):
+            mAP, r1, r5, r10 = parse_metrics(out_test_dir)
+            print(f"[B1] SEARCH SKIP tag={tag} (finished={finished}>=target={SEARCH_EPOCHS}) "
+                  f"mAP={mAP} Rank-1={r1} Rank-5={r5} Rank-10={r10}")
+        else:
+            print(f"[B1] SEARCH finished but no epoch results found. Triggering eval-only for tag={tag} ...")
+            try_eval_only(tag)
+            mAP, r1, r5, r10 = parse_metrics(out_test_dir)
+        return {"tag": tag, "T": t, "W": w, "mAP": mAP, "R1": r1, "R5": r5, "R10": r10}
+
+    # Not finished → (re)run training (trainer should auto-resume by TAG/OUTPUT_DIR)
+    print(f"[B1] SEARCH RUN tag={tag} (finished={finished}/{SEARCH_EPOCHS})")
     subprocess.check_call([
         sys.executable, "run_modelB_deit.py",
         "--config", CONFIG,
         "--opts",
-        "LOSS.SUPCON.ENABLE", "True",   # ensure SupCon is ON
+        "LOSS.SUPCON.ENABLE", "True",
         "LOSS.SUPCON.T", str(t),
         "LOSS.SUPCON.W", str(w),
         "SOLVER.MAX_EPOCHS", str(SEARCH_EPOCHS),
-        "SOLVER.SEED", str(SEARCH_SEED),   # ← single seed for search
+        "SOLVER.SEED", str(SEARCH_SEED),
         "OUTPUT_DIR", str(LOG_ROOT),
         "TAG", tag,
+        # If your trainer requires explicit resume, uncomment:
+        # "SOLVER.RESUME", "True",
     ])
-    # Must match run_modelB_deit.py naming: veri776_{tag}_deit_test
-    out_test_dir = LOG_ROOT / f"veri776_{tag}_deit_test"
     mAP, r1, r5, r10 = parse_metrics(out_test_dir)
     print(f"[B1] SEARCH RESULT tag={tag} T={t} W={w} seed={SEARCH_SEED} "
           f"mAP={mAP} Rank-1={r1} Rank-5={r5} Rank-10={r10}")
     return {"tag": tag, "T": t, "W": w, "mAP": mAP, "R1": r1, "R5": r5, "R10": r10}
+
+def ensure_full_run(best_T: float, best_W: float, seed: int, epochs: int) -> Optional[Dict[str, Any]]:
+    """
+    Ensure one full retrain run (best T,W with a specific seed) is completed with results.
+    If already finished → ensure results (eval-only if needed). Otherwise → (re)run training.
+    Returns best-epoch metrics dict, or None if not found.
+    """
+    tag = f"b1_supcon_best_T{_fmt(best_T)}_W{_fmt(best_W)}_seed{seed}"
+    test_dir = LOG_ROOT / f"veri776_{tag}_deit_test"
+    finished = count_finished_epochs(test_dir)
+
+    if finished >= epochs:
+        if not has_any_epoch_results(test_dir):
+            print(f"[B1] FULL finished but no epoch results found. Triggering eval-only for tag={tag} ...")
+            try_eval_only(tag)
+    else:
+        print(f"[B1] FULL RUN (resume if exists): T={best_T}, W={best_W}, seed={seed} → tag={tag} "
+              f"(finished={finished}/{epochs})")
+        subprocess.check_call([
+            sys.executable, "run_modelB_deit.py",
+            "--config", CONFIG,
+            "--opts",
+            "LOSS.SUPCON.ENABLE", "True",
+            "LOSS.SUPCON.T", str(best_T),
+            "LOSS.SUPCON.W", str(best_W),
+            "SOLVER.MAX_EPOCHS", str(epochs),
+            "SOLVER.SEED", str(seed),
+            "OUTPUT_DIR", str(LOG_ROOT),
+            "TAG", tag,
+            # If your trainer requires explicit resume, uncomment:
+            # "SOLVER.RESUME", "True",
+        ])
+
+    best_ep = pick_best_epoch_metrics(test_dir)
+    if best_ep is None:
+        print(f"[B1][warn] No valid epoch metrics found under: {test_dir}")
+        return None
+    print(f"[B1] Seed {seed} best epoch: {best_ep}")
+    return best_ep
 
 # ---------- Main ----------
 def main():
@@ -293,8 +407,8 @@ def main():
     print(f"[B1] Search uses single seed: {SEARCH_SEED}")
     print(f"[B1] Full training seeds   : {FULL_SEEDS}")
 
-    # 2) Sweep grid (single-seed) and collect metrics
-    runs = [run_one_search(t, w) for t, w in itertools.product(T_list, W_list)]
+    # 2) Sweep grid (single-seed) and collect metrics (idempotent & resumable)
+    runs = [ensure_search_run(t, w) for t, w in itertools.product(T_list, W_list)]
     if not runs:
         raise SystemExit("[B1] No runs executed. Check your SEARCH grid or paths.")
 
@@ -309,32 +423,12 @@ def main():
     }, indent=2))
     print(f"[B1] Saved best → {BEST_JSON}")
 
-    # 4) Retrain the best combo for FULL_EPOCHS with 3 seeds
+    # 4) Retrain the best combo for FULL_EPOCHS with 3 seeds (idempotent & resumable)
     seed_best_records: Dict[int, Dict[str, Any]] = {}
     for seed in FULL_SEEDS:
-        full_tag = f"b1_supcon_best_T{_fmt(best['T'])}_W{_fmt(best['W'])}_seed{seed}"
-        print(f"[B1] Full retrain: (T={best['T']}, W={best['W']}) seed={seed} → tag={full_tag}")
-        subprocess.check_call([
-            sys.executable, "run_modelB_deit.py",
-            "--config", CONFIG,
-            "--opts",
-            "LOSS.SUPCON.ENABLE", "True",   # ensure SupCon is ON
-            "LOSS.SUPCON.T", str(best["T"]),
-            "LOSS.SUPCON.W", str(best["W"]),
-            "SOLVER.MAX_EPOCHS", str(FULL_EPOCHS),
-            "SOLVER.SEED", str(seed),       # ← 3 seeds for confirmation
-            "OUTPUT_DIR", str(LOG_ROOT),
-            "TAG", full_tag,
-        ])
-
-        # After each seed is done, pick its best epoch
-        test_dir = LOG_ROOT / f"veri776_{full_tag}_deit_test"
-        best_ep = pick_best_epoch_metrics(test_dir)
-        if best_ep is None:
-            print(f"[B1][warn] No valid epoch metrics found under: {test_dir}")
-        else:
+        best_ep = ensure_full_run(best["T"], best["W"], seed, FULL_EPOCHS)
+        if best_ep is not None:
             seed_best_records[seed] = best_ep
-            print(f"[B1] Seed {seed} best epoch: {best_ep}")
 
     # 5) Aggregate mean/std across seeds and save summary JSON
     if seed_best_records:
