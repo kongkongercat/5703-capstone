@@ -34,6 +34,9 @@
 #                              re-test function (idempotent), which guarantees
 #                              "no re-train, no duplicate test".
 #                            - Keep English code comments; Chinese guidance in chat.
+# [2025-09-16 | ChatGPT   ] NEW: pass DATASETS.ROOT_DIR everywhere
+#                            - detect_data_root(): auto-detect VeRi dataset root
+#                            - add DATASETS.ROOT_DIR to all run/test invocations
 # ===========================================================
 
 import itertools
@@ -85,6 +88,36 @@ BEST_SUMMARY_JSON = LOG_ROOT / "b1_supcon_best_summary.json"
 
 def _fmt(v: float) -> str:
     return str(v).replace(".", "p")
+
+# ---------- Detect dataset root (VeRi) ----------
+def detect_data_root() -> str:
+    """
+    Return a directory path whose subfolder 'VeRi' exists.
+    Priority: $DATASETS_ROOT > common Colab/Drive locations > ../../datasets
+    """
+    # 1) Env override
+    env = os.getenv("DATASETS_ROOT")
+    if env and (Path(env) / "VeRi").exists():
+        return env
+
+    # 2) Common candidates (Colab / Drive / workspace)
+    candidates = [
+        "/content/drive/MyDrive/datasets",
+        "/content/drive/MyDrive/5703(hzha0521)/datasets",
+        "/content/datasets",
+        "/workspace/datasets",
+        str(Path.cwd().parents[1] / "datasets"),   # ../../datasets from project root
+        str(Path.cwd() / "datasets"),
+    ]
+    for c in candidates:
+        if (Path(c) / "VeRi").exists():
+            return c
+
+    # 3) Fallback to YAML default parent if nothing found (will still fail fast in test.py)
+    return str(Path.cwd().parents[1] / "datasets")
+
+DATA_ROOT = detect_data_root()
+print(f"[B1] Using DATASETS.ROOT_DIR={DATA_ROOT}")
 
 # ---------- Load grid from YAML (preferred), fallback to defaults ----------
 def _to_float_list(x) -> List[float]:
@@ -328,10 +361,10 @@ def eval_missing_epochs_via_test_py(tag_with_seed: str, config_path: str, log_ro
         out_ep.mkdir(parents=True, exist_ok=True)
         cmd = [
             sys.executable, "test.py", "--config_file", str(config_path),
-            # Keep device simple; test.py will typically auto-pick from config/opts.
             "MODEL.DEVICE", "cuda",
             "TEST.WEIGHT", str(ck),
             "OUTPUT_DIR", str(out_ep),
+            "DATASETS.ROOT_DIR", DATA_ROOT,   # <-- critical override
         ]
         print("[B1][eval] Launch:", " ".join(cmd))
         ret = subprocess.call(cmd)
@@ -390,7 +423,7 @@ def ensure_search_run(t: float, w: float) -> Dict[str, Any]:
         print(f"[B1] SEARCH DONE (no retrain) tag={tag_seed} mAP={mAP} R1={r1} R5={r5} R10={r10}")
         return {"tag": tag_base, "T": t, "W": w, "mAP": mAP, "R1": r1, "R5": r5, "R10": r10}
 
-    # Not done → (re)run training; launcher will auto-resume by TAG/OUTPUT_DIR and auto-appends seed suffix
+    # Not done → (re)run training
     print(f"[B1] SEARCH RUN tag={tag_seed} (trained_max={trained_max}/{SEARCH_EPOCHS})")
     subprocess.check_call([
         sys.executable, "run_modelB_deit.py",
@@ -403,8 +436,9 @@ def ensure_search_run(t: float, w: float) -> Dict[str, Any]:
         "SOLVER.SEED", str(SEARCH_SEED),
         "SOLVER.CHECKPOINT_PERIOD", "1",
         "SOLVER.EVAL_PERIOD", "1",
+        "DATASETS.ROOT_DIR", DATA_ROOT,  # <-- critical override for training/eval
         "OUTPUT_DIR", str(LOG_ROOT),
-        "TAG", tag_base,  # seed suffix will be auto-added by the launcher
+        "TAG", tag_base,  # seed suffix auto-added by the trainer
     ])
     # In case some epochs failed to be evaluated during training, reconstruct them
     eval_missing_epochs_via_test_py(tag_seed, CONFIG, LOG_ROOT)
@@ -453,6 +487,7 @@ def ensure_full_run(best_T: float, best_W: float, seed: int, epochs: int) -> Opt
             "SOLVER.SEED", str(seed),
             "SOLVER.CHECKPOINT_PERIOD", "1",
             "SOLVER.EVAL_PERIOD", "1",
+            "DATASETS.ROOT_DIR", DATA_ROOT,  # <-- critical override
             "OUTPUT_DIR", str(LOG_ROOT),
             "TAG", f"b1_supcon_best_T{_fmt(best_T)}_W{_fmt(best_W)}",  # launcher auto-adds _seed{seed}
         ])

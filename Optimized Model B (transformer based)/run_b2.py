@@ -24,6 +24,9 @@
 #                              and call test.py only for epochs missing outputs.
 #                            - Force CHECKPOINT_PERIOD=1 & EVAL_PERIOD=1 on new runs.
 #                            - Keep English code comments; naming aligned with run_b1.py.
+# [2025-09-16 | ChatGPT   ] NEW: pass DATASETS.ROOT_DIR everywhere
+#                            - detect_data_root(): auto-detect VeRi dataset root
+#                            - add DATASETS.ROOT_DIR to all run/test invocations
 # =============================================================================
 """
 B2: Use the best (T, W) from B1 to run long training with seeds=[0,1,2],
@@ -75,6 +78,32 @@ def pick_log_root() -> Path:
         dflt = "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/logs"
         return Path(os.getenv("DRIVE_LOG_ROOT", dflt))
     return Path("logs")
+
+# ---------- Dataset root detection ----------
+def detect_data_root() -> str:
+    """
+    Return a directory path whose subfolder 'VeRi' exists.
+    Priority: $DATASETS_ROOT > common Colab/Drive locations > ../../datasets
+    """
+    env = os.getenv("DATASETS_ROOT")
+    if env and (Path(env) / "VeRi").exists():
+        return env
+    candidates = [
+        "/content/drive/MyDrive/datasets",
+        "/content/drive/MyDrive/5703(hzha0521)/datasets",
+        "/content/datasets",
+        "/workspace/datasets",
+        str(Path.cwd().parents[1] / "datasets"),  # ../../datasets
+        str(Path.cwd() / "datasets"),
+    ]
+    for c in candidates:
+        if (Path(c) / "VeRi").exists():
+            return c
+    # Fallback (可能仍会失败，但至少可见报错路径)
+    return str(Path.cwd().parents[1] / "datasets")
+
+DATA_ROOT = detect_data_root()
+print(f"[B2] Using DATASETS.ROOT_DIR={DATA_ROOT}")
 
 def _fmt(v: float) -> str:
     return str(v).replace(".", "p")
@@ -215,6 +244,7 @@ def eval_missing_epochs_via_test_py(tag: str, config_path: str, log_root: Path) 
             "MODEL.DEVICE", "cuda",
             "TEST.WEIGHT", str(ck),
             "OUTPUT_DIR", str(out_ep),
+            "DATASETS.ROOT_DIR", DATA_ROOT,  # <-- critical override
         ]
         print("[B2][eval] Launch:", " ".join(cmd))
         ret = subprocess.call(cmd)
@@ -273,6 +303,7 @@ def ensure_full_run_seed(
             "SOLVER.SEED", str(seed),
             "SOLVER.CHECKPOINT_PERIOD", "1",
             "SOLVER.EVAL_PERIOD", "1",
+            "DATASETS.ROOT_DIR", DATA_ROOT,  # <-- critical override for training/eval
             "OUTPUT_DIR", str(log_root),
             "TAG", tag,
         ]
@@ -322,15 +353,13 @@ def main():
         raise SystemExit(f"[B2] Failed to parse {best_json}: {e}")
 
     # Locate B1 best weight for optional warm-start (transformer_12.pth)
-    b1_weight = None
+    b1_weight: Optional[Path] = None
     try:
-        # Prefer explicit run_dir in b1_supcon_best.json if present
         run_dir_str = json.loads(best_json.read_text()).get("run_dir", "")
         if run_dir_str:
             cand = Path(run_dir_str) / "transformer_12.pth"
             if cand.exists():
                 b1_weight = cand
-        # Fallback: infer from source_tag
         if b1_weight is None:
             src_tag = obj.get("source_tag")
             if src_tag:
@@ -360,6 +389,7 @@ def main():
         R10s  = [rec["Rank-10"] for rec in seed_best_records.values()]
         summary = {
             "T": T, "W": W, "config": B2_CONFIG, "epochs": FULL_EPOCHS,
+            "data_root": DATA_ROOT,
             "seeds": {str(k): v for k, v in seed_best_records.items()},
             "mean": {
                 "mAP":  safe_mean(mAPs),
