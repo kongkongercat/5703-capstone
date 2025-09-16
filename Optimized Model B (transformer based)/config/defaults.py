@@ -115,8 +115,8 @@ _C.INPUT.PADDING = 10
 # DATASETS
 # -----------------------------------------------------------------------------
 _C.DATASETS = CN()
-_C.DATASETS.NAMES = ('veri',)                           # VeRi-776
-_C.DATASETS.ROOT_DIR = ('../datasets')                  # override per-env if needed
+_C.DATASETS.NAMES = 'veri'                              # ← 已改为字符串
+_C.DATASETS.ROOT_DIR = '../datasets'                     # ← 已改为字符串
 
 # -----------------------------------------------------------------------------
 # DATALOADER
