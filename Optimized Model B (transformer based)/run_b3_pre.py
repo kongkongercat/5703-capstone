@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ==========================================
-# File: run_b1_self_supervised.py
-# Purpose: B1 SupCon grid search with YAML-driven grid (LOSS.SUPCON.SEARCH) for self-supervised learning
+# File: run_b3_self_supervised.py
+# Purpose: B3 SupCon grid search with YAML-driven grid (LOSS.SUPCON.SEARCH) for self-supervised learning
 # Author: Zeyu Yang (Your Email or Info Here)
 # ==========================================
 # Change Log
@@ -22,7 +22,7 @@ from typing import List, Tuple, Optional, Dict, Any
 import statistics as stats
 
 # ====== User settings ======
-CONFIG = "configs/VeiRi/deit_transreid_stride_b3_ssl_pretrain.yml".replace("VeiRi", "VeRi")
+CONFIG = "configs/VeRi/deit_transreid_stride_b3_ssl_pretrain.yml".replace("VeRi", "VeRi")
 SEARCH_EPOCHS = 12        # 12–15 recommended for quick screening
 FULL_EPOCHS   = 30        # long training for the best (T,W)
 # Seeds policy
@@ -56,8 +56,8 @@ def pick_log_root() -> Path:
 
 LOG_ROOT = pick_log_root()
 LOG_ROOT.mkdir(parents=True, exist_ok=True)
-BEST_JSON = LOG_ROOT / "b1_supcon_best.json"
-BEST_SUMMARY_JSON = LOG_ROOT / "b1_supcon_best_summary.json"
+BEST_JSON = LOG_ROOT / "b3_supcon_best.json"
+BEST_SUMMARY_JSON = LOG_ROOT / "b3_supcon_best_summary.json"
 
 def _fmt(v: float) -> str:
     return str(v).replace(".", "p")
@@ -147,7 +147,7 @@ def parse_metrics(out_test_dir: Path) -> Tuple[float, float, float, float]:
 
 # ---------- One run (search, single-seed) ----------
 def run_one_search(t: float, w: float):
-    tag = f"b1_supcon_T{_fmt(t)}_W{_fmt(w)}"
+    tag = f"b3_supcon_T{_fmt(t)}_W{_fmt(w)}"
     subprocess.check_call([
         sys.executable, "run_modelB_deit.py",
         "--config", CONFIG,
@@ -162,20 +162,20 @@ def run_one_search(t: float, w: float):
     ])
     out_test_dir = LOG_ROOT / f"veri776_{tag}_deit_test"
     mAP, r1, r5, r10 = parse_metrics(out_test_dir)
-    print(f"[B1] SEARCH RESULT tag={tag} T={t} W={w} seed={SEARCH_SEED} "
+    print(f"[B3] SEARCH RESULT tag={tag} T={t} W={w} seed={SEARCH_SEED} "
           f"mAP={mAP} Rank-1={r1} Rank-5={r5} Rank-10={r10}")
     return {"tag": tag, "T": t, "W": w, "mAP": mAP, "R1": r1, "R5": r5, "R10": r10}
 
 # ---------- Main ----------
 def main():
     T_list, W_list = load_grid_from_yaml(CONFIG)
-    print(f"[B1] Search grid → T={T_list} ; W={W_list}")
-    print(f"[B1] Search uses single seed: {SEARCH_SEED}")
-    print(f"[B1] Full training seeds   : {FULL_SEEDS}")
+    print(f"[B3] Search grid → T={T_list} ; W={W_list}")
+    print(f"[B3] Search uses single seed: {SEARCH_SEED}")
+    print(f"[B3] Full training seeds   : {FULL_SEEDS}")
 
     runs = [run_one_search(t, w) for t, w in itertools.product(T_list, W_list)]
     if not runs:
-        raise SystemExit("[B1] No runs executed. Check your SEARCH grid or paths.")
+        raise SystemExit("[B3] No runs executed. Check your SEARCH grid or paths.")
 
     best = max(runs, key=lambda x: (x["mAP"], x["R1"]))
     BEST_JSON.write_text(json.dumps({
@@ -183,14 +183,14 @@ def main():
         "mAP": best["mAP"], "Rank-1": best["R1"],
         "Rank-5": best.get("R5", -1), "Rank-10": best.get("R10", -1),
         "source_tag": best["tag"],
-        "note": "Best SupCon params from B1 search (single-seed screening)"
+        "note": "Best SupCon params from B3 search (single-seed screening)"
     }, indent=2))
-    print(f"[B1] Saved best → {BEST_JSON}")
+    print(f"[B3] Saved best → {BEST_JSON}")
 
     seed_best_records: Dict[int, Dict[str, Any]] = {}
     for seed in FULL_SEEDS:
-        full_tag = f"b1_supcon_best_T{_fmt(best['T'])}_W{_fmt(best['W'])}_seed{seed}"
-        print(f"[B1] Full retrain: (T={best['T']}, W={best['W']}) seed={seed} → tag={full_tag}")
+        full_tag = f"b3_supcon_best_T{_fmt(best['T'])}_W{_fmt(best['W'])}_seed{seed}"
+        print(f"[B3] Full retrain: (T={best['T']}, W={best['W']}) seed={seed} → tag={full_tag}")
         subprocess.check_call([
             sys.executable, "run_modelB_deit.py",
             "--config", CONFIG,
@@ -207,10 +207,10 @@ def main():
         test_dir = LOG_ROOT / f"veri776_{full_tag}_deit_test"
         best_ep = pick_best_epoch_metrics(test_dir)
         if best_ep is None:
-            print(f"[B1][warn] No valid epoch metrics found under: {test_dir}")
+            print(f"[B3][warn] No valid epoch metrics found under: {test_dir}")
         else:
             seed_best_records[seed] = best_ep
-            print(f"[B1] Seed {seed} best epoch: {best_ep}")
+            print(f"[B3] Seed {seed} best epoch: {best_ep}")
 
     if seed_best_records:
         mAPs  = [rec["mAP"] for rec in seed_best_records.values()]
@@ -238,11 +238,11 @@ def main():
                     "Means/std computed over seeds with valid metrics.",
         }
         BEST_SUMMARY_JSON.write_text(json.dumps(summary, indent=2))
-        print(f"[B1] Wrote summary → {BEST_SUMMARY_JSON}")
+        print(f"[B3] Wrote summary → {BEST_SUMMARY_JSON}")
     else:
-        print("[B1][warn] No seed best records collected; skip summary.")
+        print("[B3][warn] No seed best records collected; skip summary.")
 
-    print(f"[B1] Full retrains finished under {LOG_ROOT}")
+    print(f"[B3] Full retrains finished under {LOG_ROOT}")
 
 if __name__ == "__main__":
     main()
