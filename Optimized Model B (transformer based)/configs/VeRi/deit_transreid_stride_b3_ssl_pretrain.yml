@@ -75,6 +75,7 @@ SOLVER:
   WEIGHT_DECAY: 1e-4
   WEIGHT_DECAY_BIAS: 1e-4
   BIAS_LR_FACTOR: 2
+  MARGIN: 0.3
 
 # ==========================================
 # TEST / EVALUATION
@@ -106,4 +107,5 @@ LOSS:
 # OUTPUT
 # ==========================================
 # OUTPUT_DIR: '../logs/veri_deit_transreid_stride_b3_ssl_pretrain'  # handled by runner
+
 
