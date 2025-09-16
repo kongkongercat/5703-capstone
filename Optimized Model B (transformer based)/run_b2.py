@@ -16,21 +16,25 @@
 #                            (MODEL.PRETRAIN_CHOICE=self, not resume); force-enable
 #                            TripletX; set TRAINING_MODE=supervised explicitly.
 # [2025-09-16 | Hang Zhang] NEW: Seamless run (auto progress detection + resume + test guard)
-#                            - Skip or resume per seed based on epoch_* count
-#                            - If training finished but no epoch results, auto eval-only
-#                            - Warm-start only when no progress exists (finished==0)
+#                            - Skip/resume per seed based on trained/tested progress
+#                            - If training finished but no results, auto eval-only
+#                            - Warm-start only when *no progress* exists
+# [2025-09-16 | ChatGPT   ] Replace eval-only guessing with robust re-test:
+#                            - NEW eval_missing_epochs_via_test_py(): iterate checkpoints
+#                              and call test.py only for epochs missing outputs.
+#                            - Force CHECKPOINT_PERIOD=1 & EVAL_PERIOD=1 on new runs.
+#                            - Keep English code comments; naming aligned with run_b1.py.
 # =============================================================================
 """
-B2: Use best (T,W) from B1 to run long training with seeds=[0,1,2],
+B2: Use the best (T, W) from B1 to run long training with seeds=[0,1,2],
 pick best epoch per seed (by mAP, tie Rank-1), then aggregate mean/std.
 
-Robustness / Seamless behavior:
-- Auto-select LOG_ROOT (local/Colab)
+Seamless behavior (mirrors B1):
 - Per-seed run is idempotent:
-  * If epoch_* >= FULL_EPOCHS → skip training; ensure test results (eval-only if missing)
-  * If 0 < epoch_* < FULL_EPOCHS → resume training (same TAG/OUTPUT_DIR)
-  * If epoch_* == 0 → (first run) warm-start from B1's best weight when available
-- Test guard: if finished but no epoch summaries, try eval-only to produce results
+  * If tests already cover FULL_EPOCHS -> skip training/testing; parse directly.
+  * Else if checkpoints reached FULL_EPOCHS -> reconstruct missing tests via test.py.
+  * Else -> (re)train with CHECKPOINT_PERIOD=1 & EVAL_PERIOD=1, then reconstruct tests.
+- Warm-start only when there is zero progress and B1's best ckpt is found.
 """
 
 import json
@@ -57,6 +61,7 @@ def _in_colab() -> bool:
         return False
 
 def pick_log_root() -> Path:
+    """Pick a single root for logs/checkpoints/results: env > Colab Drive > ./logs."""
     env = os.getenv("OUTPUT_ROOT")
     if env:
         return Path(env)
@@ -74,7 +79,7 @@ def pick_log_root() -> Path:
 def _fmt(v: float) -> str:
     return str(v).replace(".", "p")
 
-# ---------- Metric parsing helpers ----------
+# ---------- Metrics parsing ----------
 def _re_pick(text: str, pat: str) -> float:
     m = re.search(pat, text, re.I)
     return float(m.group(1)) if m else -1.0
@@ -84,6 +89,7 @@ def _re_pick_last(text: str, pat: str) -> float:
     return float(mm[-1].group(1)) if mm else -1.0
 
 def parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, float]:
+    """Return (mAP, Rank-1, Rank-5, Rank-10) from a single epoch_* directory."""
     sj = epoch_dir / "summary.json"
     if sj.exists():
         try:
@@ -107,6 +113,7 @@ def parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, 
     return -1.0, -1.0, -1.0, -1.0
 
 def pick_best_epoch_metrics(test_dir: Path) -> Optional[Dict[str, Any]]:
+    """Iterate epoch_* and return the best epoch by (mAP, Rank-1)."""
     epochs = sorted(
         [p for p in test_dir.glob("epoch_*") if p.is_dir()],
         key=lambda p: int(p.name.split("_")[-1])
@@ -131,112 +138,164 @@ def safe_stdev(values: List[float]) -> float:
     vals = [v for v in values if v >= 0]
     return round(stats.stdev(vals), 4) if len(vals) >= 2 else 0.0
 
-# ---------- Progress & test guards ----------
-def count_finished_epochs(test_dir: Path) -> int:
-    return len([p for p in test_dir.glob("epoch_*") if p.is_dir() and p.name.split("_")[-1].isdigit()])
-
-def has_any_epoch_results(test_dir: Path) -> bool:
+# ---------- Progress detection ----------
+def _max_test_epoch(test_dir: Path) -> int:
+    """Return max epoch index that has any result file; 0 if none."""
+    max_ep = 0
     for ep in test_dir.glob("epoch_*"):
         if not ep.is_dir():
             continue
+        try:
+            idx = int(ep.name.split("_")[-1])
+        except Exception:
+            continue
         if (ep / "summary.json").exists():
-            return True
-        for name in ("test_summary.txt", "results.txt", "log.txt"):
-            if (ep / name).exists():
-                return True
+            max_ep = max(max_ep, idx); continue
+        for f in ("test_summary.txt", "results.txt", "log.txt"):
+            if (ep / f).exists():
+                max_ep = max(max_ep, idx); break
+    return max_ep
+
+def _max_epoch_from_checkpoints(run_dir: Path) -> int:
+    """Scan common checkpoint names and return max epoch; 0 if none."""
+    max_ep = 0
+    if not run_dir.exists():
+        return 0
+    for p in run_dir.glob("state_*.pth"):
+        m = re.search(r"state_(\d+)\.pth", p.name)
+        if m:
+            max_ep = max(max_ep, int(m.group(1)))
+    for p in run_dir.glob("transformer_*.pth"):
+        m = re.search(r"transformer_(\d+)\.pth", p.name)
+        if m:
+            max_ep = max(max_ep, int(m.group(1)))
+    return max_ep
+
+def has_any_epoch_results(test_dir: Path) -> bool:
+    """Any epoch_* result file or aggregated log present?"""
+    if _max_test_epoch(test_dir) > 0:
+        return True
     if (test_dir / "test_all.log").exists():
         return True
     return False
 
-def try_eval_only(tag: str, log_root: Path) -> None:
-    """Try several common eval-only switches to produce per-epoch test outputs."""
+# ---------- Robust re-test (no reliance on eval-only flags) ----------
+def eval_missing_epochs_via_test_py(tag: str, config_path: str, log_root: Path) -> None:
+    """
+    Reconstruct per-epoch test outputs by directly invoking test.py on every
+    checkpoint under .../{tag}_deit_run, writing results to
+    .../{tag}_deit_test/epoch_{E}. Only missing epochs are tested.
+    """
+    run_dir  = log_root / f"veri776_{tag}_deit_run"
     test_dir = log_root / f"veri776_{tag}_deit_test"
-    print(f"[B2] Trying eval-only to produce test results for tag={tag} ...")
-    candidate_cmds = [
-        ([sys.executable, "run_modelB_deit.py", "--config", B2_CONFIG, "--only-test",
-          "--opts", "OUTPUT_DIR", str(log_root), "TAG", tag], "--only-test"),
-        ([sys.executable, "run_modelB_deit.py", "--config", B2_CONFIG, "--eval-only",
-          "--opts", "OUTPUT_DIR", str(log_root), "TAG", tag], "--eval-only"),
-        ([sys.executable, "run_modelB_deit.py", "--config", B2_CONFIG,
-          "--opts", "EVAL_ONLY", "True", "OUTPUT_DIR", str(log_root), "TAG", tag], "EVAL_ONLY True"),
-        ([sys.executable, "run_modelB_deit.py", "--config", B2_CONFIG,
-          "--opts", "TEST.ONLY", "True", "OUTPUT_DIR", str(log_root), "TAG", tag], "TEST.ONLY True"),
-    ]
-    for cmd, desc in candidate_cmds:
-        try:
-            print(f"[B2] Eval-only attempt: {desc}")
-            subprocess.check_call(cmd)
-            if has_any_epoch_results(test_dir):
-                print(f"[B2] Eval-only success via {desc}")
-                return
-        except Exception as e:
-            print(f"[B2] Eval-only attempt failed ({desc}): {e}")
-    print("[B2][warn] Could not trigger eval-only with known switches. "
-          "Adjust try_eval_only() if your trainer uses different flags.")
+    test_dir.mkdir(parents=True, exist_ok=True)
 
-def has_any_checkpoint(tag: str, log_root: Path) -> bool:
-    """Heuristic: if epoch_* exists or common checkpoint files are present under the run dir."""
-    test_dir = log_root / f"veri776_{tag}_deit_test"
-    if count_finished_epochs(test_dir) > 0:
-        return True
-    # Try some common checkpoint locations/names adjacent to test dir
-    run_root = log_root / f"veri776_{tag}_deit"
-    patterns = ["*.pth", "checkpoint*.pth", "model_*.pth", "last*.pth"]
-    for pat in patterns:
-        if any(run_root.glob(pat)):
-            return True
-    return False
+    rx = re.compile(r"transformer_(\d+)\.pth$")
+    ckpts: List[Tuple[int, Path]] = []
+    for p in run_dir.glob("transformer_*.pth"):
+        m = rx.search(p.name)
+        if m:
+            ckpts.append((int(m.group(1)), p))
+    ckpts.sort(key=lambda x: x[0])
+
+    if not ckpts:
+        print(f"[B2][eval] No checkpoints found under: {run_dir}")
+        return
+
+    for ep, ck in ckpts:
+        out_ep = test_dir / f"epoch_{ep}"
+        if (out_ep / "summary.json").exists():
+            continue
+        if any((out_ep / name).exists() for name in ("test_summary.txt", "results.txt", "log.txt")):
+            continue
+
+        out_ep.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            sys.executable, "test.py", "--config_file", str(config_path),
+            "MODEL.DEVICE", "cuda",
+            "TEST.WEIGHT", str(ck),
+            "OUTPUT_DIR", str(out_ep),
+        ]
+        print("[B2][eval] Launch:", " ".join(cmd))
+        ret = subprocess.call(cmd)
+        if ret != 0:
+            print(f"[B2][eval][warn] test.py failed for epoch {ep} (ret={ret})")
 
 # ---------- Idempotent per-seed runner ----------
-def ensure_full_run_seed(T: float, W: float, seed: int, epochs: int,
-                         log_root: Path, b1_weight: Optional[Path], use_warmstart_if_empty: bool = True
-                         ) -> Optional[Dict[str, Any]]:
+def ensure_full_run_seed(
+    T: float, W: float, seed: int, epochs: int,
+    log_root: Path, b1_weight: Optional[Path], use_warmstart_if_empty: bool = True
+) -> Optional[Dict[str, Any]]:
+    """
+    Ensure one per-seed long run is completed with results.
+
+    Behavior:
+      - If tests already cover 'epochs' -> skip train/test; pick best and return.
+      - Else if checkpoints reached 'epochs' -> reconstruct missing tests via test.py; pick best.
+      - Else -> (re)train with CHECKPOINT_PERIOD=1 & EVAL_PERIOD=1 (resume by TAG);
+                if zero progress and b1_weight available, warm-start (not resume);
+                then reconstruct any missing tests and pick best.
+    """
     tag = f"b2_with_b1best_T{_fmt(T)}_W{_fmt(W)}_seed{seed}"
     test_dir = log_root / f"veri776_{tag}_deit_test"
-    finished = count_finished_epochs(test_dir)
+    run_dir  = log_root / f"veri776_{tag}_deit_run"
 
-    if finished >= epochs:
-        if not has_any_epoch_results(test_dir):
-            print(f"[B2] Finished but no epoch results. Triggering eval-only: tag={tag}")
-            try_eval_only(tag, log_root)
+    # 1) Already tested to target epochs? → skip train/test
+    tested_max = _max_test_epoch(test_dir)
+    if tested_max >= epochs:
+        best_ep = pick_best_epoch_metrics(test_dir)
+        if best_ep is None:
+            print(f"[B2][warn] Already tested to {tested_max}, but cannot parse metrics under: {test_dir}")
+            return None
+        print(f"[B2] FULL ALREADY-TESTED tag={tag} (tested_max={tested_max}≥{epochs}) best_ep={best_ep}")
+        return best_ep
+
+    # 2) Training progress by checkpoints
+    trained_max = _max_epoch_from_checkpoints(run_dir)
+    if trained_max >= epochs:
+        print(f"[B2] FULL trained_max={trained_max}≥{epochs}; ensure tests exist for tag={tag}")
+        eval_missing_epochs_via_test_py(tag, B2_CONFIG, log_root)
     else:
-        # Build base cmd
+        # 3) Need to train/resume
         cmd = [
             sys.executable, "run_modelB_deit.py",
             "--config", B2_CONFIG,
             "--opts",
-            # SupCon from B1 best
+            # SupCon inherited from B1
             "LOSS.SUPCON.ENABLE", "True",
             "LOSS.SUPCON.T", str(T),
             "LOSS.SUPCON.W", str(W),
-            # TripletX + training mode
+            # TripletX and training mode
             "LOSS.TRIPLETX.ENABLE", "True",
             "MODEL.TRAINING_MODE", "supervised",
             # Run settings
             "SOLVER.MAX_EPOCHS", str(epochs),
             "SOLVER.SEED", str(seed),
+            "SOLVER.CHECKPOINT_PERIOD", "1",
+            "SOLVER.EVAL_PERIOD", "1",
             "OUTPUT_DIR", str(log_root),
             "TAG", tag,
         ]
 
-        # Decide warm-start vs resume:
-        # - If no progress & b1_weight available & allowed → warm-start (non-resume)
-        # - Else → rely on trainer's auto-resume by TAG/OUTPUT_DIR
-        if finished == 0 and use_warmstart_if_empty and (b1_weight is not None) and (not has_any_checkpoint(tag, log_root)):
+        # Warm-start only when zero progress and weight exists
+        if trained_max == 0 and tested_max == 0 and use_warmstart_if_empty and b1_weight is not None:
             print(f"[B2] First run (no progress). Warm-start from B1 best: {b1_weight}")
             cmd += [
                 "MODEL.PRETRAIN_CHOICE", "self",
                 "MODEL.PRETRAIN_PATH", str(b1_weight),
             ]
         else:
-            print(f"[B2] Resume/continue run: tag={tag} (finished={finished}/{epochs})")
-            # If your trainer requires explicit resume flag, uncomment the next line:
+            print(f"[B2] Resume/continue run: tag={tag} (trained_max={trained_max}/{epochs})")
+            # If your trainer needs an explicit resume flag, you may add it here:
             # cmd += ["SOLVER.RESUME", "True"]
 
         print("[B2] Launch:", " ".join(cmd))
         subprocess.check_call(cmd)
 
-    # Pick best epoch metrics
+        # Reconstruct any missing test epochs after training (idempotent)
+        eval_missing_epochs_via_test_py(tag, B2_CONFIG, log_root)
+
+    # 4) Pick best epoch metrics after ensuring tests exist
     best_ep = pick_best_epoch_metrics(test_dir)
     if best_ep is None:
         print(f"[B2][warn] No valid epoch metrics under: {test_dir}")
@@ -250,10 +309,11 @@ def main():
     log_root.mkdir(parents=True, exist_ok=True)
     print(f"[B2] Using log_root={log_root}")
 
-    # Load best (T,W) strictly from B1 output
+    # Load best (T, W) strictly from B1 output
     best_json = log_root / "b1_supcon_best.json"
     if not best_json.exists():
         raise SystemExit(f"[B2] Missing {best_json}. Run B1 search first.")
+
     try:
         obj = json.loads(best_json.read_text())
         T = float(obj["T"])
@@ -261,20 +321,20 @@ def main():
     except Exception as e:
         raise SystemExit(f"[B2] Failed to parse {best_json}: {e}")
 
-    # Locate B1 best weight for optional warm-start
+    # Locate B1 best weight for optional warm-start (transformer_12.pth)
     b1_weight = None
     try:
-        # Prefer explicit run_dir if present
-        run_dir = Path(json.loads(best_json.read_text()).get("run_dir", ""))
-        if run_dir:
-            cand = run_dir / "transformer_12.pth"
+        # Prefer explicit run_dir in b1_supcon_best.json if present
+        run_dir_str = json.loads(best_json.read_text()).get("run_dir", "")
+        if run_dir_str:
+            cand = Path(run_dir_str) / "transformer_12.pth"
             if cand.exists():
                 b1_weight = cand
+        # Fallback: infer from source_tag
         if b1_weight is None:
-            # Fallback: try to infer from source_tag directory
             src_tag = obj.get("source_tag")
             if src_tag:
-                guess = log_root / f"veri776_{src_tag}_deit" / "transformer_12.pth"
+                guess = log_root / f"veri776_{src_tag}_deit_run" / "transformer_12.pth"
                 if guess.exists():
                     b1_weight = guess
         if b1_weight:
@@ -284,13 +344,14 @@ def main():
     except Exception as e:
         print(f"[B2][warn] Failed to locate B1 weight: {e}")
 
+    # Per-seed execution (idempotent & seamless)
     seed_best_records: Dict[int, Dict[str, Any]] = {}
     for seed in SEEDS:
         rec = ensure_full_run_seed(T, W, seed, FULL_EPOCHS, log_root, b1_weight)
         if rec is not None:
             seed_best_records[seed] = rec
 
-    # Aggregate
+    # Aggregate mean/std across seeds
     summary_path = log_root / "b2_supcon_best_summary.json"
     if seed_best_records:
         mAPs  = [rec["mAP"] for rec in seed_best_records.values()]
