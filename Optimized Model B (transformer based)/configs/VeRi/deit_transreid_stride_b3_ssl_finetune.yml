@@ -1,0 +1,183 @@
+# ==========================================
+# Model B3 (Self-Supervised Pretraining)
+# File: deit_transreid_stride_b3_ssl_pretrain.yml
+#
+# Change Log
+# [2025-09-16 | Zeyu Yang] Initial B3 config for Self-Supervised Pretraining.
+# [2025-09-16 | Zeyu Yang] Added SSL-specific loss configuration for self-supervised learning.
+# ==========================================
+
+# ==========================================
+# MODEL
+# ==========================================
+MODEL:
+  PRETRAIN_CHOICE: 'self'  # 'self' for self-supervised pretraining
+  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'  # Path to pretrained weights
+
+  METRIC_LOSS_TYPE: 'triplet'  # Use triplet loss for self-supervised, but will only use SupCon loss
+  IF_LABELSMOOTH: 'off'
+  IF_WITH_CENTER: 'no'
+
+  NAME: 'transformer'
+  TRANSFORMER_TYPE: 'vit_base_patch16_224_TransReID'  # Backbone type
+
+  DEVICE_ID: ('0')  # Specify the GPU ID
+
+  # Official stride setting
+  STRIDE_SIZE: [12, 12]
+  SIE_CAMERA: True
+  SIE_VIEW: True
+  SIE_COE: 3.0
+  JPM: True
+  SHIFT_NUM: 8
+  RE_ARRANGE: True
+
+# ==========================================
+# INPUT / AUGMENTATION
+# ==========================================
+INPUT:
+  SIZE_TRAIN: [256, 256]
+  SIZE_TEST:  [256, 256]
+  PROB: 0.5
+  RE_PROB: 0.8
+  PADDING: 10
+
+# ==========================================
+# DATASETS
+# ==========================================
+DATASETS:
+  NAMES: ('veri')  # Dataset used for pretraining (e.g., VeRi-776)
+  ROOT_DIR: ('../../datasets')
+
+# ==========================================
+# DATALOADER
+# ==========================================
+DATALOADER:
+  SAMPLER: 'softmax_triplet'
+  NUM_INSTANCE: 8
+  NUM_WORKERS: 8
+
+# ==========================================
+# SOLVER / OPTIMIZATION
+# ==========================================
+SOLVER:
+  OPTIMIZER_NAME: 'SGD'
+  MAX_EPOCHS: 120
+  BASE_LR: 0.01
+  IMS_PER_BATCH: 96
+
+  WARMUP_METHOD: 'linear'
+  LARGE_FC_LR: False
+  CHECKPOINT_PERIOD: 120
+  LOG_PERIOD: 50
+  EVAL_PERIOD: 120
+  WEIGHT_DECAY: 1e-4
+  WEIGHT_DECAY_BIAS: 1e-4
+  BIAS_LR_FACTOR: 2
+
+# ==========================================
+# TEST / EVALUATION
+# ==========================================
+TEST:
+  EVAL: True
+  IMS_PER_BATCH: 256
+  RE_RANKING: False
+  WEIGHT: ''
+  NECK_FEAT: 'before'
+  FEAT_NORM: 'yes'
+
+# ==========================================
+# LOSS (For Self-Supervised Pretraining)
+# ==========================================
+LOSS:
+  SUPCON:
+    ENABLE: True
+    W: 0.30
+    T: 0.07
+    CAM_AWARE: False
+    POS_RULE: "class"
+
+  TRIPLETX:
+    ENABLE: False
+
+# ==========================================
+# OUTPUT
+# ==========================================
+# OUTPUT_DIR: '../logs/veri_deit_transreid_stride_b3_ssl_pretrain'
+# ==========================================
+
+
+# ============================================================
+# >>> Added block for Fine-tuning (supervised) <<<
+# Save this as a separate file deit_transreid_b3_finetune.yml
+# ============================================================
+
+MODEL:
+  PRETRAIN_CHOICE: 'finetune'   # fine-tuning mode
+  PRETRAIN_PATH: ''             # runner 会用 --opts 覆盖成 ckpt 路径
+  METRIC_LOSS_TYPE: 'softmax+triplet'
+  IF_LABELSMOOTH: 'on'
+  IF_WITH_CENTER: 'no'
+
+  NAME: 'transformer'
+  TRANSFORMER_TYPE: 'vit_base_patch16_224_TransReID'
+  DEVICE_ID: ('0')
+
+  STRIDE_SIZE: [12, 12]
+  SIE_CAMERA: True
+  SIE_VIEW: True
+  SIE_COE: 3.0
+  JPM: True
+  SHIFT_NUM: 8
+  RE_ARRANGE: True
+
+INPUT:
+  SIZE_TRAIN: [256, 256]
+  SIZE_TEST:  [256, 256]
+  PROB: 0.5
+  RE_PROB: 0.5        # 微调时适当减弱增强
+  PADDING: 10
+
+DATASETS:
+  NAMES: ('veri')
+  ROOT_DIR: ('../../datasets')
+
+DATALOADER:
+  SAMPLER: 'softmax_triplet'
+  NUM_INSTANCE: 4      # batch 小一点即可
+  NUM_WORKERS: 8
+
+SOLVER:
+  OPTIMIZER_NAME: 'AdamW'
+  MAX_EPOCHS: 30
+  BASE_LR: 0.00003     # 小学习率微调
+  IMS_PER_BATCH: 64
+
+  WARMUP_METHOD: 'linear'
+  LARGE_FC_LR: True
+  CHECKPOINT_PERIOD: 10
+  LOG_PERIOD: 20
+  EVAL_PERIOD: 5
+  WEIGHT_DECAY: 1e-4
+  WEIGHT_DECAY_BIAS: 1e-4
+  BIAS_LR_FACTOR: 1.0
+
+TEST:
+  EVAL: True
+  IMS_PER_BATCH: 256
+  RE_RANKING: False
+  WEIGHT: ''
+  NECK_FEAT: 'after'
+  FEAT_NORM: 'yes'
+
+LOSS:
+  SUPCON:
+    ENABLE: False   # 关闭 SupCon，使用监督损失
+  TRIPLET:
+    ENABLE: True
+    MARGIN: 0.3
+  CE:
+    ENABLE: True
+    EPSILON: 0.1
+
+# OUTPUT_DIR 在 runner 里由 TAG 指定
