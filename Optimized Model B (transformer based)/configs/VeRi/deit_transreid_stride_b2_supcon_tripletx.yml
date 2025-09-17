@@ -7,6 +7,7 @@
 # [2025-09-14 | Hang Zhang] Initial B2 config (SupCon + TripletX; K=8 PK-sampler).
 # [2025-09-14 | Hang Zhang] Remove LOSS.SUPCON from YAML; SupCon (T/W/ENABLE) will be injected by run_b2.py.
 # [2025-09-14 | Hang Zhang] Comment out OUTPUT_DIR to avoid override conflicts with runner.
+# [2025-09-17 | Hang Zhang] Added SOLVER.MARGIN=0.3 for compatibility with legacy TripletLoss in make_loss.py.
 # ==========================================
 
 # ==========================================
@@ -68,7 +69,7 @@ SOLVER:
   MAX_EPOCHS: 120
   BASE_LR: 0.01
   IMS_PER_BATCH: 64               
-
+  MARGIN: 0.3   
   WARMUP_METHOD: 'linear'
   LARGE_FC_LR: False
   CHECKPOINT_PERIOD: 120
