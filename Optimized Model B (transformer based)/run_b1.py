@@ -37,6 +37,10 @@
 # [2025-09-16 | ChatGPT   ] NEW: pass DATASETS.ROOT_DIR everywhere
 #                            - detect_data_root(): auto-detect VeRi dataset root
 #                            - add DATASETS.ROOT_DIR to all run/test invocations
+# [2025-09-17 | ChatGPT   ] FIX: recognize existing test artifacts correctly
+#                            - Treat `test_log.txt` and `dist_mat.npy` as valid
+#                              epoch-completion markers (besides summary/log files)
+#                            - Add diagnostics for tested_max / paths
 # ===========================================================
 
 import itertools
@@ -56,6 +60,14 @@ FULL_EPOCHS   = 30        # long training for the best (T,W)
 SEARCH_SEED   = 0         # single seed for search
 FULL_SEEDS    = [0, 1, 2] # seeds for confirmation
 # ===========================
+
+# ---- Test completion markers (unified) ----
+# Presence of ANY of these files under test_dir/epoch_X/ == "tested".
+TEST_MARKER_FILES_DEFAULT = (
+    "summary.json", "test_summary.txt", "results.txt", "log.txt",
+    "test_log.txt",      # your current artifact
+    "dist_mat.npy"       # supported if you enable matrix saving
+)
 
 # ---------- Env helpers ----------
 def _in_colab() -> bool:
@@ -95,12 +107,10 @@ def detect_data_root() -> str:
     Return a directory path whose subfolder 'VeRi' exists.
     Priority: $DATASETS_ROOT > common Colab/Drive locations > ../../datasets
     """
-    # 1) Env override
     env = os.getenv("DATASETS_ROOT")
     if env and (Path(env) / "VeRi").exists():
         return env
 
-    # 2) Common candidates (Colab / Drive / workspace)
     candidates = [
         "/content/drive/MyDrive/datasets",
         "/content/drive/MyDrive/5703(hzha0521)/datasets",
@@ -113,7 +123,7 @@ def detect_data_root() -> str:
         if (Path(c) / "VeRi").exists():
             return c
 
-    # 3) Fallback to YAML default parent if nothing found (will still fail fast in test.py)
+    # Fallback to YAML-default parent; if wrong, test.py will fail visibly.
     return str(Path.cwd().parents[1] / "datasets")
 
 DATA_ROOT = detect_data_root()
@@ -192,7 +202,7 @@ def _re_pick_last(text: str, pat: str) -> float:
 def parse_metrics(out_test_dir: Path) -> Tuple[float, float, float, float]:
     """
     Return (mAP, Rank-1, Rank-5, Rank-10) from latest epoch_*.
-    Priority: epoch_*/summary.json; fallback: test_all.log by regex.
+    Priority: epoch_*/summary.json; fallback: epoch_* logs; fallback: test_all.log.
     Missing values return -1.0.
     """
     ep = _latest_epoch_dir(out_test_dir)
@@ -208,7 +218,8 @@ def parse_metrics(out_test_dir: Path) -> Tuple[float, float, float, float]:
                 return mAP, r1, r5, r10
             except Exception:
                 pass
-        for name in ("test_summary.txt", "results.txt", "log.txt"):
+        # include test_log.txt as a valid source
+        for name in ("test_summary.txt", "results.txt", "log.txt", "test_log.txt"):
             p = ep / name
             if p.exists():
                 s = p.read_text(encoding="utf-8", errors="ignore")
@@ -242,7 +253,8 @@ def parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, 
             return mAP, r1, r5, r10
         except Exception:
             pass
-    for name in ("test_summary.txt", "results.txt", "log.txt"):
+    # include test_log.txt for robustness
+    for name in ("test_summary.txt", "results.txt", "log.txt", "test_log.txt"):
         p = epoch_dir / name
         if p.exists():
             s = p.read_text(encoding="utf-8", errors="ignore")
@@ -294,10 +306,8 @@ def _max_test_epoch(test_dir: Path) -> int:
             idx = int(ep.name.split("_")[-1])
         except Exception:
             continue
-        if (ep / "summary.json").exists():
-            max_ep = max(max_ep, idx)
-            continue
-        for f in ("test_summary.txt", "results.txt", "log.txt"):
+        # unified marker check
+        for f in TEST_MARKER_FILES_DEFAULT:
             if (ep / f).exists():
                 max_ep = max(max_ep, idx)
                 break
@@ -339,7 +349,7 @@ def eval_missing_epochs_via_test_py(tag_with_seed: str, config_path: str, log_ro
     test_dir.mkdir(parents=True, exist_ok=True)
 
     rx = re.compile(r"transformer_(\d+)\.pth$")
-    ckpts = []
+    ckpts: List[Tuple[int, Path]] = []
     for p in run_dir.glob("transformer_*.pth"):
         m = rx.search(p.name)
         if m:
@@ -350,12 +360,21 @@ def eval_missing_epochs_via_test_py(tag_with_seed: str, config_path: str, log_ro
         print(f"[B1][eval] No checkpoints found under: {run_dir}")
         return
 
+    print(f"[B1][diagnose] run_root={run_dir}")
+    print(f"[B1][diagnose] test_root={test_dir}")
+
     for ep, ck in ckpts:
         out_ep = test_dir / f"epoch_{ep}"
-        # Skip if any prior artifact exists for this epoch
-        if (out_ep / "summary.json").exists():
-            continue
-        if any((out_ep / name).exists() for name in ("test_summary.txt", "results.txt", "log.txt")):
+
+        # unified "done" check (includes test_log.txt / dist_mat.npy)
+        already = False
+        if out_ep.exists():
+            for name in TEST_MARKER_FILES_DEFAULT:
+                if (out_ep / name).exists():
+                    already = True
+                    break
+        if already:
+            print(f"[B1][eval] Skip epoch {ep}: existing test markers in {out_ep}")
             continue
 
         out_ep.mkdir(parents=True, exist_ok=True)
@@ -364,7 +383,7 @@ def eval_missing_epochs_via_test_py(tag_with_seed: str, config_path: str, log_ro
             "MODEL.DEVICE", "cuda",
             "TEST.WEIGHT", str(ck),
             "OUTPUT_DIR", str(out_ep),
-            "DATASETS.ROOT_DIR", DATA_ROOT,   # <-- critical override
+            "DATASETS.ROOT_DIR", DATA_ROOT,   # critical override
         ]
         print("[B1][eval] Launch:", " ".join(cmd))
         ret = subprocess.call(cmd)
@@ -408,6 +427,7 @@ def ensure_search_run(t: float, w: float) -> Dict[str, Any]:
     test_dir = _search_test_dir(t, w)
 
     tested_max = _max_test_epoch(test_dir)
+    print(f"[B1][diagnose] SEARCH tested_max={tested_max} under {test_dir}")
     if tested_max >= SEARCH_EPOCHS:
         mAP, r1, r5, r10 = parse_metrics(test_dir)
         print(f"[B1] SEARCH ALREADY-TESTED tag={tag_seed} (tested_max={tested_max}≥{SEARCH_EPOCHS}) "
@@ -417,7 +437,6 @@ def ensure_search_run(t: float, w: float) -> Dict[str, Any]:
     trained_max = _max_epoch_from_checkpoints(run_dir)
     if trained_max >= SEARCH_EPOCHS:
         print(f"[B1] SEARCH trained_max={trained_max}≥{SEARCH_EPOCHS}; ensure tests exist for tag={tag_seed}")
-        # Idempotent re-test (only missing epochs will be tested)
         eval_missing_epochs_via_test_py(tag_seed, CONFIG, LOG_ROOT)
         mAP, r1, r5, r10 = parse_metrics(test_dir)
         print(f"[B1] SEARCH DONE (no retrain) tag={tag_seed} mAP={mAP} R1={r1} R5={r5} R10={r10}")
@@ -436,11 +455,10 @@ def ensure_search_run(t: float, w: float) -> Dict[str, Any]:
         "SOLVER.SEED", str(SEARCH_SEED),
         "SOLVER.CHECKPOINT_PERIOD", "1",
         "SOLVER.EVAL_PERIOD", "1",
-        "DATASETS.ROOT_DIR", DATA_ROOT,  # <-- critical override for training/eval
+        "DATASETS.ROOT_DIR", DATA_ROOT,  # critical override for training/eval
         "OUTPUT_DIR", str(LOG_ROOT),
         "TAG", tag_base,  # seed suffix auto-added by the trainer
     ])
-    # In case some epochs failed to be evaluated during training, reconstruct them
     eval_missing_epochs_via_test_py(tag_seed, CONFIG, LOG_ROOT)
 
     mAP, r1, r5, r10 = parse_metrics(test_dir)
@@ -461,6 +479,7 @@ def ensure_full_run(best_T: float, best_W: float, seed: int, epochs: int) -> Opt
     test_dir = _full_test_dir(best_T, best_W, seed)
 
     tested_max = _max_test_epoch(test_dir)
+    print(f"[B1][diagnose] FULL tested_max={tested_max} under {test_dir}")
     if tested_max >= epochs:
         best_ep = pick_best_epoch_metrics(test_dir)
         if best_ep is None:
@@ -487,11 +506,10 @@ def ensure_full_run(best_T: float, best_W: float, seed: int, epochs: int) -> Opt
             "SOLVER.SEED", str(seed),
             "SOLVER.CHECKPOINT_PERIOD", "1",
             "SOLVER.EVAL_PERIOD", "1",
-            "DATASETS.ROOT_DIR", DATA_ROOT,  # <-- critical override
+            "DATASETS.ROOT_DIR", DATA_ROOT,  # critical override
             "OUTPUT_DIR", str(LOG_ROOT),
             "TAG", f"b1_supcon_best_T{_fmt(best_T)}_W{_fmt(best_W)}",  # launcher auto-adds _seed{seed}
         ])
-        # Reconstruct any missing tests afterwards
         eval_missing_epochs_via_test_py(tag_seed, CONFIG, LOG_ROOT)
 
     best_ep = pick_best_epoch_metrics(test_dir)
