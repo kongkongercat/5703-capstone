@@ -12,6 +12,7 @@ from yacs.config import CfgNode as CN
 # [2025-09-16 | Hang Zhang] **Update defaults to current model baseline (TransReID + DeiT stride):**
 #                           ViT backbone, STRIDE_SIZE=[12,12], SIE/JPM on, VeRi dataset, P×K sampler,
 #                           SGD schedule (120 epochs), test batch=256.
+# [2025-09-17 | Hang Zhang] Added SOLVER.MARGIN=0.3 for backward compatibility with legacy TripletLoss.
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
@@ -115,8 +116,8 @@ _C.INPUT.PADDING = 10
 # DATASETS
 # -----------------------------------------------------------------------------
 _C.DATASETS = CN()
-_C.DATASETS.NAMES = 'veri'                              # ← 已改为字符串
-_C.DATASETS.ROOT_DIR = '../datasets'                     # ← 已改为字符串
+_C.DATASETS.NAMES = 'veri'                              # ← string
+_C.DATASETS.ROOT_DIR = '../datasets'                    # ← string
 
 # -----------------------------------------------------------------------------
 # DATALOADER
@@ -140,6 +141,9 @@ _C.SOLVER.WEIGHT_DECAY = 1e-4
 _C.SOLVER.WEIGHT_DECAY_BIAS = 1e-4
 _C.SOLVER.GAMMA = 0.1
 _C.SOLVER.STEPS = (40, 70)
+
+# Triplet loss margin (legacy baseline, still referenced in make_loss.py)
+_C.SOLVER.MARGIN = 0.3
 
 # Warmup
 _C.SOLVER.WARMUP_FACTOR = 0.01
