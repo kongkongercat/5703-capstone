@@ -12,8 +12,16 @@
 #   - Robust test skipping (summary.json/test_log.txt/dist_mat.npy)
 #   - Pick best epoch per seed (by mAP, tie Rank-1)
 #   - Aggregate mean/std across seeds, save JSON summary
+# [2025-09-18 | Hang Zhang] Polished & hardened:
+#   - Data root detection + sanity hints
+#   - Resume training by injecting MODEL.PRETRAIN_* if checkpoint exists
+#   - Always override SOLVER.MAX_EPOCHS to target epochs
+#   - Device auto-detect for test phase (cuda > mps > cpu), env override EVAL_DEVICE
+#   - Per-seed best JSON dump (b0_baseline_seedX_best.json)
+#   - Idempotent logging and minor bug-proofing
 # ===========================================================
 
+from __future__ import annotations
 import json, os, re, subprocess, sys, statistics as stats
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -24,7 +32,8 @@ FULL_EPOCHS = 30
 SEEDS       = [0, 1, 2]
 # ===================================
 
-# ----- Env helpers -----
+# ----- Colab detection & log root -----
+
 def _in_colab() -> bool:
     try:
         import google.colab  # noqa: F401
@@ -32,13 +41,14 @@ def _in_colab() -> bool:
     except Exception:
         return False
 
+
 def pick_log_root() -> Path:
     env = os.getenv("OUTPUT_ROOT")
     if env:
         return Path(env)
     if _in_colab():
         try:
-            from google.colab import drive
+            from google.colab import drive  # type: ignore
             if not Path("/content/drive/MyDrive").exists():
                 drive.mount("/content/drive", force_remount=False)
         except Exception:
@@ -47,11 +57,13 @@ def pick_log_root() -> Path:
         return Path(os.getenv("DRIVE_LOG_ROOT", dflt))
     return Path("logs")
 
+
 LOG_ROOT = pick_log_root()
 LOG_ROOT.mkdir(parents=True, exist_ok=True)
 SUMMARY_JSON = LOG_ROOT / "b0_baseline_best_summary.json"
 
 # ----- Dataset root detection -----
+
 def detect_data_root() -> str:
     env = os.getenv("DATASETS_ROOT")
     if env and (Path(env) / "VeRi").exists():
@@ -67,23 +79,32 @@ def detect_data_root() -> str:
     for c in candidates:
         if (Path(c) / "VeRi").exists():
             return c
-    return str(Path.cwd().parents[1] / "datasets")
+    # Fallback: conventional relative path; may not exist but allows explicit error later.
+    return str(Path.cwd() / "datasets")
+
 
 DATA_ROOT = detect_data_root()
 print(f"[B0] Using DATASETS.ROOT_DIR={DATA_ROOT}")
+if not (Path(DATA_ROOT) / "VeRi").exists():
+    print("[B0][warn] VeRi folder not found under DATASETS.ROOT_DIR.\n"
+          "           Expected: <DATASETS.ROOT_DIR>/VeRi/{image_train,image_query,image_test}\n"
+          "           Training will likely fail until dataset is placed correctly.")
 
 # ----- Helpers -----
 TEST_MARKER_FILES = (
     "summary.json", "test_summary.txt", "results.txt",
-    "log.txt", "test_log.txt", "dist_mat.npy"
+    "log.txt", "test_log.txt", "dist_mat.npy",
 )
+
 
 def _fmt(v: float) -> str:
     return str(v).replace(".", "p")
 
+
 def _re_pick(text: str, pat: str) -> float:
     m = re.search(pat, text, re.I)
     return float(m.group(1)) if m else -1.0
+
 
 def parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, float]:
     sj = epoch_dir / "summary.json"
@@ -105,6 +126,7 @@ def parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, 
             return mAP, r1, r5, r10
     return -1.0, -1.0, -1.0, -1.0
 
+
 def pick_best_epoch_metrics(test_dir: Path) -> Optional[Dict[str, Any]]:
     epochs = sorted([p for p in test_dir.glob("epoch_*") if p.is_dir()],
                     key=lambda p: int(p.name.split("_")[-1]))
@@ -112,7 +134,7 @@ def pick_best_epoch_metrics(test_dir: Path) -> Optional[Dict[str, Any]]:
     for ep in epochs:
         idx = int(ep.name.split("_")[-1])
         mAP, r1, r5, r10 = parse_metrics_from_epoch_dir(ep)
-        if mAP < 0: 
+        if mAP < 0:
             continue
         key = (mAP, r1)
         if (best_key is None) or (key > best_key):
@@ -120,19 +142,23 @@ def pick_best_epoch_metrics(test_dir: Path) -> Optional[Dict[str, Any]]:
             best = {"epoch": idx, "mAP": mAP, "Rank-1": r1, "Rank-5": r5, "Rank-10": r10}
     return best
 
+
 def safe_mean(values: List[float]) -> float:
     vals = [v for v in values if v >= 0]
     return round(stats.mean(vals), 4) if vals else -1.0
+
 
 def safe_stdev(values: List[float]) -> float:
     vals = [v for v in values if v >= 0]
     return round(stats.stdev(vals), 4) if len(vals) >= 2 else 0.0
 
 # ----- Progress detection -----
+
 def _max_test_epoch(test_dir: Path) -> int:
     max_ep = 0
     for ep in test_dir.glob("epoch_*"):
-        if not ep.is_dir(): continue
+        if not ep.is_dir():
+            continue
         try:
             idx = int(ep.name.split("_")[-1])
         except Exception:
@@ -143,14 +169,35 @@ def _max_test_epoch(test_dir: Path) -> int:
                 break
     return max_ep
 
+
 def _max_epoch_from_checkpoints(run_dir: Path) -> int:
     max_ep = 0
     for p in run_dir.glob("transformer_*.pth"):
         m = re.search(r"transformer_(\d+)\.pth", p.name)
-        if m: max_ep = max(max_ep, int(m.group(1)))
+        if m:
+            max_ep = max(max_ep, int(m.group(1)))
     return max_ep
 
+# ----- Eval device selection -----
+
+def pick_eval_device() -> str:
+    env = os.getenv("EVAL_DEVICE")
+    if env:
+        return env
+    try:
+        import torch  # local import so the file doesn't require torch just to parse
+        if torch.cuda.is_available():
+            return "cuda"
+        # MPS (Apple Silicon) backend
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():  # type: ignore
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
 # ----- Robust re-test -----
+
 def eval_missing_epochs_via_test_py(tag: str, config_path: str, log_root: Path):
     run_dir  = log_root / f"veri776_{tag}_deit_run"
     test_dir = log_root / f"veri776_{tag}_deit_test"
@@ -160,8 +207,11 @@ def eval_missing_epochs_via_test_py(tag: str, config_path: str, log_root: Path):
     rx = re.compile(r"transformer_(\d+)\.pth$")
     for p in run_dir.glob("transformer_*.pth"):
         m = rx.search(p.name)
-        if m: ckpts.append((int(m.group(1)), p))
+        if m:
+            ckpts.append((int(m.group(1)), p))
     ckpts.sort()
+
+    device = pick_eval_device()
 
     for ep, ck in ckpts:
         out_ep = test_dir / f"epoch_{ep}"
@@ -170,7 +220,7 @@ def eval_missing_epochs_via_test_py(tag: str, config_path: str, log_root: Path):
         out_ep.mkdir(parents=True, exist_ok=True)
         cmd = [
             sys.executable, "test.py", "--config_file", str(config_path),
-            "MODEL.DEVICE", "cuda",
+            "MODEL.DEVICE", device,
             "TEST.WEIGHT", str(ck),
             "OUTPUT_DIR", str(out_ep),
             "DATASETS.ROOT_DIR", DATA_ROOT,
@@ -178,7 +228,9 @@ def eval_missing_epochs_via_test_py(tag: str, config_path: str, log_root: Path):
         print("[B0][eval] Launch:", " ".join(cmd))
         subprocess.call(cmd)
 
+
 # ----- Idempotent runner per seed -----
+
 def ensure_full_run(seed: int, epochs: int, log_root: Path) -> Optional[Dict[str, Any]]:
     tag = f"b0_baseline_seed{seed}"
     run_dir  = log_root / f"veri776_{tag}_deit_run"
@@ -189,40 +241,58 @@ def ensure_full_run(seed: int, epochs: int, log_root: Path) -> Optional[Dict[str
         best_ep = pick_best_epoch_metrics(test_dir)
         if best_ep:
             print(f"[B0] Already tested seed={seed}, best={best_ep}")
+            # also dump per-seed best json for quick lookup
+            (log_root / f"b0_baseline_seed{seed}_best.json").write_text(json.dumps(best_ep, indent=2))
             return best_ep
 
     trained_max = _max_epoch_from_checkpoints(run_dir)
+
+    # ---- resume-aware training ----
     if trained_max >= epochs:
         print(f"[B0] Trained to {trained_max}, reconstruct tests for seed={seed}")
         eval_missing_epochs_via_test_py(tag, CONFIG, log_root)
     else:
-        print(f"[B0] Training seed={seed} (resume if exists, {trained_max}/{epochs})")
-        subprocess.check_call([
+        print(f"[B0] Training seed={seed} (resume {trained_max}/{epochs})")
+        ckpt_path = run_dir / f"transformer_{trained_max}.pth"
+
+        cmd = [
             sys.executable, "run_modelB_deit.py",
             "--config", CONFIG,
             "--opts",
+            # Always override target epochs, regardless of what's stored in the checkpoint
             "SOLVER.MAX_EPOCHS", str(epochs),
             "SOLVER.SEED", str(seed),
             "SOLVER.CHECKPOINT_PERIOD", "1",
             "SOLVER.EVAL_PERIOD", "1",
             "DATASETS.ROOT_DIR", DATA_ROOT,
             "OUTPUT_DIR", str(log_root),
-            "TAG", "b0_baseline",  # seed 后缀由 trainer 自动加
-        ])
+            "TAG", "b0_baseline",  # seed 后缀由 trainer 自动追加
+        ]
+        if ckpt_path.exists() and trained_max > 0:
+            cmd += [
+                "MODEL.PRETRAIN_CHOICE", "resume",
+                "MODEL.PRETRAIN_PATH", str(ckpt_path),
+            ]
+        print("[B0][train] Launch:", " ".join(cmd))
+        subprocess.check_call(cmd)
         eval_missing_epochs_via_test_py(tag, CONFIG, log_root)
 
     best_ep = pick_best_epoch_metrics(test_dir)
     if best_ep:
         print(f"[B0] Seed {seed} best epoch: {best_ep}")
+        (log_root / f"b0_baseline_seed{seed}_best.json").write_text(json.dumps(best_ep, indent=2))
         return best_ep
     return None
 
+
 # ----- Main -----
+
 def main():
     seed_best: Dict[int, Dict[str, Any]] = {}
     for seed in SEEDS:
         rec = ensure_full_run(seed, FULL_EPOCHS, LOG_ROOT)
-        if rec: seed_best[seed] = rec
+        if rec:
+            seed_best[seed] = rec
 
     if seed_best:
         mAPs = [rec["mAP"] for rec in seed_best.values()]
@@ -246,7 +316,7 @@ def main():
                 "Rank-5": safe_stdev(R5s),
                 "Rank-10": safe_stdev(R10s),
             },
-            "note": "Best epoch per seed picked by mAP (tie-breaker Rank-1)."
+            "note": "Best epoch per seed picked by mAP (tie-breaker Rank-1).",
         }
         SUMMARY_JSON.write_text(json.dumps(summary, indent=2))
         print(f"[B0] Wrote summary → {SUMMARY_JSON}")
@@ -254,6 +324,7 @@ def main():
         print("[B0][warn] No valid results collected.")
 
     print("[B0] Done.")
+
 
 if __name__ == "__main__":
     main()
