@@ -19,12 +19,12 @@
 #                            - Skip/resume per seed based on trained/tested progress
 #                            - If training finished but no results, auto eval-only
 #                            - Warm-start only when *no progress* exists
-# [2025-09-16 | ChatGPT   ] Replace eval-only guessing with robust re-test:
+# [2025-09-16 | Hang Zhang] Replace eval-only guessing with robust re-test:
 #                            - NEW eval_missing_epochs_via_test_py(): iterate checkpoints
 #                              and call test.py only for epochs missing outputs.
 #                            - Force CHECKPOINT_PERIOD=1 & EVAL_PERIOD=1 on new runs.
 #                            - Keep English code comments; naming aligned with run_b1.py.
-# [2025-09-16 | ChatGPT   ] NEW: pass DATASETS.ROOT_DIR everywhere
+# [2025-09-16 | Hang Zhang] NEW: pass DATASETS.ROOT_DIR everywhere
 #                            - detect_data_root(): auto-detect VeRi dataset root
 #                            - add DATASETS.ROOT_DIR to all run/test invocations
 # =============================================================================

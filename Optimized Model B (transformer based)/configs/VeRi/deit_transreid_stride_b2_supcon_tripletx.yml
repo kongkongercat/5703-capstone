@@ -21,7 +21,7 @@ MODEL:
   IF_WITH_CENTER: 'no'
 
   NAME: 'transformer'
-  TRANSFORMER_TYPE: 'deit_base_distilled_patch16_224_TransReID'
+  TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
 
   NO_MARGIN: False
   DEVICE_ID: ('0')
@@ -67,7 +67,7 @@ SOLVER:
   OPTIMIZER_NAME: 'SGD'
   MAX_EPOCHS: 120
   BASE_LR: 0.01
-  IMS_PER_BATCH: 96                # P*K (e.g., 12*8)
+  IMS_PER_BATCH: 64               
 
   WARMUP_METHOD: 'linear'
   LARGE_FC_LR: False
