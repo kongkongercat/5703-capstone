@@ -1,3 +1,8 @@
+# ==========================================
+# Change Log
+# [2025-09-21 | Zeyu Yang] Add random sampling method
+# ==========================================
+
 import torch
 import torchvision.transforms as T
 from torch.utils.data import DataLoader
@@ -13,6 +18,8 @@ import torch.distributed as dist
 from .occ_duke import OCC_DukeMTMCreID
 from .vehicleid import VehicleID
 from .veri import VeRi
+from torch.utils.data.distributed import DistributedSampler
+
 __factory = {
     'market1501': Market1501,
     'dukemtmc': DukeMTMCreID,
@@ -81,18 +88,54 @@ def make_dataloader(cfg):
             )
         else:
             train_loader = DataLoader(
-                train_set, batch_size=cfg.SOLVER.IMS_PER_BATCH,
+                train_set,
+                batch_size=cfg.SOLVER.IMS_PER_BATCH,
                 sampler=RandomIdentitySampler(dataset.train, cfg.SOLVER.IMS_PER_BATCH, cfg.DATALOADER.NUM_INSTANCE),
-                num_workers=num_workers, collate_fn=train_collate_fn
+                num_workers=num_workers,
+                collate_fn=train_collate_fn
             )
+
     elif cfg.DATALOADER.SAMPLER == 'softmax':
         print('using softmax sampler')
         train_loader = DataLoader(
-            train_set, batch_size=cfg.SOLVER.IMS_PER_BATCH, shuffle=True, num_workers=num_workers,
+            train_set,
+            batch_size=cfg.SOLVER.IMS_PER_BATCH,
+            shuffle=True,
+            num_workers=num_workers,
             collate_fn=train_collate_fn
         )
+
+    elif cfg.DATALOADER.SAMPLER == 'random':
+        # 严格SSL：不依赖标签的随机采样
+        if cfg.MODEL.DIST_TRAIN:
+            print('DIST_TRAIN START (random)')
+            world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+            mini_batch_size = cfg.SOLVER.IMS_PER_BATCH // max(world, 1)
+            data_sampler = DistributedSampler(train_set, shuffle=True)
+            train_loader = DataLoader(
+                train_set,
+                batch_size=mini_batch_size,
+                sampler=data_sampler,
+                num_workers=num_workers,
+                pin_memory=True,
+                drop_last=True,
+                collate_fn=train_collate_fn,
+            )
+        else:
+            train_loader = DataLoader(
+                train_set,
+                batch_size=cfg.SOLVER.IMS_PER_BATCH,
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=True,
+                drop_last=True,
+                collate_fn=train_collate_fn,
+            )
+
     else:
-        print('unsupported sampler! expected softmax or triplet but got {}'.format(cfg.SAMPLER))
+        s = getattr(cfg.DATALOADER, 'SAMPLER', '<missing>')
+        raise ValueError('unsupported sampler! expected softmax/softmax_triplet/triplet/random but got {}'.format(s))
+
 
     val_set = ImageDataset(dataset.query + dataset.gallery, val_transforms)
 
