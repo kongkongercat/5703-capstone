@@ -2,13 +2,15 @@
 # -*- coding: utf-8 -*-
 # ==========================================
 # File: run_b3_self_supervised.py
-# Purpose: B3 SupCon grid search with YAML-driven grid (LOSS.SUPCON.SEARCH) for self-supervised learning
+# Purpose: B3 SupCon grid search with YAML-driven grid (LOSS.SUPCON.SEARCH)
 # Author: Zeyu Yang (Your Email or Info Here)
 # ==========================================
 # Change Log
 # [2025-09-16 | Zeyu Yang] Initial version: added self-supervised grid search for SupCon.
 # [2025-09-16 | Zeyu Yang] Ensure SupCon is explicitly enabled via --opts
 # [2025-09-16 | Zeyu Yang] Adapted for self-supervised learning.
+# [2025-09-22 | Zeyu Yang] Grid runs now use softmax_triplet sampler with ID/TRIPLET weights=0,
+#                           force TEST.EVAL=True, start from ImageNet (no resume), and unique TAGs.
 # ==========================================
 
 import itertools
@@ -17,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import time  # NEW
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 import statistics as stats
@@ -30,7 +33,7 @@ FULL_EPOCHS   = 30        # long training for the best (T,W)
 SEARCH_SEED = 0           # fast screening: single seed only
 FULL_SEEDS  = [0, 1, 2]   # confirm best with 3 seeds
 
-# Whether to force SSL-style overrides so the pipeline does NOT use labels
+# Whether to apply SSL-style overrides (we use SupCon-only training with eval on)
 FORCE_SSL_OVERRIDES = True
 # ===========================
 
@@ -65,6 +68,10 @@ BEST_SUMMARY_JSON = LOG_ROOT / "b3_supcon_best_summary.json"
 
 def _fmt(v: float) -> str:
     return str(v).replace(".", "p")
+
+def _unique_tag(base: str) -> str:
+    """Make a unique tag to avoid resuming from old checkpoints accidentally."""
+    return f"{base}_{time.strftime('%m%d-%H%M%S')}"
 
 # ---------- YAML grid loader ----------
 def _to_float_list(x) -> List[float]:
@@ -154,10 +161,8 @@ def _resolve_test_dir(log_root: Path, tag: str) -> Path:
     # Fallback: glob within 3 levels
     candidates = glob.glob(str(log_root / f"**/*{tag}*deit_test"), recursive=True)
     if candidates:
-        # Choose the most recent modified
         candidates = sorted(candidates, key=lambda p: os.path.getmtime(p), reverse=True)
         return Path(candidates[0])
-    # As a last resort, return the expected (may not exist; caller should handle)
     return expected
 
 def parse_metrics(out_test_dir: Path) -> Tuple[float, float, float, float]:
@@ -221,32 +226,39 @@ def pick_best_epoch_metrics(test_dir: Path):
 # ---------- One run (search, single-seed) ----------
 def _ssl_overrides_for_opts(t: float, w: float) -> List[str]:
     """
-    Build --opts overrides to ensure label-free SSL if FORCE_SSL_OVERRIDES is True.
-    Requires model pipeline to support z_supcon & instance positive rule.
+    Recommended overrides for SSL-style SupCon training:
+      - use softmax_triplet sampler but disable ID/TRIPLET losses (weights=0)
+      - force TEST.EVAL=True
+      - start from ImageNet (avoid resume)
     """
     if not FORCE_SSL_OVERRIDES:
-        # Still ensure SupCon on + set (T, W)
         return [
             "LOSS.SUPCON.ENABLE", "True",
             "LOSS.SUPCON.T", str(t),
             "LOSS.SUPCON.W", str(w),
         ]
     return [
-        # Turn on SupCon and set hyper-params
+        # SupCon on + hyper-params
         "LOSS.SUPCON.ENABLE", "True",
         "LOSS.SUPCON.T", str(t),
         "LOSS.SUPCON.W", str(w),
-        "LOSS.SUPCON.POS_RULE", "instance",
-        # Switch to SSL mode + remove label-dependent pieces
+        "LOSS.SUPCON.POS_RULE", "class",
+
+        # Use supervised sampler but disable its losses
+        "DATALOADER.SAMPLER", "softmax_triplet",
+        "DATALOADER.NUM_INSTANCE", "4",   # adjust per GPU memory
+
+        "MODEL.ID_LOSS_WEIGHT", "0",
+        "MODEL.TRIPLET_LOSS_WEIGHT", "0",
+
+        # SSL mode + fresh start + enable eval
         "MODEL.TRAINING_MODE", "self_supervised",
-        "DATALOADER.SAMPLER", "random",
-        "DATALOADER.NUM_INSTANCE", "1",
-        # Avoid label-based evaluation during pretrain
-        "TEST.EVAL", "False",
+        "MODEL.PRETRAIN_CHOICE", "imagenet",
+        "TEST.EVAL", "True",
     ]
 
 def run_one_search(t: float, w: float):
-    tag = f"b3_supcon_T{_fmt(t)}_W{_fmt(w)}"
+    tag = _unique_tag(f"b3_supcon_T{_fmt(t)}_W{_fmt(w)}")  # unique tag
     cmd = [
         sys.executable, "run_modelB_deit.py",
         "--config", CONFIG,
@@ -268,7 +280,6 @@ def run_one_search(t: float, w: float):
     print(f"[B3] SEARCH RESULT tag={tag} T={t} W={w} seed={SEARCH_SEED} "
           f"mAP={mAP} Rank-1={r1} Rank-5={r5} Rank-10={r10}")
 
-    # 强制确保拿到有效指标；否则让你第一时间发现问题
     if mAP < 0 or r1 < 0:
         raise RuntimeError(f"[B3] Invalid metrics (mAP={mAP}, R1={r1}). "
                            f"Check logs under {out_test_dir} and training config.")
@@ -287,7 +298,6 @@ def main():
     if not runs:
         raise SystemExit("[B3] No runs executed. Check your SEARCH grid or paths.")
 
-    # choose best
     best = max(runs, key=lambda x: (x["mAP"], x["R1"]))
     BEST_JSON.write_text(json.dumps({
         "T": best["T"], "W": best["W"],
@@ -302,7 +312,9 @@ def main():
     # ---- Full retrain with multiple seeds
     seed_best_records: Dict[int, Dict[str, Any]] = {}
     for seed in FULL_SEEDS:
-        full_tag = f"b3_supcon_best_T{_fmt(best['T'])}_W{_fmt(best['W'])}_seed{seed}"
+        full_tag = _unique_tag(
+            f"b3_supcon_best_T{_fmt(best['T'])}_W{_fmt(best['W'])}_seed{seed}"
+        )
         print(f"[B3] Full retrain: (T={best['T']}, W={best['W']}) seed={seed} → tag={full_tag}")
 
         cmd = [
