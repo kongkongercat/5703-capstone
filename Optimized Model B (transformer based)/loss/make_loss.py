@@ -6,15 +6,9 @@
 Modified by Zhang Hang on 2025-09-11:
 - Added support for Supervised Contrastive Loss (SupConLoss)
 - Integrate cfg.LOSS.SUPCON.ENABLE / W / T into total loss calculation
+Modified by Zhang Hang on 2025-09-22:
+Added a new branch for sampler == "random": computes only the SupCon loss (no ID / Triplet)
 """
-
-import torch
-import torch.nn.functional as F
-from .softmax_loss import CrossEntropyLabelSmooth, LabelSmoothingCrossEntropy
-from .triplet_loss import TripletLoss
-from .center_loss import CenterLoss
-from .supcon_loss import SupConLoss  # <-- Added
-
 
 def make_loss(cfg, num_classes):
     sampler = cfg.DATALOADER.SAMPLER
@@ -52,7 +46,6 @@ def make_loss(cfg, num_classes):
         def loss_func(score, feat, target, camids=None, z_supcon=None):
             ce_loss = F.cross_entropy(score, target)
             total_loss = ce_loss
-            # Add SupCon if enabled and z_supcon provided
             if supcon_criterion is not None and z_supcon is not None:
                 total_loss += cfg.LOSS.SUPCON.W * supcon_criterion(z_supcon, target, camids)
             return total_loss
@@ -89,8 +82,16 @@ def make_loss(cfg, num_classes):
 
             return total_loss
 
+    elif sampler == 'random':
+        # 严格SSL：仅计算 SupCon，不用 ID / Triplet
+        def loss_func(score, feat, target, camids=None, z_supcon=None):
+            if supcon_criterion is None or z_supcon is None:
+                raise RuntimeError("sampler=random 需要启用 SupCon 且在前向里提供 z_supcon 张量")
+            return cfg.LOSS.SUPCON.W * supcon_criterion(z_supcon, target, camids)
+
     else:
-        print('expected sampler should be softmax or softmax_triplet'
-              'but got {}'.format(cfg.DATALOADER.SAMPLER))
+        # 直接抛错，避免 loss_func 未定义
+        raise ValueError('expected sampler should be softmax/softmax_triplet/random '
+                         'but got {}'.format(cfg.DATALOADER.SAMPLER))
 
     return loss_func, center_criterion
