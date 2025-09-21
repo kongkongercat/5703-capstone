@@ -1,3 +1,16 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ==========================================
+# File: run_b3_self_supervised.py
+# Purpose: B3 SupCon grid search with YAML-driven grid (LOSS.SUPCON.SEARCH) for self-supervised learning
+# Author: Zeyu Yang (Your Email or Info Here)
+# ==========================================
+# Change Log
+# [2025-09-16 | Zeyu Yang] Initial version: added self-supervised grid search for SupCon.
+# [2025-09-16 | Zeyu Yang] Ensure SupCon is explicitly enabled via --opts
+# [2025-09-16 | Zeyu Yang] Adapted for self-supervised learning.
+# ==========================================
+
 import itertools
 import json
 import os
