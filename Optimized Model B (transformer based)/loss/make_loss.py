@@ -9,6 +9,12 @@ Modified by Zhang Hang on 2025-09-11:
 Modified by Zhang Hang on 2025-09-22:
 Added a new branch for sampler == "random": computes only the SupCon loss (no ID / Triplet)
 """
+import torch
+import torch.nn.functional as F
+from .softmax_loss import CrossEntropyLabelSmooth, LabelSmoothingCrossEntropy
+from .triplet_loss import TripletLoss
+from .center_loss import CenterLoss
+from .supcon_loss import SupConLoss
 
 def make_loss(cfg, num_classes):
     sampler = cfg.DATALOADER.SAMPLER
