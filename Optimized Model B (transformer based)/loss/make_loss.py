@@ -16,6 +16,12 @@ from .triplet_loss import TripletLoss
 from .center_loss import CenterLoss
 from .supcon_loss import SupConLoss
 
+def _pick_z(z_supcon, feat):
+    """优先用 z_supcon；否则回退到主干特征 feat。"""
+    if z_supcon is not None:
+        return z_supcon
+    return feat[0] if isinstance(feat, list) else feat
+
 def make_loss(cfg, num_classes):
     sampler = cfg.DATALOADER.SAMPLER
     feat_dim = 2048
@@ -52,8 +58,9 @@ def make_loss(cfg, num_classes):
         def loss_func(score, feat, target, camids=None, z_supcon=None):
             ce_loss = F.cross_entropy(score, target)
             total_loss = ce_loss
-            if supcon_criterion is not None and z_supcon is not None:
-                total_loss += cfg.LOSS.SUPCON.W * supcon_criterion(z_supcon, target, camids)
+            if supcon_criterion is not None:
+                z = _pick_z(z_supcon, feat)
+                total_loss += cfg.LOSS.SUPCON.W * supcon_criterion(z, target, camids)
             return total_loss
 
     elif sampler == 'softmax_triplet':
@@ -83,17 +90,19 @@ def make_loss(cfg, num_classes):
                          cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
 
             # ----- SupCon Loss -----
-            if supcon_criterion is not None and z_supcon is not None:
-                total_loss += cfg.LOSS.SUPCON.W * supcon_criterion(z_supcon, target, camids)
+            if supcon_criterion is not None:
+                z = _pick_z(z_supcon, feat)
+                total_loss += cfg.LOSS.SUPCON.W * supcon_criterion(z, target, camids)
 
             return total_loss
 
     elif sampler == 'random':
-        # 严格SSL：仅计算 SupCon，不用 ID / Triplet
+    # 仅 SupCon；允许回退到 feat，便于先跑通
         def loss_func(score, feat, target, camids=None, z_supcon=None):
-            if supcon_criterion is None or z_supcon is None:
-                raise RuntimeError("sampler=random 需要启用 SupCon 且在前向里提供 z_supcon 张量")
-            return cfg.LOSS.SUPCON.W * supcon_criterion(z_supcon, target, camids)
+            if supcon_criterion is None:
+                raise RuntimeError("sampler=random 需要启用 SupCon")
+                z = _pick_z(z_supcon, feat)
+                return cfg.LOSS.SUPCON.W * supcon_criterion(z, target, camids)
 
     else:
         # 直接抛错，避免 loss_func 未定义
