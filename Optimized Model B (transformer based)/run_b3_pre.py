@@ -11,6 +11,7 @@
 # [2025-09-16 | Zeyu Yang] Adapted for self-supervised learning.
 # [2025-09-22 | Zeyu Yang] Grid runs now use softmax_triplet sampler with ID/TRIPLET weights=0,
 #                           force TEST.EVAL=True, start from ImageNet (no resume), and unique TAGs.
+# [2025-09-23 | Zeyu Yang] Fix YACS dtype mismatch: pass MODEL.*_WEIGHT as float strings ("0.0").
 # ==========================================
 
 import itertools
@@ -19,7 +20,7 @@ import os
 import re
 import subprocess
 import sys
-import time  # NEW
+import time
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 import statistics as stats
@@ -38,6 +39,7 @@ FORCE_SSL_OVERRIDES = True
 # ===========================
 
 # ---------- Env helpers ----------
+
 def _in_colab() -> bool:
     try:
         import google.colab  # noqa: F401
@@ -74,6 +76,7 @@ def _unique_tag(base: str) -> str:
     return f"{base}_{time.strftime('%m%d-%H%M%S')}"
 
 # ---------- YAML grid loader ----------
+
 def _to_float_list(x) -> List[float]:
     if isinstance(x, (int, float)):
         return [float(x)]
@@ -125,6 +128,7 @@ def load_grid_from_yaml(cfg_path: str) -> Tuple[List[float], List[float]]:
     return [0.07], [0.25, 0.30, 0.35]
 
 # ---------- Regex helper / stats ----------
+
 def _re_pick(s: str, pattern: str, default: float = -1.0) -> float:
     m = re.search(pattern, s, flags=re.I)
     try:
@@ -141,12 +145,14 @@ def safe_stdev(xs):
     return stats.pstdev(xs) if len(xs) > 1 else 0.0
 
 # ---------- Metrics parsing helpers ----------
+
 def _latest_epoch_dir(out_test_dir: Path) -> Optional[Path]:
     epochs = sorted(
         [p for p in out_test_dir.glob("epoch_*") if p.is_dir()],
         key=lambda p: int(p.name.split("_")[-1]) if p.name.split("_")[-1].isdigit() else -1,
     )
     return epochs[-1] if epochs else None
+
 
 def _resolve_test_dir(log_root: Path, tag: str) -> Path:
     """
@@ -164,6 +170,7 @@ def _resolve_test_dir(log_root: Path, tag: str) -> Path:
         candidates = sorted(candidates, key=lambda p: os.path.getmtime(p), reverse=True)
         return Path(candidates[0])
     return expected
+
 
 def parse_metrics(out_test_dir: Path) -> Tuple[float, float, float, float]:
     """
@@ -199,6 +206,7 @@ def parse_metrics(out_test_dir: Path) -> Tuple[float, float, float, float]:
 
     return -1.0, -1.0, -1.0, -1.0
 
+
 def pick_best_epoch_metrics(test_dir: Path):
     """Pick best epoch by (mAP, Rank-1). Return a record dict or None."""
     best = None
@@ -224,6 +232,7 @@ def pick_best_epoch_metrics(test_dir: Path):
     return best
 
 # ---------- One run (search, single-seed) ----------
+
 def _ssl_overrides_for_opts(t: float, w: float) -> List[str]:
     """
     Recommended overrides for SSL-style SupCon training:
@@ -248,14 +257,16 @@ def _ssl_overrides_for_opts(t: float, w: float) -> List[str]:
         "DATALOADER.SAMPLER", "softmax_triplet",
         "DATALOADER.NUM_INSTANCE", "4",   # adjust per GPU memory
 
-        "MODEL.ID_LOSS_WEIGHT", "0",
-        "MODEL.TRIPLET_LOSS_WEIGHT", "0",
+        # IMPORTANT: pass floats as strings to satisfy YACS dtype check
+        "MODEL.ID_LOSS_WEIGHT", "0.0",
+        "MODEL.TRIPLET_LOSS_WEIGHT", "0.0",
 
         # SSL mode + fresh start + enable eval
         "MODEL.TRAINING_MODE", "self_supervised",
         "MODEL.PRETRAIN_CHOICE", "imagenet",
         "TEST.EVAL", "True",
     ]
+
 
 def run_one_search(t: float, w: float):
     tag = _unique_tag(f"b3_supcon_T{_fmt(t)}_W{_fmt(w)}")  # unique tag
@@ -287,6 +298,7 @@ def run_one_search(t: float, w: float):
     return {"tag": tag, "T": t, "W": w, "mAP": mAP, "R1": r1, "R5": r5, "R10": r10}
 
 # ---------- Main ----------
+
 def main():
     T_list, W_list = load_grid_from_yaml(CONFIG)
     print(f"[B3] Search grid → T={T_list} ; W={W_list}")
@@ -372,6 +384,7 @@ def main():
         print("[B3][warn] No seed best records collected; skip summary.")
 
     print(f"[B3] Full retrains finished under {LOG_ROOT}")
+
 
 if __name__ == "__main__":
     main()
