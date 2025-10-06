@@ -1,27 +1,25 @@
 # ==========================================
-# Model B3 (Self-Supervised Pretraining)
-# File: deit_transreid_stride_b3_ssl_pretrain.yml
+# Model B (TransReID + DeiT + official stride)
+# B4: Unified fine-tuning (CE + SupCon + TripletX) on top of SSL checkpoint
+# File: deit_transreid_stride_b4_ssl_finetune.yml
 #
 # Change Log
-# [2025-09-16 | Zeyu Yang] Initial B3 config for Self-Supervised Pretraining.
-# [2025-09-16 | Zeyu Yang] Added SSL-specific loss configuration for self-supervised learning.
+# [2025-10-06 | Fanyi Meng] Initial B4 fine-tune config.
 # ==========================================
 
 # ==========================================
 # MODEL
 # ==========================================
 MODEL:
-  PRETRAIN_CHOICE: 'self'  # 'self' for self-supervised pretraining
-  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'  # Path to pretrained weights
-
-  METRIC_LOSS_TYPE: 'triplet'  # Use triplet loss for self-supervised, but will only use SupCon loss
-  IF_LABELSMOOTH: 'off'
-  IF_WITH_CENTER: 'no'
+  # The runner (run_b4_fine.py) will inject:
+  #   MODEL.PRETRAIN_PATH: <SSL checkpoint>
+  #   MODEL.PRETRAIN_CHOICE: 'finetune'
+  PRETRAIN_CHOICE: 'finetune'
+  PRETRAIN_PATH: ''
 
   NAME: 'transformer'
-  TRANSFORMER_TYPE: 'vit_base_patch16_224_TransReID'  # Backbone type
-
-  DEVICE_ID: ('0')  # Specify the GPU ID
+  TRANSFORMER_TYPE: 'vit_base_patch16_224_TransReID'   # or 'deit_base_patch16_224_TransReID' if your codebase uses this key
+  DEVICE_ID: ('0')
 
   # Official stride setting
   STRIDE_SIZE: [12, 12]
@@ -32,6 +30,12 @@ MODEL:
   SHIFT_NUM: 8
   RE_ARRANGE: True
 
+  # Optional knobs used by some forks
+  TRAINING_MODE: 'supervised'   # fine-tuning with labels
+  NO_MARGIN: False              # ensure margin losses behave as expected
+  # Do not freeze backbone by default; runner can override if needed
+  # FREEZE_BACKBONE_AT: 0
+
 # ==========================================
 # INPUT / AUGMENTATION
 # ==========================================
@@ -39,41 +43,44 @@ INPUT:
   SIZE_TRAIN: [256, 256]
   SIZE_TEST:  [256, 256]
   PROB: 0.5
-  RE_PROB: 0.8
+  RE_PROB: 0.5         # slightly weaker than SSL
   PADDING: 10
 
 # ==========================================
 # DATASETS
 # ==========================================
 DATASETS:
-  NAMES: ('veri')  # Dataset used for pretraining (e.g., VeRi-776)
-  ROOT_DIR: ('../../datasets')
+  NAMES: ('veri')              # VeRi-776
+  ROOT_DIR: ('../../datasets') # runner may override DATASETS.ROOT_DIR
 
 # ==========================================
-# DATALOADER
+# DATALOADER (P × K sampler)
 # ==========================================
 DATALOADER:
   SAMPLER: 'softmax_triplet'
-  NUM_INSTANCE: 8
+  NUM_INSTANCE: 8              # K=8
   NUM_WORKERS: 8
 
 # ==========================================
-# SOLVER / OPTIMIZATION
+# SOLVER / OPTIMIZATION (fine-tuning friendly defaults)
 # ==========================================
 SOLVER:
-  OPTIMIZER_NAME: 'SGD'
-  MAX_EPOCHS: 120
-  BASE_LR: 0.01
-  IMS_PER_BATCH: 96
+  # You can switch to 'SGD' if you want to strictly match previous baselines.
+  OPTIMIZER_NAME: 'AdamW'
+  BASE_LR: 0.00003             # small LR for fine-tuning
+  WEIGHT_DECAY: 5e-5
+  WEIGHT_DECAY_BIAS: 5e-5
+  BIAS_LR_FACTOR: 1.0
+
+  IMS_PER_BATCH: 96            # adjust per GPU memory
+  MAX_EPOCHS: 20               # runner can override via --opts SOLVER.MAX_EPOCHS
 
   WARMUP_METHOD: 'linear'
-  LARGE_FC_LR: False
-  CHECKPOINT_PERIOD: 120
+  WARMUP_EPOCHS: 2
+
+  CHECKPOINT_PERIOD: 5
   LOG_PERIOD: 50
-  EVAL_PERIOD: 120
-  WEIGHT_DECAY: 1e-4
-  WEIGHT_DECAY_BIAS: 1e-4
-  BIAS_LR_FACTOR: 2
+  EVAL_PERIOD: 1               # per-epoch eval so the runner can parse epoch_* summaries
 
 # ==========================================
 # TEST / EVALUATION
@@ -87,97 +94,34 @@ TEST:
   FEAT_NORM: 'yes'
 
 # ==========================================
-# LOSS (For Self-Supervised Pretraining)
+# LOSS (B4: CE + SupCon + TripletX), all enabled together
 # ==========================================
 LOSS:
-  SUPCON:
-    ENABLE: True
-    W: 0.30
-    T: 0.07
-    CAM_AWARE: False
-    POS_RULE: "class"
-
-  TRIPLETX:
-    ENABLE: False
-
-# ==========================================
-# OUTPUT
-# ==========================================
-# OUTPUT_DIR: '../logs/veri_deit_transreid_stride_b3_ssl_pretrain'
-# ==========================================
-
-
-# ============================================================
-# >>> Added block for Fine-tuning (supervised) <<<
-# Save this as a separate file deit_transreid_b3_finetune.yml
-# ============================================================
-
-MODEL:
-  PRETRAIN_CHOICE: 'finetune'   # fine-tuning mode
-  PRETRAIN_PATH: ''             # runner 会用 --opts 覆盖成 ckpt 路径
-  METRIC_LOSS_TYPE: 'softmax+triplet'
-  IF_LABELSMOOTH: 'on'
-  IF_WITH_CENTER: 'no'
-
-  NAME: 'transformer'
-  TRANSFORMER_TYPE: 'vit_base_patch16_224_TransReID'
-  DEVICE_ID: ('0')
-
-  STRIDE_SIZE: [12, 12]
-  SIE_CAMERA: True
-  SIE_VIEW: True
-  SIE_COE: 3.0
-  JPM: True
-  SHIFT_NUM: 8
-  RE_ARRANGE: True
-
-INPUT:
-  SIZE_TRAIN: [256, 256]
-  SIZE_TEST:  [256, 256]
-  PROB: 0.5
-  RE_PROB: 0.5        # 微调时适当减弱增强
-  PADDING: 10
-
-DATASETS:
-  NAMES: ('veri')
-  ROOT_DIR: ('../../datasets')
-
-DATALOADER:
-  SAMPLER: 'softmax_triplet'
-  NUM_INSTANCE: 4      # batch 小一点即可
-  NUM_WORKERS: 8
-
-SOLVER:
-  OPTIMIZER_NAME: 'AdamW'
-  MAX_EPOCHS: 30
-  BASE_LR: 0.00003     # 小学习率微调
-  IMS_PER_BATCH: 64
-
-  WARMUP_METHOD: 'linear'
-  LARGE_FC_LR: True
-  CHECKPOINT_PERIOD: 10
-  LOG_PERIOD: 20
-  EVAL_PERIOD: 5
-  WEIGHT_DECAY: 1e-4
-  WEIGHT_DECAY_BIAS: 1e-4
-  BIAS_LR_FACTOR: 1.0
-
-TEST:
-  EVAL: True
-  IMS_PER_BATCH: 256
-  RE_RANKING: False
-  WEIGHT: ''
-  NECK_FEAT: 'after'
-  FEAT_NORM: 'yes'
-
-LOSS:
-  SUPCON:
-    ENABLE: False   # 关闭 SupCon，使用监督损失
-  TRIPLET:
-    ENABLE: True
-    MARGIN: 0.3
   CE:
     ENABLE: True
-    EPSILON: 0.1
+    W: 1.0
+    EPSILON: 0.1              # label smoothing (ignored if your code doesn't use it)
 
-# OUTPUT_DIR 在 runner 里由 TAG 指定
+  SUPCON:
+    ENABLE: True
+    W: 0.30                   # start with 0.2~0.3; tune on val
+    T: 0.07                   # match SSL temperature unless you have evidence to change
+    CAM_AWARE: False
+    POS_RULE: "class"         # or "class+camera" depending on your design
+
+  TRIPLETX:
+    ENABLE: True
+    W: 1.0
+    MARGIN: 0.3
+    CROSS_CAM_POS: True
+    NORM_FEAT: True
+    SOFT_WARMUP: True
+    WARMUP_EPOCHS: 10
+    K: 5
+    ALPHA: 2.0
+    SAME_CAM_NEG_BOOST: 1.2
+
+# ==========================================
+# OUTPUT (leave empty; runner controls OUTPUT_DIR/TAG)
+# ==========================================
+# OUTPUT_DIR: ''   # handled by runner
