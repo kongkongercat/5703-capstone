@@ -11,7 +11,6 @@
 # ==========================================
 
 import json
-import re
 import subprocess
 import sys
 import time
@@ -72,11 +71,11 @@ def pick_best_ckpt_from_test(test_dir: Path, run_dir: Path) -> Path | None:
     Fallback: last 'transformer_*.pth' under run_dir.
     """
     if test_dir.exists():
-        best = None  # (mAP, rank1, epoch)
+        best_tup = None  # (mAP, rank1, epoch)
         for ep in sorted([p for p in test_dir.glob("epoch_*") if p.is_dir()],
                          key=lambda p: int(p.name.split("_")[-1]) if p.name.split("_")[-1].isdigit() else -1):
             sj = ep / "summary.json"
-            if not sj.exists(): 
+            if not sj.exists():
                 continue
             try:
                 obj = json.loads(sj.read_text())
@@ -85,12 +84,12 @@ def pick_best_ckpt_from_test(test_dir: Path, run_dir: Path) -> Path | None:
                 if mAP >= 0:
                     e = int(ep.name.split("_")[-1]) if ep.name.split("_")[-1].isdigit() else -1
                     tup = (mAP, r1, e)
-                    if best is None or tup > best:
-                        best = tup
+                    if best_tup is None or tup > best_tup:
+                        best_tup = tup
             except Exception:
                 pass
-        if best is not None:
-            _, _, epoch = best
+        if best_tup is not None:
+            _, _, epoch = best_tup
             ck = run_dir / f"transformer_{epoch}.pth"
             if ck.exists():
                 print(f"[B4] ✅ Pick best by mAP: epoch {epoch}  -> {ck.name}")
@@ -125,7 +124,6 @@ def stage1_ssl() -> Path:
         "LOSS.SUPCON.ENABLE", "True",
         "LOSS.SUPCON.T", str(SSL_T),
         "LOSS.SUPCON.W", str(SSL_W),
-        "LOSS.CE.ENABLE", "False",
         "LOSS.TRIPLETX.ENABLE", "False",
 
         # disable supervised losses in model head
@@ -173,13 +171,19 @@ def stage2_joint_finetune(ssl_ckpt: Path):
 
         # Joint losses
         "MODEL.TRAINING_MODE", "supervised",
-        "LOSS.CE.ENABLE", "True",
+        # —— 打开 CE（通过 MODEL.* 控制）
+        "MODEL.ID_LOSS_TYPE", "softmax",
+        "MODEL.ID_LOSS_WEIGHT", "1.0",
+        # —— 打开 Triplet
+        "MODEL.METRIC_LOSS_TYPE", "triplet",
+        "MODEL.TRIPLET_LOSS_WEIGHT", "1.0",
         "LOSS.TRIPLETX.ENABLE", "True",
+        # —— 保留 SupCon
         "LOSS.SUPCON.ENABLE", "True",
         "LOSS.SUPCON.T", str(FT_T),
         "LOSS.SUPCON.W", str(FT_W),
 
-        # Use the optimizer from B4 YAML (AdamW/3e-5) unless you want to override here
+        # 使用 B4 YAML 中的优化器（AdamW/3e-5）；如需改可在此追加 SOLVER.*
 
         "SOLVER.SEED", str(SEED),
         "OUTPUT_DIR", str(LOG_ROOT),
