@@ -122,7 +122,8 @@ LOSS:
     SAME_CAM_NEG_BOOST: 1.2
 
 # ==========================================
-# OUTPUT (leave empty; runner controls OUTPUT_DIR/TAG)
+# OUTPUT 
 # ==========================================
 # OUTPUT_DIR: '../logs/veri_deit_transreid_stride_b4_ssl_finetune'   # handled by runner
+
 
