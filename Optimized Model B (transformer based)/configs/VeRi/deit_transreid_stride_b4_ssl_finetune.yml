@@ -124,4 +124,5 @@ LOSS:
 # ==========================================
 # OUTPUT (leave empty; runner controls OUTPUT_DIR/TAG)
 # ==========================================
-# OUTPUT_DIR: ''   # handled by runner
+# OUTPUT_DIR: '../logs/veri_deit_transreid_stride_b4_ssl_finetune'   # handled by runner
+
