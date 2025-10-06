@@ -6,7 +6,7 @@
 Modified by Zhang Hang on 2025-09-11:
 - Added support for Supervised Contrastive Loss (SupConLoss)
 - Integrate cfg.LOSS.SUPCON.ENABLE / W / T into total loss calculation
-Modified by Zhang Hang on 2025-09-22:
+Modified by Zeyu Yang on 2025-09-22:
 Added a new branch for sampler == "random": computes only the SupCon loss (no ID / Triplet)
 Modified by Meng Fanyi on 2025-10-06:
 - Fixed NameError when METRIC_LOSS_TYPE=none (triplet undefined)
