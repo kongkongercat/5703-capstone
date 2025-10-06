@@ -28,7 +28,7 @@ import glob
 
 # ====== User settings ======
 CONFIG = "configs/VeRi/deit_transreid_stride_b3_ssl_pretrain.yml"
-SEARCH_EPOCHS = 12        # 12–15 recommended for quick screening
+SEARCH_EPOCHS = 10       # 10 recommended for quick screening
 FULL_EPOCHS   = 30        # long training for the best (T,W)
 # Seeds policy
 SEARCH_SEED = 0           # fast screening: single seed only
