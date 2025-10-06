@@ -17,8 +17,8 @@ import time
 from pathlib import Path
 
 # ---------- Basic knobs ----------
-EPOCHS_SSL  = 2       # Stage-1 epochs
-EPOCHS_FINE = 2       # Stage-2 epochs
+EPOCHS_SSL  = 3       # Stage-1 epochs
+EPOCHS_FINE = 3       # Stage-2 epochs
 BATCH = 64
 NUM_WORKERS = 8
 SEED = 0
@@ -78,51 +78,39 @@ def _test_dir_from_tag(tag: str) -> Path:
         return p2
     cands = sorted(LOG_ROOT.glob(f"veri776_{tag}*_deit_test"))
     return cands[-1] if cands else p1
+
 def pick_best_ckpt_from_test(test_dir: Path, run_dir: Path) -> Path | None:
-    """
-    Prefer best by mAP from test summaries; fallback to log parsing or last ckpt.
-    """
-    best = None
+    """Pick best checkpoint by mAP; fallback to last .pth"""
     if test_dir.exists():
+        best_tup = None  # (mAP, rank1, epoch)
         for ep in sorted([p for p in test_dir.glob("epoch_*") if p.is_dir()],
-                         key=lambda p: int(p.name.split("_")[-1])):
-            # 优先读 summary.json
+                         key=lambda p: int(p.name.split("_")[-1]) if p.name.split("_")[-1].isdigit() else -1):
             sj = ep / "summary.json"
-            log_path = ep / "log.txt"
-            mAP, r1 = -1, -1
-            if sj.exists():
-                try:
-                    obj = json.loads(sj.read_text())
-                    mAP = float(obj.get("mAP", -1))
-                    r1 = float(obj.get("Rank-1", obj.get("Rank1", -1)))
-                except Exception:
-                    pass
-            elif log_path.exists():
-                # 没有 summary.json 就从 log.txt 提取
-                txt = log_path.read_text()
-                import re
-                m = re.search(r"mAP:\s*([\d\.]+)%", txt)
-                n = re.search(r"Rank-1\s*:\s*([\d\.]+)%", txt)
-                if m: mAP = float(m.group(1))
-                if n: r1 = float(n.group(1))
-
-            if mAP > 0:
-                epoch = int(ep.name.split("_")[-1])
-                if not best or mAP > best[0]:
-                    best = (mAP, r1, epoch)
-
-    if best:
-        mAP, r1, ep = best
-        ckpt = run_dir / f"transformer_{ep}.pth"
-        print(f"[B4] ✅ Best epoch = {ep} | mAP = {mAP:.2f}% | Rank-1 = {r1:.2f}%")
-        return ckpt
+            if not sj.exists():
+                continue
+            try:
+                obj = json.loads(sj.read_text())
+                mAP = float(obj.get("mAP", -1))
+                r1  = float(obj.get("Rank-1", obj.get("Rank1", -1)))
+                if mAP >= 0:
+                    e = int(ep.name.split("_")[-1]) if ep.name.split("_")[-1].isdigit() else -1
+                    tup = (mAP, r1, e)
+                    if best_tup is None or tup > best_tup:
+                        best_tup = tup
+            except Exception:
+                pass
+        if best_tup is not None:
+            _, _, epoch = best_tup
+            ck = run_dir / f"transformer_{epoch}.pth"
+            if ck.exists():
+                print(f"[B4] ✅ Pick best by mAP: epoch {epoch}  -> {ck.name}")
+                return ck
 
     # fallback
     ckpts = sorted(run_dir.glob("transformer_*.pth"))
     if ckpts:
         print(f"[B4] ⚠️ No summary found; fallback to last ckpt: {ckpts[-1].name}")
         return ckpts[-1]
-
     print("[B4] ❌ No checkpoints found.")
     return None
 
