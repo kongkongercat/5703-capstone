@@ -83,12 +83,14 @@ def stage1_ssl() -> Path:
         "LOSS.SUPCON.T", str(SSL_T),
         "LOSS.SUPCON.W", str(SSL_W),
 
-        # make sure supervised losses are off
-        "LOSS.CE.ENABLE", "False",
-        "LOSS.TRIPLETX.ENABLE", "False",
+        # disable supervised losses by type
+        "MODEL.METRIC_LOSS_TYPE", "none",
+        "MODEL.IF_LABELSMOOTH", "off",
+        "MODEL.IF_WITH_CENTER", "no",
+
+        # ensure CE / Triplet not used
         "MODEL.ID_LOSS_TYPE", "none",
         "MODEL.ID_LOSS_WEIGHT", "0.0",
-        "MODEL.METRIC_LOSS_TYPE", "none",
         "MODEL.TRIPLET_LOSS_WEIGHT", "0.0",
 
         # logging
