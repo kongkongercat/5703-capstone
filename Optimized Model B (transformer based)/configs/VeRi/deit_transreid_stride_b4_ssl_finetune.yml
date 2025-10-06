@@ -1,27 +1,22 @@
 # ==========================================
-# Model B (TransReID + DeiT + official stride)
-# B4: Unified fine-tuning (CE + SupCon + TripletX) on top of SSL checkpoint
+# Model B4 (Fine-tuning after SSL Pretraining)
 # File: deit_transreid_stride_b4_ssl_finetune.yml
 #
 # Change Log
-# [2025-10-06 | Fanyi Meng] Initial B4 fine-tune config.
+# [2025-10-06 | Fanyi Meng] Fine-tuning config built on top of B3 SSL pretraining.
 # ==========================================
 
 # ==========================================
 # MODEL
 # ==========================================
 MODEL:
-  # The runner (run_b4_fine.py) will inject:
-  #   MODEL.PRETRAIN_PATH: <SSL checkpoint>
-  #   MODEL.PRETRAIN_CHOICE: 'finetune'
-  PRETRAIN_CHOICE: 'finetune'
-  PRETRAIN_PATH: ''
+  PRETRAIN_CHOICE: 'finetune'     # ← runner 会注入 SSL 权重路径
+  PRETRAIN_PATH: ''               # ← 留空，由 run_b4_fine.py 填入
 
   NAME: 'transformer'
-  TRANSFORMER_TYPE: 'vit_base_patch16_224_TransReID'   # or 'deit_base_patch16_224_TransReID' if your codebase uses this key
+  TRANSFORMER_TYPE: 'vit_base_patch16_224_TransReID'
   DEVICE_ID: ('0')
 
-  # Official stride setting
   STRIDE_SIZE: [12, 12]
   SIE_CAMERA: True
   SIE_VIEW: True
@@ -30,11 +25,13 @@ MODEL:
   SHIFT_NUM: 8
   RE_ARRANGE: True
 
-  # Optional knobs used by some forks
-  TRAINING_MODE: 'supervised'   # fine-tuning with labels
-  NO_MARGIN: False              # ensure margin losses behave as expected
-  # Do not freeze backbone by default; runner can override if needed
-  # FREEZE_BACKBONE_AT: 0
+  # supervised fine-tuning mode
+  TRAINING_MODE: 'supervised'
+  ID_LOSS_TYPE: 'softmax'         # ← 打开分类头
+  ID_LOSS_WEIGHT: 1.0
+  METRIC_LOSS_TYPE: 'triplet'     # ← 激活 Triplet (TripletX见LOSS部分)
+  TRIPLET_LOSS_WEIGHT: 1.0
+  NO_MARGIN: False
 
 # ==========================================
 # INPUT / AUGMENTATION
@@ -43,44 +40,40 @@ INPUT:
   SIZE_TRAIN: [256, 256]
   SIZE_TEST:  [256, 256]
   PROB: 0.5
-  RE_PROB: 0.5         # slightly weaker than SSL
+  RE_PROB: 0.5
   PADDING: 10
 
 # ==========================================
 # DATASETS
 # ==========================================
 DATASETS:
-  NAMES: ('veri')              # VeRi-776
-  ROOT_DIR: ('../../datasets') # runner may override DATASETS.ROOT_DIR
+  NAMES: ('veri')
+  ROOT_DIR: ('../../datasets')
 
 # ==========================================
-# DATALOADER (P × K sampler)
+# DATALOADER
 # ==========================================
 DATALOADER:
-  SAMPLER: 'softmax_triplet'
-  NUM_INSTANCE: 8              # K=8
+  SAMPLER: 'softmax_triplet'     # ← standard ReID sampling
+  NUM_INSTANCE: 8
   NUM_WORKERS: 8
 
 # ==========================================
-# SOLVER / OPTIMIZATION (fine-tuning friendly defaults)
+# SOLVER / OPTIMIZATION
 # ==========================================
 SOLVER:
-  # You can switch to 'SGD' if you want to strictly match previous baselines.
   OPTIMIZER_NAME: 'AdamW'
-  BASE_LR: 0.00003             # small LR for fine-tuning
+  BASE_LR: 0.00003               # smaller LR for fine-tuning
   WEIGHT_DECAY: 5e-5
   WEIGHT_DECAY_BIAS: 5e-5
   BIAS_LR_FACTOR: 1.0
-
-  IMS_PER_BATCH: 96            # adjust per GPU memory
-  MAX_EPOCHS: 20               # runner can override via --opts SOLVER.MAX_EPOCHS
-
+  IMS_PER_BATCH: 96
+  MAX_EPOCHS: 20
   WARMUP_METHOD: 'linear'
   WARMUP_EPOCHS: 2
-
   CHECKPOINT_PERIOD: 5
   LOG_PERIOD: 50
-  EVAL_PERIOD: 1               # per-epoch eval so the runner can parse epoch_* summaries
+  EVAL_PERIOD: 1
 
 # ==========================================
 # TEST / EVALUATION
@@ -94,23 +87,23 @@ TEST:
   FEAT_NORM: 'yes'
 
 # ==========================================
-# LOSS (B4: CE + SupCon + TripletX), all enabled together
+# LOSS
 # ==========================================
 LOSS:
   CE:
     ENABLE: True
     W: 1.0
-    EPSILON: 0.1              # label smoothing (ignored if your code doesn't use it)
+    EPSILON: 0.1
 
   SUPCON:
-    ENABLE: True
-    W: 0.30                   # start with 0.2~0.3; tune on val
-    T: 0.07                   # match SSL temperature unless you have evidence to change
+    ENABLE: False               # ← 关闭 SupCon
+    W: 0.0
+    T: 0.07
     CAM_AWARE: False
-    POS_RULE: "class"         # or "class+camera" depending on your design
+    POS_RULE: "class"
 
   TRIPLETX:
-    ENABLE: True
+    ENABLE: True                # ← 开 TripletX
     W: 1.0
     MARGIN: 0.3
     CROSS_CAM_POS: True
@@ -122,8 +115,6 @@ LOSS:
     SAME_CAM_NEG_BOOST: 1.2
 
 # ==========================================
-# OUTPUT 
+# OUTPUT
 # ==========================================
-# OUTPUT_DIR: '../logs/veri_deit_transreid_stride_b4_ssl_finetune'   # handled by runner
-
-
+# OUTPUT_DIR: '../logs/veri_deit_transreid_stride_b4_ssl_finetune'  # handled by runner
