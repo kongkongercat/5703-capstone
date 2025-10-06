@@ -97,11 +97,6 @@ TEST:
 # LOSS (Joint: CE + SupCon + TripletX)
 # ==========================================
 LOSS:
-  CE:
-    ENABLE: True
-    W: 1.0
-    EPSILON: 0.1
-
   SUPCON:
     ENABLE: True               # keep SupCon ON in fine-tuning
     W: 0.20                    # recommended 0.1~0.3 for joint training
@@ -125,4 +120,5 @@ LOSS:
 # OUTPUT
 # ==========================================
 # OUTPUT_DIR: '../logs/veri_deit_transreid_stride_b4_ssl_finetune'  # handled by runner
+
 
