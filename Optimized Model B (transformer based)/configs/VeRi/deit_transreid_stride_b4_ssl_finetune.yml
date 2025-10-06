@@ -71,7 +71,7 @@ SOLVER:
   BASE_LR: 0.00003            # small LR for stable fine-tuning
   WEIGHT_DECAY: 5e-5
   WEIGHT_DECAY_BIAS: 5e-5
-  BIAS_LR_FACTOR: 1.0
+  BIAS_LR_FACTOR: 2
 
   IMS_PER_BATCH: 96
   MAX_EPOCHS: 10               # runner can override
@@ -125,3 +125,4 @@ LOSS:
 # OUTPUT
 # ==========================================
 # OUTPUT_DIR: '../logs/veri_deit_transreid_stride_b4_ssl_finetune'  # handled by runner
+
