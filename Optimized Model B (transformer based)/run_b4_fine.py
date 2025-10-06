@@ -17,8 +17,8 @@ import time
 from pathlib import Path
 
 # ---------- Basic knobs ----------
-EPOCHS_SSL  = 3       # Stage-1 epochs
-EPOCHS_FINE = 3       # Stage-2 epochs
+EPOCHS_SSL  = 1       # Stage-1 epochs
+EPOCHS_FINE = 1       # Stage-2 epochs
 BATCH = 64
 NUM_WORKERS = 8
 SEED = 0
