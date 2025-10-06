@@ -17,8 +17,8 @@ import time
 from pathlib import Path
 
 # ---------- Basic knobs ----------
-EPOCHS_SSL  = 3       # Stage-1 epochs
-EPOCHS_FINE = 3        # Stage-2 epochs
+EPOCHS_SSL  = 2       # Stage-1 epochs
+EPOCHS_FINE = 2       # Stage-2 epochs
 BATCH = 64
 NUM_WORKERS = 8
 SEED = 0
@@ -59,17 +59,28 @@ def _tag(prefix: str) -> str:
     return f"{prefix}_{time.strftime('%m%d-%H%M')}"
 
 def _run_dir_from_tag(tag: str) -> Path:
-    # run_modelB_deit.py convention
-    return LOG_ROOT / f"veri776_{tag}_deit_run"
+    """兼容含 seed 的保存目录"""
+    p1 = LOG_ROOT / f"veri776_{tag}_seed{SEED}_deit_run"
+    if p1.exists():
+        return p1
+    p2 = LOG_ROOT / f"veri776_{tag}_deit_run"
+    if p2.exists():
+        return p2
+    cands = sorted(LOG_ROOT.glob(f"veri776_{tag}*_deit_run"))
+    return cands[-1] if cands else p1
 
 def _test_dir_from_tag(tag: str) -> Path:
-    return LOG_ROOT / f"veri776_{tag}_deit_test"
+    p1 = LOG_ROOT / f"veri776_{tag}_seed{SEED}_deit_test"
+    if p1.exists():
+        return p1
+    p2 = LOG_ROOT / f"veri776_{tag}_deit_test"
+    if p2.exists():
+        return p2
+    cands = sorted(LOG_ROOT.glob(f"veri776_{tag}*_deit_test"))
+    return cands[-1] if cands else p1
 
 def pick_best_ckpt_from_test(test_dir: Path, run_dir: Path) -> Path | None:
-    """
-    Prefer best by mAP from test summaries: <test_dir>/epoch_*/summary.json.
-    Fallback: last 'transformer_*.pth' under run_dir.
-    """
+    """Pick best checkpoint by mAP; fallback to last .pth"""
     if test_dir.exists():
         best_tup = None  # (mAP, rank1, epoch)
         for ep in sorted([p for p in test_dir.glob("epoch_*") if p.is_dir()],
@@ -95,7 +106,7 @@ def pick_best_ckpt_from_test(test_dir: Path, run_dir: Path) -> Path | None:
                 print(f"[B4] ✅ Pick best by mAP: epoch {epoch}  -> {ck.name}")
                 return ck
 
-    # fallback: last
+    # fallback
     ckpts = sorted(run_dir.glob("transformer_*.pth"))
     if ckpts:
         print(f"[B4] ⚠️ No summary found; fallback to last ckpt: {ckpts[-1].name}")
@@ -116,26 +127,18 @@ def stage1_ssl() -> Path:
         "--pretrained", str(PRETRAINED_IMAGENET),
         "--tag", tag,
         "--opts",
-        # Force SSL mode
         "MODEL.PRETRAIN_CHOICE", "imagenet",
         "MODEL.TRAINING_MODE", "self_supervised",
-
-        # SupCon ON; CE/Triplet OFF
         "LOSS.SUPCON.ENABLE", "True",
         "LOSS.SUPCON.T", str(SSL_T),
         "LOSS.SUPCON.W", str(SSL_W),
         "LOSS.TRIPLETX.ENABLE", "False",
-
-        # disable supervised losses in model head
         "MODEL.METRIC_LOSS_TYPE", "none",
         "MODEL.ID_LOSS_TYPE", "none",
         "MODEL.ID_LOSS_WEIGHT", "0.0",
         "MODEL.TRIPLET_LOSS_WEIGHT", "0.0",
-
-        # IMPORTANT: override optimizer/LR for SSL (B4 YAML is for fine-tune)
         "SOLVER.OPTIMIZER_NAME", "SGD",
         "SOLVER.BASE_LR", "0.01",
-
         "SOLVER.SEED", str(SEED),
         "OUTPUT_DIR", str(LOG_ROOT),
     ]
@@ -143,7 +146,6 @@ def stage1_ssl() -> Path:
 
     run_dir  = _run_dir_from_tag(tag)
     test_dir = _test_dir_from_tag(tag)
-
     if not run_dir.exists():
         raise SystemExit(f"[B4] ❌ Stage-1 run dir not found: {run_dir}")
 
@@ -162,29 +164,20 @@ def stage2_joint_finetune(ssl_ckpt: Path):
         "--batch", str(BATCH),
         "--num-workers", str(NUM_WORKERS),
         "--data-root", str(DATASET_ROOT),
-        "--pretrained", str(ssl_ckpt),           # for safety
+        "--pretrained", str(ssl_ckpt),
         "--tag", tag,
         "--opts",
-        # Finetune from SSL checkpoint
         "MODEL.PRETRAIN_CHOICE", "finetune",
         "MODEL.PRETRAIN_PATH",  str(ssl_ckpt),
-
-        # Joint losses
         "MODEL.TRAINING_MODE", "supervised",
-        # —— 打开 CE（通过 MODEL.* 控制）
         "MODEL.ID_LOSS_TYPE", "softmax",
         "MODEL.ID_LOSS_WEIGHT", "1.0",
-        # —— 打开 Triplet
         "MODEL.METRIC_LOSS_TYPE", "triplet",
         "MODEL.TRIPLET_LOSS_WEIGHT", "1.0",
         "LOSS.TRIPLETX.ENABLE", "True",
-        # —— 保留 SupCon
         "LOSS.SUPCON.ENABLE", "True",
         "LOSS.SUPCON.T", str(FT_T),
         "LOSS.SUPCON.W", str(FT_W),
-
-        # 使用 B4 YAML 中的优化器（AdamW/3e-5）；如需改可在此追加 SOLVER.*
-
         "SOLVER.SEED", str(SEED),
         "OUTPUT_DIR", str(LOG_ROOT),
     ]
@@ -202,7 +195,6 @@ def main():
 
     ssl_best = stage1_ssl()
     print(f"[B4] Using best SSL checkpoint: {ssl_best}")
-
     stage2_joint_finetune(ssl_best)
     print("[B4] ✅ Finished! All results saved in:", LOG_ROOT)
 
