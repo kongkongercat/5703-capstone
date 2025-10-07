@@ -156,32 +156,114 @@ def stage1_ssl() -> Path:
 
 # ---------- Stage 2: Joint Fine-tuning ----------
 def stage2_joint_finetune(ssl_ckpt: Path):
-    tag = _tag(f"b4_jointft_T{str(FT_T).replace('.','p')}_W{str(FT_W).replace('.','p')}")
-    cmd = [
+    """
+    Two-phase Stage-2:
+      Phase A: 5 epochs, CE + TripletX (SupCon off)
+      Phase B: 5 epochs, CE + TripletX + SupCon (fine-tune from Phase A best)
+    """
+    # -------- Phase A: CE + TripletX --------
+    tagA = _tag("b4_jointftA_ce_tri_only")
+    cmdA = [
         sys.executable, "run_modelB_deit.py",
         "--config", CONFIG_B4,
-        "--epochs", str(EPOCHS_FINE),
+        "--epochs", "5",
         "--batch", str(BATCH),
         "--num-workers", str(NUM_WORKERS),
         "--data-root", str(DATASET_ROOT),
         "--pretrained", str(ssl_ckpt),
-        "--tag", tag,
+        "--tag", tagA,
         "--opts",
         "MODEL.PRETRAIN_CHOICE", "finetune",
         "MODEL.PRETRAIN_PATH",  str(ssl_ckpt),
+
         "MODEL.TRAINING_MODE", "supervised",
         "MODEL.ID_LOSS_TYPE", "softmax",
         "MODEL.ID_LOSS_WEIGHT", "1.0",
         "MODEL.METRIC_LOSS_TYPE", "triplet",
         "MODEL.TRIPLET_LOSS_WEIGHT", "1.0",
+
+        # TripletX ON
         "LOSS.TRIPLETX.ENABLE", "True",
-        "LOSS.SUPCON.ENABLE", "True",
-        "LOSS.SUPCON.T", str(FT_T),
-        "LOSS.SUPCON.W", str(FT_W),
+
+        # SupCon OFF in Phase A
+        "LOSS.SUPCON.ENABLE", "False",
+
+        # ✅ 提高学习率，让分类头快速收敛
+        "SOLVER.BASE_LR", "5e-5",
+
+        # 每轮评估 & 每轮保存
+        "SOLVER.CHECKPOINT_PERIOD", "1",
+        "SOLVER.EVAL_PERIOD", "1",
+        "TEST.EVAL", "True",
+
         "SOLVER.SEED", str(SEED),
         "OUTPUT_DIR", str(LOG_ROOT),
     ]
-    run_and_log(cmd, "Stage 2: Joint fine-tune (CE + TripletX + SupCon)")
+    run_and_log(cmdA, "Stage 2A: CE+TripletX (no SupCon)")
+
+    run_dirA  = _run_dir_from_tag(tagA)
+    test_dirA = _test_dir_from_tag(tagA)
+    if not run_dirA.exists():
+        raise SystemExit(f"[B4] ❌ Stage-2A run dir not found: {run_dirA}")
+
+    best_ckpt_A = pick_best_ckpt_from_test(test_dirA, run_dirA)
+    if not best_ckpt_A:
+        raise SystemExit("[B4] ❌ Stage-2A has no checkpoint to continue.")
+    print(f"[B4] ✅ Stage-2A best ckpt: {best_ckpt_A}")
+
+    # -------- Phase B: CE + TripletX + SupCon --------
+    tagB = _tag("b4_jointftB_add_supcon")
+    cmdB = [
+        sys.executable, "run_modelB_deit.py",
+        "--config", CONFIG_B4,
+        "--epochs", "5",
+        "--batch", str(BATCH),
+        "--num-workers", str(NUM_WORKERS),
+        "--data-root", str(DATASET_ROOT),
+        "--pretrained", str(best_ckpt_A),
+        "--tag", tagB,
+        "--opts",
+        "MODEL.PRETRAIN_CHOICE", "finetune",
+        "MODEL.PRETRAIN_PATH",  str(best_ckpt_A),
+
+        "MODEL.TRAINING_MODE", "supervised",
+        "MODEL.ID_LOSS_TYPE", "softmax",
+        "MODEL.ID_LOSS_WEIGHT", "1.0",
+        "MODEL.METRIC_LOSS_TYPE", "triplet",
+        "MODEL.TRIPLET_LOSS_WEIGHT", "1.0",
+
+        # TripletX ON
+        "LOSS.TRIPLETX.ENABLE", "True",
+
+        # SupCon ON (温和权重)
+        "LOSS.SUPCON.ENABLE", "True",
+        "LOSS.SUPCON.T", str(FT_T),     # 0.07
+        "LOSS.SUPCON.W", str(FT_W),     # 0.20
+        "LOSS.SUPCON.POS_RULE", "class",
+
+        # ✅ 降低学习率，稳定联合训练
+        "SOLVER.BASE_LR", "2e-5",
+
+        # 每轮评估 & 每轮保存
+        "SOLVER.CHECKPOINT_PERIOD", "1",
+        "SOLVER.EVAL_PERIOD", "1",
+        "TEST.EVAL", "True",
+
+        "SOLVER.SEED", str(SEED),
+        "OUTPUT_DIR", str(LOG_ROOT),
+    ]
+    run_and_log(cmdB, "Stage 2B: add SupCon (CE+TripletX+SupCon)")
+
+    run_dirB  = _run_dir_from_tag(tagB)
+    test_dirB = _test_dir_from_tag(tagB)
+    if not run_dirB.exists():
+        raise SystemExit(f"[B4] ❌ Stage-2B run dir not found: {run_dirB}")
+
+    best_ckpt_B = pick_best_ckpt_from_test(test_dirB, run_dirB)
+    if not best_ckpt_B:
+        raise SystemExit("[B4] ❌ Stage-2B has no checkpoint to report.")
+    print(f"[B4] ✅ Stage-2B best ckpt: {best_ckpt_B}")
+
 
 # ---------- Main ----------
 def main():
