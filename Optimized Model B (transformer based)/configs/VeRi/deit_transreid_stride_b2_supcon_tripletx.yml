@@ -1,33 +1,43 @@
 # ==========================================
-# Model B (built upon the baseline: TransReID + DeiT + official stride)
+# Model B (TransReID + DeiT + official stride)
 # B2: TripletX enhancement (+ SupCon injected by runner)
 # File: deit_transreid_stride_b2_supcon_tripletx.yml
 #
 # Change Log
 # [2025-09-14 | Hang Zhang] Initial B2 config (SupCon + TripletX; K=8 PK-sampler).
-# [2025-09-14 | Hang Zhang] Remove LOSS.SUPCON from YAML; SupCon (T/W/ENABLE) will be injected by run_b2.py.
+# [2025-09-14 | Hang Zhang] Remove LOSS.SUPCON from YAML; SupCon (T/W/ENABLE) is injected by run_b2.py.
 # [2025-09-14 | Hang Zhang] Comment out OUTPUT_DIR to avoid override conflicts with runner.
-# [2025-09-17 | Hang Zhang] Added SOLVER.MARGIN=0.3 for compatibility with legacy TripletLoss in make_loss.py.
+# [2025-09-17 | Hang Zhang] Add SOLVER.MARGIN=0.3 for compatibility with legacy TripletLoss in make_loss.py.
+# [2025-10-08 | Hang Zhang] Align with new make_loss:
+#                           - Ensure TripletX is selected via LOSS.TRIPLETX.ENABLE.
+#                           - Add MODEL.TRAINING_MODE='supervised' and explicit loss weights.
+#                           - Normalize DATASETS.NAMES format; keep ROOT_DIR overridable by runner.
+#                           - Keep K=8 PK sampler; keep SupCon injected by runner only.
 # ==========================================
 
 # ==========================================
 # MODEL
 # ==========================================
 MODEL:
-  PRETRAIN_CHOICE: 'imagenet'
-  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
-
-  METRIC_LOSS_TYPE: 'triplet'
-  IF_LABELSMOOTH: 'off'
-  IF_WITH_CENTER: 'no'
-
   NAME: 'transformer'
   TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
 
-  NO_MARGIN: False
+  PRETRAIN_CHOICE: 'imagenet'
+  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
+
+  # Loss plumbing (make_loss will read these)
+  METRIC_LOSS_TYPE: 'triplet'    # TripletX is selected by LOSS.TRIPLETX.ENABLE
+  ID_LOSS_WEIGHT: 1.0
+  TRIPLET_LOSS_WEIGHT: 1.0
+  IF_LABELSMOOTH: 'off'
+  IF_WITH_CENTER: 'no'
+  NO_MARGIN: False               # legacy triplet fallback only
+
+  # Runtime
+  TRAINING_MODE: 'supervised'
   DEVICE_ID: ('0')
 
-  # Official stride setting
+  # Official stride & TransReID extras
   STRIDE_SIZE: [12, 12]
   SIE_CAMERA: True
   SIE_VIEW: True
@@ -48,28 +58,30 @@ INPUT:
 
 # ==========================================
 # DATASETS
+# (Runner will override ROOT_DIR via --opts DATASETS.ROOT_DIR=...)
 # ==========================================
 DATASETS:
-  NAMES: ('veri')                  # VeRi-776
-  ROOT_DIR: ('../../datasets')
+  NAMES: 'veri'                  # VeRi-776
+  ROOT_DIR: '../datasets'
 
 # ==========================================
-# DATALOADER  (B2: K = 8)
+# DATALOADER  (B2: K = 8 for PK-sampler)
 # ==========================================
 DATALOADER:
   SAMPLER: 'softmax_triplet'
-  NUM_INSTANCE: 8                  # K=8
+  NUM_INSTANCE: 8                # K=8
   NUM_WORKERS: 8
 
 # ==========================================
 # SOLVER / OPTIMIZATION
+# (Runner may override MAX_EPOCHS/CHECKPOINT_PERIOD/EVAL_PERIOD for screening runs)
 # ==========================================
 SOLVER:
   OPTIMIZER_NAME: 'SGD'
   MAX_EPOCHS: 120
   BASE_LR: 0.01
-  IMS_PER_BATCH: 64               
-  MARGIN: 0.3   
+  IMS_PER_BATCH: 64
+  MARGIN: 0.3
   WARMUP_METHOD: 'linear'
   LARGE_FC_LR: False
   CHECKPOINT_PERIOD: 120
@@ -95,8 +107,7 @@ TEST:
 # ==========================================
 LOSS:
   TRIPLETX:
-    ENABLE: true
-    W: 1.00
+    ENABLE: true                 # <-- make_loss will switch to TripletX when this is True
     MARGIN: 0.30
     SOFT_WARMUP: true
     WARMUP_EPOCHS: 10
@@ -105,6 +116,7 @@ LOSS:
     CROSS_CAM_POS: true
     SAME_CAM_NEG_BOOST: 1.2
     NORM_FEAT: true
+    # Note: final weight is controlled by MODEL.TRIPLET_LOSS_WEIGHT
 
 # ==========================================
 # OUTPUT
