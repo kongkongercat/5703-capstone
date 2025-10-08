@@ -34,6 +34,10 @@
 #                            - B2 now always initializes from ImageNet
 #                              (B2_no-warmstart), to compare fairly with
 #                              B1_full(ImageNet). Removed all b1_weight logic.
+# [2025-10-08 | Hang Zhang] EXTENDED: CLI argument support
+#                            - Added --test/--no-test, --epochs, --seeds, --output-root, --tag.
+#                            - Allows flexible run configuration without editing source.
+#                            - Default behavior identical to seamless B2_no-warmstart(ImageNet).
 # =============================================================================
 """
 B2_no-warmstart(ImageNet):
@@ -49,6 +53,7 @@ Seamless behavior:
 """
 
 from __future__ import annotations
+import argparse
 import json
 import os
 import re
@@ -64,7 +69,6 @@ FULL_EPOCHS  = 30
 SEEDS        = [0, 1, 2]
 
 # ---- Test completion markers (unified) ----
-# Presence of ANY of these files under test_dir/epoch_X/ means "tested".
 TEST_MARKER_FILES_DEFAULT = (
     "summary.json", "test_summary.txt", "results.txt", "log.txt",
     "test_log.txt",
@@ -80,8 +84,16 @@ def _in_colab() -> bool:
     except Exception:
         return False
 
-def pick_log_root() -> Path:
-    """Pick a single root for logs/checkpoints/results: env > Colab Drive > ./logs."""
+def pick_log_root(cli_output_root: Optional[str]) -> Path:
+    """
+    Choose output root in priority:
+    1) CLI argument
+    2) Environment variable OUTPUT_ROOT
+    3) Colab Drive path
+    4) ./logs
+    """
+    if cli_output_root:
+        return Path(cli_output_root)
     env = os.getenv("OUTPUT_ROOT")
     if env:
         return Path(env)
@@ -108,19 +120,18 @@ def detect_data_root() -> str:
         "/content/drive/MyDrive/5703(hzha0521)/datasets",
         "/content/datasets",
         "/workspace/datasets",
-        str(Path.cwd().parents[1] / "datasets"),  # ../../datasets
+        str(Path.cwd().parents[1] / "datasets"),
         str(Path.cwd() / "datasets"),
     ]
     for c in candidates:
         if (Path(c) / "VeRi").exists():
             return c
-    # Fallback (visible even if wrong)
     return str(Path.cwd().parents[1] / "datasets")
 
 DATA_ROOT = detect_data_root()
 print(f"[B2] Using DATASETS.ROOT_DIR={DATA_ROOT}")
 
-# ---------- Small helpers ----------
+# ---------- Helpers ----------
 
 def _fmt(v: float) -> str:
     return str(v).replace(".", "p")
@@ -132,19 +143,18 @@ def _re_pick(text: str, pat: str) -> float:
 # ---------- Metrics parsing ----------
 
 def parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, float]:
-    """Return (mAP, Rank-1, Rank-5, Rank-10) from a single epoch_* directory."""
     sj = epoch_dir / "summary.json"
     if sj.exists():
         try:
             obj = json.loads(sj.read_text())
-            mAP = float(obj.get("mAP", -1))
-            r1  = float(obj.get("Rank-1", obj.get("Rank1", -1)))
-            r5  = float(obj.get("Rank-5", obj.get("Rank5", -1)))
-            r10 = float(obj.get("Rank-10", obj.get("Rank10", -1)))
-            return mAP, r1, r5, r10
+            return (
+                float(obj.get("mAP", -1)),
+                float(obj.get("Rank-1", obj.get("Rank1", -1))),
+                float(obj.get("Rank-5", obj.get("Rank5", -1))),
+                float(obj.get("Rank-10", obj.get("Rank10", -1))),
+            )
         except Exception:
             pass
-    # Include test_log.txt as a valid source of metrics
     for name in ("test_summary.txt", "results.txt", "log.txt", "test_log.txt"):
         p = epoch_dir / name
         if p.exists():
@@ -156,9 +166,7 @@ def parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, 
             return mAP, r1, r5, r10
     return -1.0, -1.0, -1.0, -1.0
 
-
 def pick_best_epoch_metrics(test_dir: Path) -> Optional[Dict[str, Any]]:
-    """Iterate epoch_* and return the best epoch by (mAP, Rank-1)."""
     epochs = sorted(
         [p for p in test_dir.glob("epoch_*") if p.is_dir()],
         key=lambda p: int(p.name.split("_")[-1])
@@ -175,240 +183,164 @@ def pick_best_epoch_metrics(test_dir: Path) -> Optional[Dict[str, Any]]:
             best = {"epoch": ep_idx, "mAP": mAP, "Rank-1": r1, "Rank-5": r5, "Rank-10": r10}
     return best
 
+def safe_mean(vals: List[float]) -> float:
+    valid = [v for v in vals if v >= 0]
+    return round(stats.mean(valid), 4) if valid else -1.0
 
-def safe_mean(values: List[float]) -> float:
-    vals = [v for v in values if v >= 0]
-    return round(stats.mean(vals), 4) if vals else -1.0
+def safe_stdev(vals: List[float]) -> float:
+    valid = [v for v in vals if v >= 0]
+    return round(stats.stdev(valid), 4) if len(valid) >= 2 else 0.0
 
+# ---------- CLI args ----------
 
-def safe_stdev(values: List[float]) -> float:
-    vals = [v for v in values if v >= 0]
-    return round(stats.stdev(vals), 4) if len(vals) >= 2 else 0.0
+def parse_seeds(arg_list: List[str]) -> List[int]:
+    flat = []
+    for a in arg_list:
+        flat += [x for x in a.split(",") if x.strip()]
+    return [int(x) for x in flat]
 
-# ---------- Progress detection ----------
+def build_cli() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Run B2_no-warmstart with flexible options.")
+    p.add_argument("--test", dest="test", action="store_true", help="Enable test phase (default).")
+    p.add_argument("--no-test", dest="test", action="store_false", help="Skip test phase (train only).")
+    p.set_defaults(test=True)
+    p.add_argument("--epochs", type=int, default=FULL_EPOCHS, help="Number of training epochs.")
+    p.add_argument("--seeds", nargs="+", default=[str(s) for s in SEEDS],
+                   help="Comma or space separated seeds list. Default: [0,1,2].")
+    p.add_argument("--output-root", type=str, default=None, help="Override output root directory.")
+    p.add_argument("--tag", type=str, default=None, help="Custom tag (used in output dir names).")
+    return p.parse_args()
+
+# ---------- Progress detection & test ----------
 
 def _max_test_epoch(test_dir: Path) -> int:
-    """Return max epoch index that has any result file; 0 if none."""
     max_ep = 0
     for ep in test_dir.glob("epoch_*"):
-        if not ep.is_dir():
-            continue
-        try:
-            idx = int(ep.name.split("_")[-1])
-        except Exception:
-            continue
+        if not ep.is_dir(): continue
+        try: idx = int(ep.name.split("_")[-1])
+        except: continue
         for f in TEST_MARKER_FILES_DEFAULT:
             if (ep / f).exists():
                 max_ep = max(max_ep, idx)
                 break
     return max_ep
 
-
 def _max_epoch_from_checkpoints(run_dir: Path) -> int:
-    """Scan common checkpoint names and return max epoch; 0 if none."""
     max_ep = 0
-    if not run_dir.exists():
-        return 0
-    for p in run_dir.glob("state_*.pth"):
-        m = re.search(r"state_(\d+)\.pth", p.name)
-        if m:
-            max_ep = max(max_ep, int(m.group(1)))
+    if not run_dir.exists(): return 0
     for p in run_dir.glob("transformer_*.pth"):
         m = re.search(r"transformer_(\d+)\.pth", p.name)
-        if m:
-            max_ep = max(max_ep, int(m.group(1)))
+        if m: max_ep = max(max_ep, int(m.group(1)))
     return max_ep
 
-
-# ---------- Robust re-test (no reliance on eval-only flags) ----------
-
-def eval_missing_epochs_via_test_py(tag: str, config_path: str, log_root: Path) -> None:
-    """
-    Reconstruct per-epoch test outputs by directly invoking test.py on every
-    checkpoint under .../{tag}_deit_run, writing results to
-    .../{tag}_deit_test/epoch_{E}. Only missing epochs are tested.
-    """
-    run_dir  = log_root / f"veri776_{tag}_deit_run"
+def eval_missing_epochs_via_test_py(tag: str, config: str, log_root: Path):
+    run_dir = log_root / f"veri776_{tag}_deit_run"
     test_dir = log_root / f"veri776_{tag}_deit_test"
     test_dir.mkdir(parents=True, exist_ok=True)
-
-    rx = re.compile(r"transformer_(\d+)\.pth$")
-    ckpts: List[Tuple[int, Path]] = []
-    for p in run_dir.glob("transformer_*.pth"):
-        m = rx.search(p.name)
-        if m:
-            ckpts.append((int(m.group(1)), p))
-    ckpts.sort(key=lambda x: x[0])
-
+    ckpts = sorted(run_dir.glob("transformer_*.pth"), key=lambda p: int(re.search(r"(\d+)", p.name).group(1)))
     if not ckpts:
-        print(f"[B2][eval] No checkpoints found under: {run_dir}")
+        print(f"[B2][eval] No checkpoints under {run_dir}")
         return
-
-    print(f"[B2][diagnose] run_root={run_dir}")
-    print(f"[B2][diagnose] test_root={test_dir}")
-
-    for ep, ck in ckpts:
+    for ck in ckpts:
+        ep = int(re.search(r"(\d+)", ck.name).group(1))
         out_ep = test_dir / f"epoch_{ep}"
-        already = False
-        if out_ep.exists():
-            for name in TEST_MARKER_FILES_DEFAULT:
-                if (out_ep / name).exists():
-                    already = True
-                    break
-        if already:
-            print(f"[B2][eval] Skip epoch {ep}: existing test marker(s) in {out_ep}")
+        if any((out_ep / f).exists() for f in TEST_MARKER_FILES_DEFAULT):
+            print(f"[B2][eval] Skip epoch {ep} (already tested)")
             continue
-
         out_ep.mkdir(parents=True, exist_ok=True)
         cmd = [
-            sys.executable, "test.py", "--config_file", str(config_path),
+            sys.executable, "test.py", "--config_file", config,
             "MODEL.DEVICE", "cuda",
             "TEST.WEIGHT", str(ck),
             "OUTPUT_DIR", str(out_ep),
             "DATASETS.ROOT_DIR", DATA_ROOT,
         ]
         print("[B2][eval] Launch:", " ".join(cmd))
-        ret = subprocess.call(cmd)
-        if ret != 0:
-            print(f"[B2][eval][warn] test.py failed for epoch {ep} (ret={ret})")
+        subprocess.call(cmd)
 
+# ---------- Seed runner ----------
 
-# ---------- Idempotent per-seed runner (NO warm-start) ----------
-
-def ensure_full_run_seed(
-    T: float, W: float, seed: int, epochs: int,
-    log_root: Path
-) -> Optional[Dict[str, Any]]:
-    """
-    Ensure one per-seed long run is completed with results (no warm-start).
-
-    Behavior:
-      - If tests already cover 'epochs' -> skip train/test; pick best and return.
-      - Else if checkpoints reached 'epochs' -> reconstruct missing tests via test.py; pick best.
-      - Else -> (re)train with CHECKPOINT_PERIOD=1 & EVAL_PERIOD=1; enforce MAX_EPOCHS=epochs;
-                then reconstruct missing tests and pick best.
-    """
-    tag = f"b2_with_b1best_T{_fmt(T)}_W{_fmt(W)}_seed{seed}"
+def ensure_full_run_seed(T, W, seed, epochs, log_root, test_enabled, tag=None):
+    tag = tag or f"b2_with_b1best_T{_fmt(T)}_W{_fmt(W)}_seed{seed}"
+    run_dir = log_root / f"veri776_{tag}_deit_run"
     test_dir = log_root / f"veri776_{tag}_deit_test"
-    run_dir  = log_root / f"veri776_{tag}_deit_run"
 
-    # 1) Already tested to target epochs? → skip train/test
-    tested_max = _max_test_epoch(test_dir)
-    print(f"[B2][diagnose] tested_max={tested_max} under {test_dir}")
-    if tested_max >= epochs:
-        best_ep = pick_best_epoch_metrics(test_dir)
-        if best_ep is None:
-            print(f"[B2][warn] Already tested to {tested_max}, but cannot parse metrics under: {test_dir}")
-            return None
-        print(f"[B2] FULL ALREADY-TESTED tag={tag} (tested_max={tested_max}≥{epochs}) best_ep={best_ep}")
-        return best_ep
-
-    # 2) Training progress by checkpoints
     trained_max = _max_epoch_from_checkpoints(run_dir)
-    print(f"[B2][diagnose] trained_max={trained_max} under {run_dir}")
+    tested_max = _max_test_epoch(test_dir) if test_enabled else 0
+    print(f"[B2][diagnose] seed={seed} trained_max={trained_max} tested_max={tested_max}")
 
-    if trained_max >= epochs:
-        print(f"[B2] FULL trained_max={trained_max}≥{epochs}; ensure tests exist for tag={tag}")
-        eval_missing_epochs_via_test_py(tag, B2_CONFIG, log_root)
-    else:
-        # 3) Need to train/resume — always ImageNet init, and cap at FULL_EPOCHS
+    if test_enabled and tested_max >= epochs:
+        best_ep = pick_best_epoch_metrics(test_dir)
+        if best_ep:
+            print(f"[B2] Already tested up to {tested_max}. Best={best_ep}")
+            return best_ep
+
+    if trained_max < epochs:
         cmd = [
             sys.executable, "run_modelB_deit.py",
             "--config", B2_CONFIG,
             "--opts",
-            # SupCon inherited from B1 JSON
             "LOSS.SUPCON.ENABLE", "True",
             "LOSS.SUPCON.T", str(T),
             "LOSS.SUPCON.W", str(W),
-            # TripletX and training mode
             "LOSS.TRIPLETX.ENABLE", "True",
             "MODEL.TRAINING_MODE", "supervised",
-            # Run settings (strictly cap epochs)
             "SOLVER.MAX_EPOCHS", str(epochs),
             "SOLVER.SEED", str(seed),
             "SOLVER.CHECKPOINT_PERIOD", "1",
             "SOLVER.EVAL_PERIOD", "1",
-            # Paths
             "DATASETS.ROOT_DIR", DATA_ROOT,
             "OUTPUT_DIR", str(log_root),
             "TAG", tag,
         ]
-        # NOTE: We intentionally do NOT add MODEL.PRETRAIN_CHOICE/self here.
-        # The YAML keeps PRETRAIN_CHOICE=imagenet → always ImageNet init.
-
         print("[B2] Launch:", " ".join(cmd))
         subprocess.check_call(cmd)
 
-        # Reconstruct any missing test epochs after training (idempotent)
-        eval_missing_epochs_via_test_py(tag, B2_CONFIG, log_root)
+    if not test_enabled:
+        print(f"[B2] Seed {seed} training done (test skipped).")
+        return None
 
-    # 4) Pick best epoch metrics after ensuring tests exist
+    eval_missing_epochs_via_test_py(tag, B2_CONFIG, log_root)
     best_ep = pick_best_epoch_metrics(test_dir)
-    if best_ep is None:
-        print(f"[B2][warn] No valid epoch metrics under: {test_dir}")
+    if not best_ep:
+        print(f"[B2][warn] No metrics found under {test_dir}")
         return None
     print(f"[B2] Seed {seed} best epoch → {best_ep}")
     return best_ep
 
-
 # ---------- Main ----------
 
 def main():
-    log_root = pick_log_root()
+    args = build_cli()
+    log_root = pick_log_root(args.output_root)
     log_root.mkdir(parents=True, exist_ok=True)
     print(f"[B2] Using log_root={log_root}")
 
-    # Load best (T, W) strictly from B1 output
     best_json = log_root / "b1_supcon_best.json"
     if not best_json.exists():
-        raise SystemExit(f"[B2] Missing {best_json}. Run B1 search first.")
+        raise SystemExit(f"[B2] Missing {best_json}")
+    obj = json.loads(best_json.read_text())
+    T, W = float(obj["T"]), float(obj["W"])
 
-    try:
-        obj = json.loads(best_json.read_text())
-        T = float(obj["T"])
-        W = float(obj["W"])
-    except Exception as e:
-        raise SystemExit(f"[B2] Failed to parse {best_json}: {e}")
+    seeds = parse_seeds(args.seeds)
+    seed_best = {}
+    for s in seeds:
+        rec = ensure_full_run_seed(T, W, s, args.epochs, log_root, args.test, args.tag)
+        if rec: seed_best[s] = rec
 
-    # Per-seed execution (idempotent & seamless). No warm-start.
-    seed_best_records: Dict[int, Dict[str, Any]] = {}
-    for seed in SEEDS:
-        rec = ensure_full_run_seed(T, W, seed, FULL_EPOCHS, log_root)
-        if rec is not None:
-            seed_best_records[seed] = rec
-
-    # Aggregate mean/std across seeds
-    summary_path = log_root / "b2_supcon_best_summary.json"
-    if seed_best_records:
-        mAPs  = [rec["mAP"] for rec in seed_best_records.values()]
-        R1s   = [rec["Rank-1"] for rec in seed_best_records.values()]
-        R5s   = [rec["Rank-5"] for rec in seed_best_records.values()]
-        R10s  = [rec["Rank-10"] for rec in seed_best_records.values()]
+    if seed_best:
         summary = {
-            "T": T, "W": W, "config": B2_CONFIG, "epochs": FULL_EPOCHS,
+            "T": T, "W": W, "epochs": args.epochs, "config": B2_CONFIG,
             "data_root": DATA_ROOT,
-            "seeds": {str(k): v for k, v in seed_best_records.items()},
-            "mean": {
-                "mAP":  safe_mean(mAPs),
-                "Rank-1": safe_mean(R1s),
-                "Rank-5": safe_mean(R5s),
-                "Rank-10": safe_mean(R10s),
-            },
-            "std": {
-                "mAP":  safe_stdev(mAPs),
-                "Rank-1": safe_stdev(R1s),
-                "Rank-5": safe_stdev(R5s),
-                "Rank-10": safe_stdev(R10s),
-            },
-            "note": "B2_no-warmstart(ImageNet). Best epoch per seed picked by mAP (tiebreaker Rank-1).",
+            "seeds": {str(k): v for k, v in seed_best.items()},
+            "mean": {k: safe_mean([r[k] for r in seed_best.values()]) for k in ["mAP","Rank-1","Rank-5","Rank-10"]},
+            "std":  {k: safe_stdev([r[k] for r in seed_best.values()]) for k in ["mAP","Rank-1","Rank-5","Rank-10"]},
         }
-        summary_path.write_text(json.dumps(summary, indent=2))
-        print(f"[B2] Wrote summary → {summary_path}")
+        (log_root / "b2_supcon_best_summary.json").write_text(json.dumps(summary, indent=2))
+        print(f"[B2] Summary written → {log_root/'b2_supcon_best_summary.json'}")
     else:
-        print("[B2][warn] No seed best records collected; skip summary.")
-
+        print("[B2] No summary (test disabled or no metrics).")
     print("[B2] Done.")
-
 
 if __name__ == "__main__":
     main()
