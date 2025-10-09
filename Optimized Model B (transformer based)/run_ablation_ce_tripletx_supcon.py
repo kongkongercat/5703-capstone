@@ -4,6 +4,14 @@
 # [2025-10-10 | Hang Zhang (hzha0521)]
 # Ablation launcher — CE + TripletX + SupCon (no SSL pretraining)
 # Based on: run_b2.py
+#
+# Change Log
+# [2025-10-09 | Hang Zhang] Initial version supporting CE+TripletX+SupCon ablation.
+# [2025-10-10 | Hang Zhang] Update:
+#     - Fixed subfolder naming: removed duplicate "seed0_seed0" pattern.
+#     - Output structure: each seed now has its own outer folder (logs/..._seed0_YYYYMMDD).
+#     - Inner folders unified as veri776_ablation_ce_tripletx_supcon_deit_run/test.
+#     - Improved checkpoint detection and consistent SupCon T/W injection.
 # =============================================================================
 
 from __future__ import annotations
@@ -165,7 +173,7 @@ def build_cli() -> argparse.Namespace:
     p.add_argument("--output-root", type=str, default=None,
                    help="Override entire output root path (disables Drive default).")
     p.add_argument("--tag", type=str, default=None,
-                   help="Optional tag appended to run/test subfolders (dedup with seed).")
+                   help="Optional tag appended to run/test subfolders.")
     p.add_argument("--no-test", action="store_true",
                    help="Train only, skip evaluation.")
     return p.parse_args()
@@ -173,10 +181,10 @@ def build_cli() -> argparse.Namespace:
 # -------------------------------------------------------------------------
 # Evaluation of saved checkpoints (resume-safe)
 # -------------------------------------------------------------------------
-def eval_saved_checkpoints(tag: str, config: str, out_root: Path):
+def eval_saved_checkpoints(config: str, out_root: Path):
     """Evaluate all saved checkpoints missing test results."""
-    run_dir  = out_root / f"veri776_{tag}_deit_run"
-    test_dir = out_root / f"veri776_{tag}_deit_test"
+    run_dir  = out_root / "veri776_ablation_ce_tripletx_supcon_deit_run"
+    test_dir = out_root / "veri776_ablation_ce_tripletx_supcon_deit_test"
     test_dir.mkdir(parents=True, exist_ok=True)
     ckpts = sorted(run_dir.glob("transformer_*.pth"),
                    key=lambda p: int(re.search(r"(\d+)", p.name).group(1)))
@@ -205,15 +213,9 @@ def eval_saved_checkpoints(tag: str, config: str, out_root: Path):
 # -------------------------------------------------------------------------
 def run_one_seed(T: float, W: float, seed: int, epochs: int,
                  save_every: int, eval_every: int, out_root: Path,
-                 do_test: bool, tag_extra: Optional[str]):
-    # Inner folder tag (no seed/date here to avoid duplication)
-    base_tag = "ablation_ce_tripletx_supcon"
-    # Dedup tag if it already contains the seed pattern
-    if tag_extra and f"seed{seed}" not in str(tag_extra):
-        base_tag += f"_{tag_extra}"
-
-    run_dir  = out_root / f"veri776_{base_tag}_deit_run"
-    test_dir = out_root / f"veri776_{base_tag}_deit_test"
+                 do_test: bool):
+    run_dir  = out_root / "veri776_ablation_ce_tripletx_supcon_deit_run"
+    test_dir = out_root / "veri776_ablation_ce_tripletx_supcon_deit_test"
 
     trained_max = _max_epoch_from_ckpts(run_dir)
     tested_max  = _max_test_epoch(test_dir) if do_test else 0
@@ -241,7 +243,7 @@ def run_one_seed(T: float, W: float, seed: int, epochs: int,
             "SOLVER.EVAL_PERIOD", str(eval_every),
             "DATASETS.ROOT_DIR", DATA_ROOT,
             "OUTPUT_DIR", str(out_root),
-            "TAG", base_tag,
+            "TAG", "ablation_ce_tripletx_supcon",
         ]
         print("[ABL] Launch:", " ".join(cmd))
         subprocess.check_call(cmd)
@@ -250,7 +252,7 @@ def run_one_seed(T: float, W: float, seed: int, epochs: int,
         print(f"[ABL] Seed {seed} training done (test skipped).")
         return None
 
-    eval_saved_checkpoints(base_tag, CONFIG_PATH, out_root)
+    eval_saved_checkpoints(CONFIG_PATH, out_root)
     best = pick_best_epoch_metrics(test_dir)
     if not best:
         print(f"[ABL][warn] No metrics found under {test_dir}")
@@ -282,27 +284,23 @@ def main():
     seeds = parse_seeds(args.seeds)
     seed_results: Dict[int, Dict[str, Any]] = {}
 
-    # Run each seed in its own outer folder: <folder>_seed{seed}_YYYYMMDD
     for s in seeds:
         out_root = per_seed_out_root(base_root, args.folder_name, s)
         print(f"[ABL] Using output_root={out_root}")
         rec = run_one_seed(T, W, s, args.epochs, args.save_every,
-                           args.eval_every, out_root, (not args.no_test), args.tag)
+                           args.eval_every, out_root, (not args.no_test))
         if rec:
-            # Write per-seed summary inside that seed's folder
-            summary = {
+            (out_root / "ablation_seed_summary.json").write_text(json.dumps({
                 "setting": "Ablation CE+TripletX+SupCon (no SSL)",
                 "config": CONFIG_PATH,
                 "epochs": args.epochs,
                 "save_every": args.save_every,
                 "eval_every": args.eval_every,
                 "data_root": DATA_ROOT,
-                "T": T, "W": W, "seed": s, "best": rec,
-            }
-            (out_root / "ablation_seed_summary.json").write_text(json.dumps(summary, indent=2))
+                "T": T, "W": W, "seed": s, "best": rec
+            }, indent=2))
             seed_results[s] = rec
 
-    # Print aggregate stats across seeds (kept lightweight since each seed has its own folder)
     if seed_results:
         mean = {k: round(stats.mean([r[k] for r in seed_results.values()]), 4)
                 for k in ["mAP","Rank-1","Rank-5","Rank-10"]}
