@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =============================================================================
-# [2025-10-09 | Hang Zhang (hzha0521)]
+# [2025-10-10 | Hang Zhang (hzha0521)]
 # Ablation launcher — CE + TripletX + SupCon (no SSL pretraining)
 # Based on: run_b2.py
-#
-# Key features:
-#   • Fixed modules: CE + TripletX + SupCon (pure supervised, no SSL)
-#   • FULL_EPOCHS = 120 by default
-#   • CHECKPOINT_PERIOD = 5, EVAL_PERIOD = 5 (can override via CLI)
-#   • Output dir auto-named: <LOG_ROOT>/<folder-name>_YYYYMMDD (defaults to Google Drive)
-#   • Resume-safe and re-eval logic identical to run_b2
 # =============================================================================
 
 from __future__ import annotations
@@ -41,10 +34,7 @@ DATASET_CANDIDATES = [
     "/workspace/datasets",
 ]
 
-TEST_MARKERS = (
-    "summary.json", "test_summary.txt", "results.txt",
-    "log.txt", "test_log.txt", "dist_mat.npy"
-)
+TEST_MARKERS = ("summary.json","test_summary.txt","results.txt","log.txt","test_log.txt","dist_mat.npy")
 
 # -------------------------------------------------------------------------
 # Environment helpers
@@ -62,16 +52,21 @@ def detect_data_root() -> str:
 DATA_ROOT = detect_data_root()
 print(f"[ABL] Using DATASETS.ROOT_DIR={DATA_ROOT}")
 
-def pick_output_root(cli_output_root: Optional[str], folder_name: str) -> Path:
-    """Decide output root. Prefer Google Drive; allow OUTPUT_ROOT override; fallback to ./logs."""
+def pick_base_log_root(cli_output_root: Optional[str]) -> Path:
+    """Prefer Drive; allow env override; fallback to ./logs."""
     if cli_output_root:
         base = Path(cli_output_root)
     else:
         base = Path(os.getenv("OUTPUT_ROOT", DRIVE_LOG_ROOT))
         if not base.exists():
             base = Path("logs")
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+def per_seed_out_root(base_root: Path, folder_name: str, seed: int) -> Path:
+    """logs/<folder_name>_seed{seed}_YYYYMMDD"""
     date_str = datetime.now().strftime("%Y%m%d")
-    out = base / f"{folder_name}_{date_str}"
+    out = base_root / f"{folder_name}_seed{seed}_{date_str}"
     out.mkdir(parents=True, exist_ok=True)
     return out
 
@@ -108,7 +103,6 @@ def parse_metrics(ep_dir: Path) -> Tuple[float,float,float,float]:
     return -1.0, -1.0, -1.0, -1.0
 
 def pick_best_epoch_metrics(test_dir: Path) -> Optional[Dict[str, Any]]:
-    """Pick epoch with highest (mAP, Rank-1)."""
     epochs = sorted([p for p in test_dir.glob("epoch_*") if p.is_dir()],
                     key=lambda p: int(p.name.split("_")[-1]))
     best, best_key = None, None
@@ -134,15 +128,11 @@ def parse_seeds(arg_list: List[str]) -> List[int]:
     return [int(x) for x in flat]
 
 def _max_test_epoch(test_dir: Path) -> int:
-    """Return highest tested epoch index."""
     max_ep = 0
     for ep in test_dir.glob("epoch_*"):
-        if not ep.is_dir():
-            continue
-        try:
-            idx = int(ep.name.split("_")[-1])
-        except:
-            continue
+        if not ep.is_dir(): continue
+        try: idx = int(ep.name.split("_")[-1])
+        except: continue
         for f in TEST_MARKERS:
             if (ep / f).exists():
                 max_ep = max(max_ep, idx)
@@ -150,14 +140,11 @@ def _max_test_epoch(test_dir: Path) -> int:
     return max_ep
 
 def _max_epoch_from_ckpts(run_dir: Path) -> int:
-    """Return highest epoch index among saved checkpoints."""
     max_ep = 0
-    if not run_dir.exists():
-        return 0
+    if not run_dir.exists(): return 0
     for p in run_dir.glob("transformer_*.pth"):
         m = re.search(r"transformer_(\d+)\.pth", p.name)
-        if m:
-            max_ep = max(max_ep, int(m.group(1)))
+        if m: max_ep = max(max_ep, int(m.group(1)))
     return max_ep
 
 # -------------------------------------------------------------------------
@@ -174,11 +161,11 @@ def build_cli() -> argparse.Namespace:
     p.add_argument("--seeds", nargs="+", default=[str(s) for s in DEFAULT_SEEDS],
                    help="Comma or space separated seeds (default: 0 1 2).")
     p.add_argument("--folder-name", type=str, default="ablation_ce_tripletx_supcon",
-                   help="Folder prefix under log root (default: ablation_ce_tripletx_supcon).")
+                   help="Folder prefix under log root.")
     p.add_argument("--output-root", type=str, default=None,
-                   help="Override entire output root path (disables auto-date).")
+                   help="Override entire output root path (disables Drive default).")
     p.add_argument("--tag", type=str, default=None,
-                   help="Optional tag appended to run/test subfolders.")
+                   help="Optional tag appended to run/test subfolders (dedup with seed).")
     p.add_argument("--no-test", action="store_true",
                    help="Train only, skip evaluation.")
     return p.parse_args()
@@ -219,9 +206,12 @@ def eval_saved_checkpoints(tag: str, config: str, out_root: Path):
 def run_one_seed(T: float, W: float, seed: int, epochs: int,
                  save_every: int, eval_every: int, out_root: Path,
                  do_test: bool, tag_extra: Optional[str]):
-    base_tag = f"ablation_ce_tripletx_supcon_seed{seed}"
-    if tag_extra:
+    # Inner folder tag (no seed/date here to avoid duplication)
+    base_tag = "ablation_ce_tripletx_supcon"
+    # Dedup tag if it already contains the seed pattern
+    if tag_extra and f"seed{seed}" not in str(tag_extra):
         base_tag += f"_{tag_extra}"
+
     run_dir  = out_root / f"veri776_{base_tag}_deit_run"
     test_dir = out_root / f"veri776_{base_tag}_deit_test"
 
@@ -273,8 +263,7 @@ def run_one_seed(T: float, W: float, seed: int, epochs: int,
 # -------------------------------------------------------------------------
 def main():
     args = build_cli()
-    out_root = pick_output_root(args.output_root, args.folder_name)
-    print(f"[ABL] Using output_root={out_root}")
+    base_root = pick_base_log_root(args.output_root)
 
     # Locate SupCon parameter file (T, W)
     drive_root = Path("/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)")
@@ -282,12 +271,7 @@ def main():
         drive_root / "logs/b1_supcon_best.json",
         Path("logs/b1_supcon_best.json"),
     ]
-    best_json = None
-    for p in best_json_candidates:
-        if p.exists():
-            best_json = p
-            break
-
+    best_json = next((p for p in best_json_candidates if p.exists()), None)
     if not best_json:
         raise SystemExit(f"[ABL] Missing b1_supcon_best.json in any of: {best_json_candidates}")
 
@@ -298,30 +282,34 @@ def main():
     seeds = parse_seeds(args.seeds)
     seed_results: Dict[int, Dict[str, Any]] = {}
 
+    # Run each seed in its own outer folder: <folder>_seed{seed}_YYYYMMDD
     for s in seeds:
+        out_root = per_seed_out_root(base_root, args.folder_name, s)
+        print(f"[ABL] Using output_root={out_root}")
         rec = run_one_seed(T, W, s, args.epochs, args.save_every,
                            args.eval_every, out_root, (not args.no_test), args.tag)
         if rec:
+            # Write per-seed summary inside that seed's folder
+            summary = {
+                "setting": "Ablation CE+TripletX+SupCon (no SSL)",
+                "config": CONFIG_PATH,
+                "epochs": args.epochs,
+                "save_every": args.save_every,
+                "eval_every": args.eval_every,
+                "data_root": DATA_ROOT,
+                "T": T, "W": W, "seed": s, "best": rec,
+            }
+            (out_root / "ablation_seed_summary.json").write_text(json.dumps(summary, indent=2))
             seed_results[s] = rec
 
+    # Print aggregate stats across seeds (kept lightweight since each seed has its own folder)
     if seed_results:
-        summary = {
-            "setting": "Ablation CE+TripletX+SupCon (no SSL)",
-            "config": CONFIG_PATH,
-            "epochs": args.epochs,
-            "save_every": args.save_every,
-            "eval_every": args.eval_every,
-            "data_root": DATA_ROOT,
-            "T": T, "W": W,
-            "seeds": {str(k): v for k,v in seed_results.items()},
-            "mean": {k: round(stats.mean([r[k] for r in seed_results.values()]),4)
-                     for k in ["mAP","Rank-1","Rank-5","Rank-10"]},
-            "std":  {k: round(stats.stdev([r[k] for r in seed_results.values()]),4)
-                     if len(seed_results)>=2 else 0.0
-                     for k in ["mAP","Rank-1","Rank-5","Rank-10"]},
-        }
-        (out_root / "ablation_ce_tripletx_supcon_summary.json").write_text(json.dumps(summary, indent=2))
-        print(f("[ABL] Summary saved → {out_root/'ablation_ce_tripletx_supcon_summary.json'}"))
+        mean = {k: round(stats.mean([r[k] for r in seed_results.values()]), 4)
+                for k in ["mAP","Rank-1","Rank-5","Rank-10"]}
+        std  = {k: round(stats.stdev([r[k] for r in seed_results.values()]), 4)
+                if len(seed_results) >= 2 else 0.0
+                for k in ["mAP","Rank-1","Rank-5","Rank-10"]}
+        print(f"[ABL] Aggregate over seeds → mean={mean} | std={std}")
     else:
         print("[ABL] No summary (test disabled or no metrics).")
 
