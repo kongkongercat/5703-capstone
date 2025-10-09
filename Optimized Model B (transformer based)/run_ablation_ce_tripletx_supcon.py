@@ -9,8 +9,7 @@
 #   • Fixed modules: CE + TripletX + SupCon (pure supervised, no SSL)
 #   • FULL_EPOCHS = 120 by default
 #   • CHECKPOINT_PERIOD = 5, EVAL_PERIOD = 5 (can override via CLI)
-#   • Custom output folder name (--folder-name) and seed selection (--seeds)
-#   • Output dir auto-named: logs/<folder-name>_YYYYMMDD
+#   • Output dir auto-named: <LOG_ROOT>/<folder-name>_YYYYMMDD (defaults to Google Drive)
 #   • Resume-safe and re-eval logic identical to run_b2
 # =============================================================================
 
@@ -30,6 +29,18 @@ SAVE_EVERY_DEFAULT  = 5
 EVAL_EVERY_DEFAULT  = 5
 DEFAULT_SEEDS       = [0, 1, 2]
 
+# Default log root on Google Drive (can be overridden by --output-root or OUTPUT_ROOT env)
+DRIVE_LOG_ROOT = "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/logs"
+
+# Prefer local project dataset first, then Drive mirrors and common fallbacks
+DATASET_CANDIDATES = [
+    "/content/5703-capstone/Optimized Model B (transformer based)/datasets",
+    "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/datasets",
+    "/content/drive/MyDrive/datasets",
+    "/content/datasets",
+    "/workspace/datasets",
+]
+
 TEST_MARKERS = (
     "summary.json", "test_summary.txt", "results.txt",
     "log.txt", "test_log.txt", "dist_mat.npy"
@@ -43,28 +54,26 @@ def detect_data_root() -> str:
     env = os.getenv("DATASETS_ROOT")
     if env and (Path(env) / "VeRi").exists():
         return env
-    for c in [
-        "/content/drive/MyDrive/datasets",
-        "/content/drive/MyDrive/5703(hzha0521)/datasets",
-        "/content/datasets",
-        "/workspace/datasets",
-        str(Path.cwd().parents[1] / "datasets"),
-        str(Path.cwd() / "datasets"),
-    ]:
+    for c in DATASET_CANDIDATES:
         if (Path(c) / "VeRi").exists():
             return c
-    return str(Path.cwd().parents[1] / "datasets")
+    return str(Path.cwd() / "datasets")
 
 DATA_ROOT = detect_data_root()
 print(f"[ABL] Using DATASETS.ROOT_DIR={DATA_ROOT}")
 
 def pick_output_root(cli_output_root: Optional[str], folder_name: str) -> Path:
-    """Decide output root. If not provided, auto-generate with date suffix."""
+    """Decide output root. Prefer Google Drive; allow OUTPUT_ROOT override; fallback to ./logs."""
     if cli_output_root:
-        return Path(cli_output_root)
+        base = Path(cli_output_root)
+    else:
+        base = Path(os.getenv("OUTPUT_ROOT", DRIVE_LOG_ROOT))
+        if not base.exists():
+            base = Path("logs")
     date_str = datetime.now().strftime("%Y%m%d")
-    base = Path(os.getenv("OUTPUT_ROOT", "logs"))
-    return base / f"{folder_name}_{date_str}"
+    out = base / f"{folder_name}_{date_str}"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
 
 # -------------------------------------------------------------------------
 # Metric parsing
@@ -85,7 +94,7 @@ def parse_metrics(ep_dir: Path) -> Tuple[float,float,float,float]:
                 float(obj.get("Rank-5", obj.get("Rank5", -1))),
                 float(obj.get("Rank-10", obj.get("Rank10", -1))),
             )
-        except: 
+        except:
             pass
     for name in ("test_summary.txt","results.txt","log.txt","test_log.txt"):
         p = ep_dir / name
@@ -165,9 +174,9 @@ def build_cli() -> argparse.Namespace:
     p.add_argument("--seeds", nargs="+", default=[str(s) for s in DEFAULT_SEEDS],
                    help="Comma or space separated seeds (default: 0 1 2).")
     p.add_argument("--folder-name", type=str, default="ablation_ce_tripletx_supcon",
-                   help="Folder prefix under logs/ (default: ablation_ce_tripletx_supcon).")
+                   help="Folder prefix under log root (default: ablation_ce_tripletx_supcon).")
     p.add_argument("--output-root", type=str, default=None,
-                   help="Override entire output root path.")
+                   help="Override entire output root path (disables auto-date).")
     p.add_argument("--tag", type=str, default=None,
                    help="Optional tag appended to run/test subfolders.")
     p.add_argument("--no-test", action="store_true",
@@ -265,7 +274,6 @@ def run_one_seed(T: float, W: float, seed: int, epochs: int,
 def main():
     args = build_cli()
     out_root = pick_output_root(args.output_root, args.folder_name)
-    out_root.mkdir(parents=True, exist_ok=True)
     print(f"[ABL] Using output_root={out_root}")
 
     # Locate SupCon parameter file (T, W)
@@ -313,7 +321,7 @@ def main():
                      for k in ["mAP","Rank-1","Rank-5","Rank-10"]},
         }
         (out_root / "ablation_ce_tripletx_supcon_summary.json").write_text(json.dumps(summary, indent=2))
-        print(f"[ABL] Summary saved → {out_root/'ablation_ce_tripletx_supcon_summary.json'}")
+        print(f("[ABL] Summary saved → {out_root/'ablation_ce_tripletx_supcon_summary.json'}"))
     else:
         print("[ABL] No summary (test disabled or no metrics).")
 

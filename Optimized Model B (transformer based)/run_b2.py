@@ -38,8 +38,9 @@
 #                            - Added --test/--no-test, --epochs, --seeds, --output-root, --tag.
 #                            - Allows flexible run configuration without editing source.
 #                            - Default behavior identical to seamless B2_no-warmstart(ImageNet).
-# [2025-10-09 | Hang Zhang] UPDATE: Locate b1_supcon_best.json from multiple candidates
-#                            (Drive project logs, current log_root, local logs, env B1_JSON).
+# [2025-10-10 | Hang Zhang] UPDATE: Prefer Google Drive for logs; dataset root
+#                            detection with candidates; multi-path lookup for
+#                            b1_supcon_best.json; fallback to local when needed.
 # =============================================================================
 """
 B2_no-warmstart(ImageNet):
@@ -70,6 +71,18 @@ B2_CONFIG    = "configs/VeiRi/deit_transreid_stride_b2_supcon_tripletx.yml".repl
 FULL_EPOCHS  = 30
 SEEDS        = [0, 1, 2]
 
+# Prefer writing logs/checkpoints to Google Drive by default
+DRIVE_LOG_ROOT = "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/logs"
+
+# Prefer local project dataset first, then Drive mirrors and common fallbacks
+DATASET_CANDIDATES = [
+    "/content/5703-capstone/Optimized Model B (transformer based)/datasets",
+    "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/datasets",
+    "/content/drive/MyDrive/datasets",
+    "/content/datasets",
+    "/workspace/datasets",
+]
+
 # ---- Test completion markers (unified) ----
 TEST_MARKER_FILES_DEFAULT = (
     "summary.json", "test_summary.txt", "results.txt", "log.txt",
@@ -89,26 +102,19 @@ def _in_colab() -> bool:
 def pick_log_root(cli_output_root: Optional[str]) -> Path:
     """
     Choose output root in priority:
-    1) CLI argument
+    1) CLI argument (--output-root)
     2) Environment variable OUTPUT_ROOT
-    3) Colab Drive path
-    4) ./logs
+    3) Google Drive project logs (preferred)
+    4) ./logs fallback
     """
     if cli_output_root:
-        return Path(cli_output_root)
-    env = os.getenv("OUTPUT_ROOT")
-    if env:
-        return Path(env)
-    if _in_colab():
-        try:
-            from google.colab import drive  # noqa: F401
-            if not Path("/content/drive/MyDrive").exists():
-                drive.mount("/content/drive", force_remount=False)
-        except Exception:
-            pass
-        dflt = "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/logs"
-        return Path(os.getenv("DRIVE_LOG_ROOT", dflt))
-    return Path("logs")
+        base = Path(cli_output_root)
+    else:
+        base = Path(os.getenv("OUTPUT_ROOT", DRIVE_LOG_ROOT))
+        if not base.exists():
+            base = Path("logs")
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
 # ---------- Dataset root detection ----------
 
@@ -117,18 +123,10 @@ def detect_data_root() -> str:
     env = os.getenv("DATASETS_ROOT")
     if env and (Path(env) / "VeRi").exists():
         return env
-    candidates = [
-        "/content/drive/MyDrive/datasets",
-        "/content/drive/MyDrive/5703(hzha0521)/datasets",
-        "/content/datasets",
-        "/workspace/datasets",
-        str(Path.cwd().parents[1] / "datasets"),
-        str(Path.cwd() / "datasets"),
-    ]
-    for c in candidates:
+    for c in DATASET_CANDIDATES:
         if (Path(c) / "VeRi").exists():
             return c
-    return str(Path.cwd().parents[1] / "datasets")
+    return str(Path.cwd() / "datasets")
 
 DATA_ROOT = detect_data_root()
 print(f"[B2] Using DATASETS.ROOT_DIR={DATA_ROOT}")
@@ -218,9 +216,12 @@ def build_cli() -> argparse.Namespace:
 def _max_test_epoch(test_dir: Path) -> int:
     max_ep = 0
     for ep in test_dir.glob("epoch_*"):
-        if not ep.is_dir(): continue
-        try: idx = int(ep.name.split("_")[-1])
-        except: continue
+        if not ep.is_dir():
+            continue
+        try:
+            idx = int(ep.name.split("_")[-1])
+        except:
+            continue
         for f in TEST_MARKER_FILES_DEFAULT:
             if (ep / f).exists():
                 max_ep = max(max_ep, idx)
@@ -229,10 +230,12 @@ def _max_test_epoch(test_dir: Path) -> int:
 
 def _max_epoch_from_checkpoints(run_dir: Path) -> int:
     max_ep = 0
-    if not run_dir.exists(): return 0
+    if not run_dir.exists():
+        return 0
     for p in run_dir.glob("transformer_*.pth"):
         m = re.search(r"transformer_(\d+)\.pth", p.name)
-        if m: max_ep = max(max_ep, int(m.group(1)))
+        if m:
+            max_ep = max(max_ep, int(m.group(1)))
     return max_ep
 
 def eval_missing_epochs_via_test_py(tag: str, config: str, log_root: Path):
@@ -315,7 +318,6 @@ def ensure_full_run_seed(T, W, seed, epochs, log_root, test_enabled, tag=None):
 def main():
     args = build_cli()
     log_root = pick_log_root(args.output_root)
-    log_root.mkdir(parents=True, exist_ok=True)
     print(f"[B2] Using log_root={log_root}")
 
     # Locate SupCon (T, W) JSON from multiple candidates
@@ -338,7 +340,8 @@ def main():
     seed_best = {}
     for s in seeds:
         rec = ensure_full_run_seed(T, W, s, args.epochs, log_root, args.test, args.tag)
-        if rec: seed_best[s] = rec
+        if rec:
+            seed_best[s] = rec
 
     if seed_best:
         summary = {
