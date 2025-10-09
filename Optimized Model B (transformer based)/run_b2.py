@@ -38,6 +38,8 @@
 #                            - Added --test/--no-test, --epochs, --seeds, --output-root, --tag.
 #                            - Allows flexible run configuration without editing source.
 #                            - Default behavior identical to seamless B2_no-warmstart(ImageNet).
+# [2025-10-09 | Hang Zhang] UPDATE: Locate b1_supcon_best.json from multiple candidates
+#                            (Drive project logs, current log_root, local logs, env B1_JSON).
 # =============================================================================
 """
 B2_no-warmstart(ImageNet):
@@ -316,11 +318,21 @@ def main():
     log_root.mkdir(parents=True, exist_ok=True)
     print(f"[B2] Using log_root={log_root}")
 
-    best_json = log_root / "b1_supcon_best.json"
-    if not best_json.exists():
-        raise SystemExit(f"[B2] Missing {best_json}")
+    # Locate SupCon (T, W) JSON from multiple candidates
+    drive_root = Path("/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)")
+    candidates = [
+        log_root / "b1_supcon_best.json",                    # preferred: current log root
+        drive_root / "logs/b1_supcon_best.json",             # project logs on Drive
+        Path("logs/b1_supcon_best.json"),                    # local fallback
+        Path(os.getenv("B1_JSON", "")) if os.getenv("B1_JSON") else None,  # env override
+    ]
+    best_json = next((p for p in candidates if p and p.exists()), None)
+    if not best_json:
+        raise SystemExit(f"[B2] Missing b1_supcon_best.json in any of: {candidates}")
+
     obj = json.loads(best_json.read_text())
     T, W = float(obj["T"]), float(obj["W"])
+    print(f"[B2] Using SupCon T={T}, W={W} from {best_json}")
 
     seeds = parse_seeds(args.seeds)
     seed_best = {}

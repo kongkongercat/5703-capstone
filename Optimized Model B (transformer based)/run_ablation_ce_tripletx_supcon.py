@@ -268,12 +268,24 @@ def main():
     out_root.mkdir(parents=True, exist_ok=True)
     print(f"[ABL] Using output_root={out_root}")
 
-    best_json = Path("logs/b1_supcon_best.json")
-    if not best_json.exists():
-        raise SystemExit(f"[ABL] Missing {best_json}")
+    # Locate SupCon parameter file (T, W)
+    drive_root = Path("/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)")
+    best_json_candidates = [
+        drive_root / "logs/b1_supcon_best.json",
+        Path("logs/b1_supcon_best.json"),
+    ]
+    best_json = None
+    for p in best_json_candidates:
+        if p.exists():
+            best_json = p
+            break
+
+    if not best_json:
+        raise SystemExit(f"[ABL] Missing b1_supcon_best.json in any of: {best_json_candidates}")
+
     obj = json.loads(best_json.read_text())
     T, W = float(obj["T"]), float(obj["W"])
-    print(f"[ABL] Using SupCon T={T}, W={W}")
+    print(f"[ABL] Using SupCon T={T}, W={W} from {best_json}")
 
     seeds = parse_seeds(args.seeds)
     seed_results: Dict[int, Dict[str, Any]] = {}
