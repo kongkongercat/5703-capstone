@@ -2,13 +2,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# =============================================================================
+# SupConLoss (Supervised Contrastive Loss with camera-aware support)
+# File: supcon_loss.py
+#
+# Created by Meng Fanyi & Hang Zhang on 2025-09-11
+# Reference: Khosla et al. (https://arxiv.org/abs/2004.11362)
+#
+# Change Log
+# [2025-09-11 | Hang Zhang] Enhanced SupConLoss implementation:
+#                            - Added camera-aware positive pair support (same ID & different cam)
+#                            - Adopted LogSumExp trick for numerical stability
+#                            - Excluded anchors with no positive pairs from loss averaging
+#                            - Applied row-wise max subtraction for stabilized logits
+#                            - Unified L2-normalization inside forward (no need to pre-normalize)
+#                            - Updated documentation and argument list (features, labels, camids)
+# =============================================================================
+
 
 class SupConLoss(nn.Module):
     """
     Supervised Contrastive Loss
-    Reference: Khosla et al. (https://arxiv.org/abs/2004.11362)
-
-    Created by Meng Fanyi & Zhang Hang on 2025-09-11
 
     This implementation supports:
       - Camera-aware positive pairs (same ID, different camera)
