@@ -2,16 +2,18 @@
 # -*- coding: utf-8 -*-
 # ==========================================
 # File: run_b3_self_supervised.py
-# Purpose: B3 SupCon grid search with YAML-driven grid (LOSS.SUPCON.SEARCH)
+# Purpose: SupCon 自监督网格搜索（T/W 来自 YAML），每轮评估与保存，
+#          并在训练目录额外导出 "transformer_best.pth"
 # Author: Zeyu Yang (Your Email or Info Here)
 # ==========================================
 # Change Log
-# [2025-09-16 | Zeyu Yang] Initial version: added self-supervised grid search for SupCon.
-# [2025-09-16 | Zeyu Yang] Ensure SupCon is explicitly enabled via --opts
-# [2025-09-16 | Zeyu Yang] Adapted for self-supervised learning.
-# [2025-09-22 | Zeyu Yang] Grid runs now use softmax_triplet sampler with ID/TRIPLET weights=0,
-#                           force TEST.EVAL=True, start from ImageNet (no resume), and unique TAGs.
-# [2025-09-23 | Zeyu Yang] Fix YACS dtype mismatch: pass MODEL.*_WEIGHT as float strings ("0.0").
+# [2025-09-16] Initial version: self-supervised SupCon grid search.
+# [2025-09-22] Use softmax_triplet sampler, disable ID/Triplet, eval on, unique TAGs.
+# [2025-09-23] Fix YACS dtype mismatch: MODEL.*_WEIGHT as "0.0" strings.
+# [2025-09-24] (This version) 固定轮次为 30，强制每轮评估/保存；新增保存最优轮次 best pth。
+#              - EVAL_PERIOD=1 & CHECKPOINT_PERIOD=1
+#              - 解析每轮结果并复制 transformer_{best}.pth -> transformer_best.pth
+#              - 更鲁棒的 run/test 目录解析 + metrics 解析回退
 # ==========================================
 
 import itertools
@@ -21,6 +23,7 @@ import re
 import subprocess
 import sys
 import time
+import shutil
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 import statistics as stats
@@ -28,18 +31,17 @@ import glob
 
 # ====== User settings ======
 CONFIG = "configs/VeRi/deit_transreid_stride_b3_ssl_pretrain.yml"
-SEARCH_EPOCHS = 10       # 10 recommended for quick screening
-FULL_EPOCHS   = 30        # long training for the best (T,W)
+SEARCH_EPOCHS = 30       # 固定为 30 轮
+FULL_EPOCHS   = 30       # 如需 full retrain，可保留；本脚本主要用 SEARCH
 # Seeds policy
-SEARCH_SEED = 0           # fast screening: single seed only
-FULL_SEEDS  = [0, 1, 2]   # confirm best with 3 seeds
+SEARCH_SEED = 0
+FULL_SEEDS  = [0, 1, 2]
 
-# Whether to apply SSL-style overrides (we use SupCon-only training with eval on)
+# 是否应用自监督样式覆盖：只用 SupCon，评估开启，从 ImageNet 初始化
 FORCE_SSL_OVERRIDES = True
 # ===========================
 
 # ---------- Env helpers ----------
-
 def _in_colab() -> bool:
     try:
         import google.colab  # noqa: F401
@@ -76,7 +78,6 @@ def _unique_tag(base: str) -> str:
     return f"{base}_{time.strftime('%m%d-%H%M%S')}"
 
 # ---------- YAML grid loader ----------
-
 def _to_float_list(x) -> List[float]:
     if isinstance(x, (int, float)):
         return [float(x)]
@@ -86,8 +87,7 @@ def _to_float_list(x) -> List[float]:
 
 def load_grid_from_yaml(cfg_path: str) -> Tuple[List[float], List[float]]:
     """
-    Try YACS first (if available), then PyYAML. Return (T_list, W_list).
-    Fallback to T=[0.07], W=[0.25,0.30,0.35] if not found.
+    Load T/W grid from YAML (LOSS.SUPCON.SEARCH). Fallback: T=[0.07], W=[0.25,0.30,0.35]
     """
     # Try YACS
     try:
@@ -128,7 +128,6 @@ def load_grid_from_yaml(cfg_path: str) -> Tuple[List[float], List[float]]:
     return [0.07], [0.25, 0.30, 0.35]
 
 # ---------- Regex helper / stats ----------
-
 def _re_pick(s: str, pattern: str, default: float = -1.0) -> float:
     m = re.search(pattern, s, flags=re.I)
     try:
@@ -144,8 +143,35 @@ def safe_stdev(xs):
     xs = [x for x in xs if isinstance(x, (int, float)) and x >= 0]
     return stats.pstdev(xs) if len(xs) > 1 else 0.0
 
-# ---------- Metrics parsing helpers ----------
+# ---------- Dir resolvers ----------
+def _resolve_test_dir(log_root: Path, tag: str) -> Path:
+    """
+    Expect: logs/veri776_{tag}_deit_test ; fallback to glob
+    """
+    expected = log_root / f"veri776_{tag}_deit_test"
+    if expected.exists():
+        return expected
+    # fallback glob
+    candidates = glob.glob(str(log_root / f"**/*{tag}*deit_test"), recursive=True)
+    if candidates:
+        candidates = sorted(candidates, key=lambda p: os.path.getmtime(p), reverse=True)
+        return Path(candidates[0])
+    return expected
 
+def _resolve_run_dir(log_root: Path, tag: str) -> Path:
+    """
+    Expect: logs/veri776_{tag}_deit_run ; fallback to glob
+    """
+    expected = log_root / f"veri776_{tag}_deit_run"
+    if expected.exists():
+        return expected
+    candidates = glob.glob(str(log_root / f"**/*{tag}*deit_run"), recursive=True)
+    if candidates:
+        candidates = sorted(candidates, key=lambda p: os.path.getmtime(p), reverse=True)
+        return Path(candidates[0])
+    return expected
+
+# ---------- Metrics parser ----------
 def _latest_epoch_dir(out_test_dir: Path) -> Optional[Path]:
     epochs = sorted(
         [p for p in out_test_dir.glob("epoch_*") if p.is_dir()],
@@ -153,92 +179,71 @@ def _latest_epoch_dir(out_test_dir: Path) -> Optional[Path]:
     )
     return epochs[-1] if epochs else None
 
-
-def _resolve_test_dir(log_root: Path, tag: str) -> Path:
+def _parse_one_epoch_metrics(ep_dir: Path) -> Optional[Dict[str, float]]:
     """
-    Try to resolve the per-run test directory robustly.
-    Primary expectation (from run_modelB_deit.py):
-       logs/veri776_{tag}_deit_test
-    If not found, fallback to glob search.
+    解析单个 epoch 目录的指标（优先 summary.json；回退文本日志）。
+    返回 dict: {"epoch": int, "mAP": float, "Rank-1": float, "Rank-5": float, "Rank-10": float}
     """
-    expected = log_root / f"veri776_{tag}_deit_test"
-    if expected.exists():
-        return expected
-    # Fallback: glob within 3 levels
-    candidates = glob.glob(str(log_root / f"**/*{tag}*deit_test"), recursive=True)
-    if candidates:
-        candidates = sorted(candidates, key=lambda p: os.path.getmtime(p), reverse=True)
-        return Path(candidates[0])
-    return expected
-
-
-def parse_metrics(out_test_dir: Path) -> Tuple[float, float, float, float]:
-    """
-    Parse metrics from latest epoch dir under out_test_dir.
-    Returns (mAP, Rank-1, Rank-5, Rank-10) or (-1,-1,-1,-1) if not found.
-    """
-    ep = _latest_epoch_dir(out_test_dir)
-    if not ep:
-        return -1.0, -1.0, -1.0, -1.0
-
-    sj = ep / "summary.json"
+    epoch_idx = int(ep_dir.name.split("_")[-1]) if ep_dir.name.split("_")[-1].isdigit() else -1
+    sj = ep_dir / "summary.json"
     if sj.exists():
         try:
             obj = json.loads(sj.read_text())
-            mAP = float(obj.get("mAP", -1))
-            r1  = float(obj.get("Rank-1", obj.get("Rank1", -1)))
-            r5  = float(obj.get("Rank-5", obj.get("Rank5", -1)))
-            r10 = float(obj.get("Rank-10", obj.get("Rank10", -1)))
-            return mAP, r1, r5, r10
+            return {
+                "epoch": epoch_idx,
+                "mAP": float(obj.get("mAP", -1)),
+                "Rank-1": float(obj.get("Rank-1", obj.get("Rank1", -1))),
+                "Rank-5": float(obj.get("Rank-5", obj.get("Rank5", -1))),
+                "Rank-10": float(obj.get("Rank-10", obj.get("Rank10", -1))),
+            }
         except Exception:
             pass
 
-    # Fallback: parse text logs
+    # fallback: parse text logs in this epoch dir
     for name in ("test_summary.txt", "results.txt", "log.txt"):
-        p = ep / name
+        p = ep_dir / name
         if p.exists():
             s = p.read_text(encoding="utf-8", errors="ignore")
             mAP = _re_pick(s, r"mAP[^0-9]*([0-9]+(?:\.[0-9]+)?)")
             r1  = _re_pick(s, r"Rank[-\s]?1[^0-9]*([0-9]+(?:\.[0-9]+)?)")
             r5  = _re_pick(s, r"Rank[-\s]?5[^0-9]*([0-9]+(?:\.[0-9]+)?)")
             r10 = _re_pick(s, r"Rank[-\s]?10[^0-9]*([0-9]+(?:\.[0-9]+)?)")
-            return mAP, r1, r5, r10
+            return {"epoch": epoch_idx, "mAP": mAP, "Rank-1": r1, "Rank-5": r5, "Rank-10": r10}
+    return None
 
-    return -1.0, -1.0, -1.0, -1.0
-
-
-def pick_best_epoch_metrics(test_dir: Path):
-    """Pick best epoch by (mAP, Rank-1). Return a record dict or None."""
+def pick_best_epoch_metrics(test_dir: Path) -> Optional[Dict[str, float]]:
+    """
+    遍历 test_dir 下所有 epoch_*，按 (mAP, Rank-1) 选最优，返回该 epoch 的记录。
+    """
     best = None
     for ep in sorted([p for p in test_dir.glob("epoch_*") if p.is_dir()],
                      key=lambda p: int(p.name.split("_")[-1]) if p.name.split("_")[-1].isdigit() else -1):
-        sj = ep / "summary.json"
-        if sj.exists():
-            try:
-                obj = json.loads(sj.read_text())
-                rec = {
-                    "epoch": int(ep.name.split("_")[-1]) if ep.name.split("_")[-1].isdigit() else -1,
-                    "mAP": float(obj.get("mAP", -1)),
-                    "Rank-1": float(obj.get("Rank-1", obj.get("Rank1", -1))),
-                    "Rank-5": float(obj.get("Rank-5", obj.get("Rank5", -1))),
-                    "Rank-10": float(obj.get("Rank-10", obj.get("Rank10", -1))),
-                }
-                if rec["mAP"] < 0:
-                    continue
-                if best is None or (rec["mAP"], rec["Rank-1"]) > (best["mAP"], best["Rank-1"]):
-                    best = rec
-            except Exception:
-                pass
+        rec = _parse_one_epoch_metrics(ep)
+        if not rec or rec["mAP"] < 0:
+            continue
+        if (best is None) or ((rec["mAP"], rec["Rank-1"]) > (best["mAP"], best["Rank-1"])):
+            best = rec
     return best
 
-# ---------- One run (search, single-seed) ----------
+def parse_metrics(out_test_dir: Path) -> Tuple[float, float, float, float]:
+    """
+    读取“最新”epoch 的指标（用于快速打印）；若缺失则返回 -1
+    """
+    ep = _latest_epoch_dir(out_test_dir)
+    if not ep:
+        return -1.0, -1.0, -1.0, -1.0
+    rec = _parse_one_epoch_metrics(ep)
+    if not rec:
+        return -1.0, -1.0, -1.0, -1.0
+    return rec["mAP"], rec["Rank-1"], rec["Rank-5"], rec["Rank-10"]
 
+# ---------- opts builder ----------
 def _ssl_overrides_for_opts(t: float, w: float) -> List[str]:
     """
-    Recommended overrides for SSL-style SupCon training:
-      - use softmax_triplet sampler but disable ID/TRIPLET losses (weights=0)
-      - force TEST.EVAL=True
-      - start from ImageNet (avoid resume)
+    自监督 SupCon 推荐覆盖：
+      - 采样器 softmax_triplet，但将 ID/TRIPLET 权重置 0
+      - 强制每轮评估与保存：EVAL_PERIOD=1, CHECKPOINT_PERIOD=1
+      - 从 ImageNet 初始化，避免误恢复旧权重
     """
     if not FORCE_SSL_OVERRIDES:
         return [
@@ -247,29 +252,51 @@ def _ssl_overrides_for_opts(t: float, w: float) -> List[str]:
             "LOSS.SUPCON.W", str(w),
         ]
     return [
-        # SupCon on + hyper-params
+        # SupCon 开启 + 超参
         "LOSS.SUPCON.ENABLE", "True",
         "LOSS.SUPCON.T", str(t),
         "LOSS.SUPCON.W", str(w),
         "LOSS.SUPCON.POS_RULE", "class",
 
-        # Use supervised sampler but disable its losses
+        # 监督采样器，但监督损失权重为 0（纯 SupCon 训练）
         "DATALOADER.SAMPLER", "softmax_triplet",
-        "DATALOADER.NUM_INSTANCE", "4",   # adjust per GPU memory
+        "DATALOADER.NUM_INSTANCE", "4",
 
-        # IMPORTANT: pass floats as strings to satisfy YACS dtype check
+        # 注意：以字符串形式传给 YACS，避免 dtype mismatch
         "MODEL.ID_LOSS_WEIGHT", "0.0",
         "MODEL.TRIPLET_LOSS_WEIGHT", "0.0",
 
-        # SSL mode + fresh start + enable eval
+        # 训练模式与初始化
         "MODEL.TRAINING_MODE", "self_supervised",
         "MODEL.PRETRAIN_CHOICE", "imagenet",
+
+        # 评估 & 保存频率：每轮一次
         "TEST.EVAL", "True",
+        "SOLVER.EVAL_PERIOD", "1",
+        "SOLVER.CHECKPOINT_PERIOD", "1",
     ]
 
+# ---------- One run ----------
+def _copy_best_weight_if_available(tag: str, log_root: Path, best_epoch: int) -> Optional[Path]:
+    """
+    在训练目录下把 transformer_{best_epoch}.pth 复制为 transformer_best.pth
+    """
+    run_dir = _resolve_run_dir(log_root, tag)
+    src = run_dir / f"transformer_{best_epoch}.pth"
+    dst = run_dir / "transformer_best.pth"
+    if src.exists():
+        try:
+            shutil.copyfile(src, dst)
+            print(f"[B3] Best checkpoint exported → {dst}")
+            return dst
+        except Exception as e:
+            print(f"[B3][warn] Failed to copy best weight: {e}")
+    else:
+        print(f"[B3][warn] Best weight not found: {src}")
+    return None
 
 def run_one_search(t: float, w: float):
-    tag = _unique_tag(f"b3_supcon_T{_fmt(t)}_W{_fmt(w)}")  # unique tag
+    tag = _unique_tag(f"b3_supcon_T{_fmt(t)}_W{_fmt(w)}")
     cmd = [
         sys.executable, "run_modelB_deit.py",
         "--config", CONFIG,
@@ -283,108 +310,64 @@ def run_one_search(t: float, w: float):
     print(f"[B3] Running: {' '.join(cmd)}")
     subprocess.check_call(cmd)
 
+    # 解析结果目录
     out_test_dir = _resolve_test_dir(LOG_ROOT, tag)
     if not out_test_dir.exists():
         raise RuntimeError(f"[B3] Test dir not found: {out_test_dir}")
 
+    # 打印最新一轮指标（便于快速查看）
     mAP, r1, r5, r10 = parse_metrics(out_test_dir)
-    print(f"[B3] SEARCH RESULT tag={tag} T={t} W={w} seed={SEARCH_SEED} "
+    print(f"[B3] LAST EPOCH RESULT tag={tag} T={t} W={w} seed={SEARCH_SEED} "
           f"mAP={mAP} Rank-1={r1} Rank-5={r5} Rank-10={r10}")
 
-    if mAP < 0 or r1 < 0:
-        raise RuntimeError(f"[B3] Invalid metrics (mAP={mAP}, R1={r1}). "
-                           f"Check logs under {out_test_dir} and training config.")
+    # 选取最优 epoch（mAP 优先，Rank-1 次之），导出 best pth
+    best_ep = pick_best_epoch_metrics(out_test_dir)
+    if best_ep is None:
+        raise RuntimeError(f"[B3] No valid epoch metrics found under: {out_test_dir}")
 
-    return {"tag": tag, "T": t, "W": w, "mAP": mAP, "R1": r1, "R5": r5, "R10": r10}
+    best_weight_path = _copy_best_weight_if_available(tag, LOG_ROOT, best_ep["epoch"])
+
+    print(f"[B3] BEST EPOCH tag={tag}: epoch={best_ep['epoch']}  "
+          f"mAP={best_ep['mAP']}  R1={best_ep['Rank-1']}  "
+          f"(best weight: {best_weight_path if best_weight_path else 'N/A'})")
+
+    return {
+        "tag": tag, "T": t, "W": w,
+        "mAP": best_ep["mAP"], "R1": best_ep["Rank-1"],
+        "R5": best_ep.get("Rank-5", -1), "R10": best_ep.get("Rank-10", -1),
+        "best_epoch": best_ep["epoch"],
+        "best_weight": str(best_weight_path) if best_weight_path else "",
+    }
 
 # ---------- Main ----------
-
 def main():
     T_list, W_list = load_grid_from_yaml(CONFIG)
     print(f"[B3] Search grid → T={T_list} ; W={W_list}")
-    print(f"[B3] Search uses single seed: {SEARCH_SEED}")
-    print(f"[B3] Full training seeds   : {FULL_SEEDS}")
+    print(f"[B3] Epochs per run        : {SEARCH_EPOCHS} (eval/save every epoch)")
+    print(f"[B3] Seed (search)         : {SEARCH_SEED}")
     print(f"[B3] FORCE_SSL_OVERRIDES   : {FORCE_SSL_OVERRIDES}")
 
     runs = [run_one_search(t, w) for t, w in itertools.product(T_list, W_list)]
     if not runs:
         raise SystemExit("[B3] No runs executed. Check your SEARCH grid or paths.")
 
+    # 选择整体最佳 (mAP, R1)
     best = max(runs, key=lambda x: (x["mAP"], x["R1"]))
     BEST_JSON.write_text(json.dumps({
         "T": best["T"], "W": best["W"],
         "mAP": best["mAP"], "Rank-1": best["R1"],
         "Rank-5": best.get("R5", -1), "Rank-10": best.get("R10", -1),
+        "best_epoch": best.get("best_epoch", -1),
+        "best_weight": best.get("best_weight", ""),
         "source_tag": best["tag"],
         "note": f"Best SupCon params from B3 search (single-seed screening). "
-                f"FORCE_SSL_OVERRIDES={FORCE_SSL_OVERRIDES}",
+                f"EVAL_PERIOD=1, CHECKPOINT_PERIOD=1, EPOCHS={SEARCH_EPOCHS}",
     }, indent=2))
-    print(f"[B3] Saved best → {BEST_JSON}")
+    print(f"[B3] Saved best summary → {BEST_JSON}")
 
-    # ---- Full retrain with multiple seeds
-    seed_best_records: Dict[int, Dict[str, Any]] = {}
-    for seed in FULL_SEEDS:
-        full_tag = _unique_tag(
-            f"b3_supcon_best_T{_fmt(best['T'])}_W{_fmt(best['W'])}_seed{seed}"
-        )
-        print(f"[B3] Full retrain: (T={best['T']}, W={best['W']}) seed={seed} → tag={full_tag}")
-
-        cmd = [
-            sys.executable, "run_modelB_deit.py",
-            "--config", CONFIG,
-            "--opts",
-            *(_ssl_overrides_for_opts(best["T"], best["W"])),
-            "SOLVER.MAX_EPOCHS", str(FULL_EPOCHS),
-            "SOLVER.SEED", str(seed),
-            "OUTPUT_DIR", str(LOG_ROOT),
-            "TAG", full_tag,
-        ]
-        print(f"[B3] Running: {' '.join(cmd)}")
-        subprocess.check_call(cmd)
-
-        test_dir = _resolve_test_dir(LOG_ROOT, full_tag)
-        if not test_dir.exists():
-            print(f"[B3][warn] Test dir not found: {test_dir}")
-            continue
-        best_ep = pick_best_epoch_metrics(test_dir)
-        if best_ep is None:
-            print(f"[B3][warn] No valid epoch metrics found under: {test_dir}")
-        else:
-            seed_best_records[seed] = best_ep
-            print(f"[B3] Seed {seed} best epoch: {best_ep}")
-
-    if seed_best_records:
-        mAPs  = [rec["mAP"] for rec in seed_best_records.values()]
-        R1s   = [rec["Rank-1"] for rec in seed_best_records.values()]
-        R5s   = [rec["Rank-5"] for rec in seed_best_records.values()]
-        R10s  = [rec["Rank-10"] for rec in seed_best_records.values()]
-
-        summary = {
-            "T": best["T"],
-            "W": best["W"],
-            "seeds": {str(k): v for k, v in seed_best_records.items()},
-            "mean": {
-                "mAP":  round(safe_mean(mAPs), 4),
-                "Rank-1": round(safe_mean(R1s), 4),
-                "Rank-5": round(safe_mean(R5s), 4),
-                "Rank-10": round(safe_mean(R10s), 4),
-            },
-            "std": {
-                "mAP":  round(safe_stdev(mAPs), 4),
-                "Rank-1": round(safe_stdev(R1s), 4),
-                "Rank-5": round(safe_stdev(R5s), 4),
-                "Rank-10": round(safe_stdev(R10s), 4),
-            },
-            "note": "Each seed uses its best epoch by mAP (tie-breaker Rank-1). "
-                    f"FORCE_SSL_OVERRIDES={FORCE_SSL_OVERRIDES}.",
-        }
-        BEST_SUMMARY_JSON.write_text(json.dumps(summary, indent=2))
-        print(f"[B3] Wrote summary → {BEST_SUMMARY_JSON}")
-    else:
-        print("[B3][warn] No seed best records collected; skip summary.")
-
-    print(f"[B3] Full retrains finished under {LOG_ROOT}")
-
+    # 如需 full retrain，可在这里保留多 seed 逻辑（略）
+    print(f"[B3] All runs finished under {LOG_ROOT}")
 
 if __name__ == "__main__":
     main()
+
