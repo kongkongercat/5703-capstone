@@ -11,6 +11,9 @@
 # [2025-10-11 | Hang Zhang] Enhanced CLI:
 #   - Add argparse for epochs/save-every/seeds
 #   - Auto-tag log folders with date-time (YYYYMMDD_HHMM)
+# [2025-10-12 | Hang Zhang] Unify naming to:
+#   veri776_b0_baseline_<DATE_TAG>_seed<seed>_deit_{run|test}
+#   Disable in-training eval (EVAL_PERIOD=0) to avoid duplicate test dirs
 # ===========================================================
 
 from __future__ import annotations
@@ -168,10 +171,11 @@ def pick_eval_device() -> str:
     return "cpu"
 
 
-# ----- Eval missing -----
+# ----- Eval missing (unified naming: date first, then seed) -----
 def eval_missing_epochs_via_test_py(tag: str, config_path: str, log_root: Path):
-    run_dir  = log_root / f"veri776_{tag}_{DATE_TAG}_deit_run"
-    test_dir = log_root / f"veri776_{tag}_{DATE_TAG}_deit_test"
+    # tag = f"b0_baseline_{DATE_TAG}_seed{seed}"
+    run_dir  = log_root / f"veri776_{tag}_deit_run"
+    test_dir = log_root / f"veri776_{tag}_deit_test"
     test_dir.mkdir(parents=True, exist_ok=True)
 
     ckpts = []
@@ -200,11 +204,13 @@ def eval_missing_epochs_via_test_py(tag: str, config_path: str, log_root: Path):
         subprocess.call(cmd)
 
 
-# ----- Training runner -----
+# ----- Training runner (unified naming) -----
 def ensure_full_run(seed: int, epochs: int, save_every: int, log_root: Path) -> Optional[Dict[str, Any]]:
-    tag = f"b0_baseline_seed{seed}"
-    run_dir  = log_root / f"veri776_{tag}_{DATE_TAG}_deit_run"
-    test_dir = log_root / f"veri776_{tag}_{DATE_TAG}_deit_test"
+    # Unify naming to match training script output:
+    # veri776_b0_baseline_<DATE_TAG>_seed<seed>_deit_{run|test}
+    tag = f"b0_baseline_{DATE_TAG}_seed{seed}"
+    run_dir  = log_root / f"veri776_{tag}_deit_run"
+    test_dir = log_root / f"veri776_{tag}_deit_test"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[B0] Training seed={seed}, total={epochs}, save every={save_every}")
@@ -216,15 +222,17 @@ def ensure_full_run(seed: int, epochs: int, save_every: int, log_root: Path) -> 
         "SOLVER.MAX_EPOCHS", str(epochs),
         "SOLVER.SEED", str(seed),
         "SOLVER.CHECKPOINT_PERIOD", str(save_every),
-        "SOLVER.EVAL_PERIOD", "1",
+        "SOLVER.EVAL_PERIOD", "0",  # disable in-training eval; test after training only
         "DATASETS.ROOT_DIR", DATA_ROOT,
         "OUTPUT_DIR", str(log_root),
-        "TAG", f"b0_baseline_{DATE_TAG}",
+        "TAG", f"b0_baseline_{DATE_TAG}",  # training script will form ..._<DATE_TAG>_seed<seed>_...
     ]
     print("[B0][train] Launch:", " ".join(cmd))
     subprocess.check_call(cmd)
 
+    # Evaluate all saved checkpoints into the unified test directory
     eval_missing_epochs_via_test_py(tag, CONFIG, log_root)
+
     best_ep = pick_best_epoch_metrics(test_dir)
     if best_ep:
         (log_root / f"b0_baseline_seed{seed}_best_{DATE_TAG}.json").write_text(json.dumps(best_ep, indent=2))
