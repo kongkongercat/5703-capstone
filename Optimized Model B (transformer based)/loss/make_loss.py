@@ -18,6 +18,10 @@
 #                           Unified SupCon usage for B1/B2/B4 with safe z_supcon fallback.
 #                           Added sampler='random' branch for B3 (SSL pretraining).
 #                           Made triplet optional; added camids/epoch passthrough for TripletX.
+# [2025-10-11 | Hang Zhang] Compatibility fix (Plan B):
+#                           - Conditionally pass camids/epoch only when TRIPLETX.ENABLE=True.
+#                           - Keep plain TripletLoss two-arg call in B0.
+#                           - Robust handling for tuple/single return from metric loss.
 # ==========================================
 
 import torch
@@ -39,6 +43,11 @@ def _pick_z(z_supcon, feat):
     if z_supcon is not None:
         return z_supcon
     return feat[0] if isinstance(feat, list) else feat
+
+
+def _reduce_triplet_output(out):
+    """Return scalar loss if metric loss returns (loss, aux) or a single value."""
+    return out[0] if isinstance(out, (list, tuple)) else out
 
 
 def make_loss(cfg, num_classes):
@@ -67,13 +76,14 @@ def make_loss(cfg, num_classes):
     # Metric loss: Triplet or TripletX
     # --------------------------------
     triplet = None
+    USE_TRIPLETX = False
     if 'triplet' in str(cfg.MODEL.METRIC_LOSS_TYPE):
-        use_tripletx = (
+        USE_TRIPLETX = (
             TripletXLoss is not None
             and hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "TRIPLETX")
             and getattr(cfg.LOSS.TRIPLETX, "ENABLE", False)
         )
-        if use_tripletx:
+        if USE_TRIPLETX:
             triplet = TripletXLoss(
                 margin=cfg.LOSS.TRIPLETX.MARGIN,
                 use_soft_warmup=cfg.LOSS.TRIPLETX.SOFT_WARMUP,
@@ -130,16 +140,25 @@ def make_loss(cfg, num_classes):
                 else:
                     ID_LOSS = F.cross_entropy(score, target)
 
-            # ---- Triplet / TripletX ----
+            # ---- Triplet / TripletX (conditional argument binding) ----
             if triplet is not None:
                 if isinstance(feat, list):
                     tri_vals = []
                     for f in feat[1:]:
-                        tri_vals.append(triplet(f, target, camids=camids, epoch=epoch)[0])
-                    tri0 = triplet(feat[0], target, camids=camids, epoch=epoch)[0]
+                        if USE_TRIPLETX:
+                            tri_vals.append(_reduce_triplet_output(triplet(f, target, camids=camids, epoch=epoch)))
+                        else:
+                            tri_vals.append(_reduce_triplet_output(triplet(f, target)))
+                    if USE_TRIPLETX:
+                        tri0 = _reduce_triplet_output(triplet(feat[0], target, camids=camids, epoch=epoch))
+                    else:
+                        tri0 = _reduce_triplet_output(triplet(feat[0], target))
                     TRI_LOSS = (sum(tri_vals) / len(tri_vals) + tri0) * 0.5
                 else:
-                    TRI_LOSS = triplet(feat, target, camids=camids, epoch=epoch)[0]
+                    if USE_TRIPLETX:
+                        TRI_LOSS = _reduce_triplet_output(triplet(feat, target, camids=camids, epoch=epoch))
+                    else:
+                        TRI_LOSS = _reduce_triplet_output(triplet(feat, target))
             else:
                 TRI_LOSS = 0.0
 
