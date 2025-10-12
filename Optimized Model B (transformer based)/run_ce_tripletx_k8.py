@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ===========================================================
-# File: run_ce_tripletx.py
+# File: run_ce_tripletx_k8.py
 # Purpose: TripletX-only runner (CE + TripletX), multi-seed,
 #          with auto-resume, robust re-test, and summary.
 # Author: Hang Zhang (hzha0521)
