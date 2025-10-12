@@ -5,7 +5,19 @@
 # Purpose: TripletX-only runner (CE + TripletX), multi-seed,
 #          with auto-resume, robust re-test, and summary.
 # Author: Hang Zhang (hzha0521)
-# Date: 2025-10-10
+# ===========================================================
+# Change Log
+# [2025-10-10 | Hang Zhang] Initial version: TripletX-only (CE+TripletX) runner,
+#                           120e by default, PK sampler configurable, auto-resume,
+#                           re-test missing epochs, and per-seed best summary.
+# [2025-10-12 | Hang Zhang] NEW CLI & capabilities:
+#   - --test-only: run evaluation only (no training)
+#   - --from-run: accept a path to existing *_deit_run/_deit_test folder or pure TAG
+#   - --tag: directly pass a TAG (e.g., ce_tripletx_k8_20251010_1507_seed0)
+#   - --cfg: override config YAML path (defaults to B2 TripletX yaml)
+#   - Fixed-tag flow: training/testing can resume into the SAME run/test folders
+#                     when --from-run/--tag is provided.
+#   - Refactors: pass cfg_path through, keep English comments, robust path parsing.
 # ===========================================================
 
 from __future__ import annotations
@@ -78,6 +90,10 @@ def _re_pick(s: str, pat: str) -> float:
     m = re.search(pat, s, re.I)
     return float(m.group(1)) if m else -1.0
 
+def _int_from_name(p: Path) -> int:
+    m = re.search(r"(\d+)", p.name)
+    return int(m.group(1)) if m else 0
+
 def parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, float]:
     sj = epoch_dir / "summary.json"
     if sj.exists():
@@ -135,18 +151,35 @@ def pick_eval_device() -> str:
         pass
     return "cpu"
 
+def infer_tag_from_input(s: str) -> str:
+    """
+    Accept:
+      - full path to veri776_<TAG>_deit_run
+      - full path to veri776_<TAG>_deit_test
+      - pure TAG ('ce_tripletx_k8_20251010_1507_seed0')
+    Return: <TAG> part only.
+    """
+    p = Path(s)
+    name = p.name
+    m = re.match(r"veri776_(.+)_(?:deit_run|deit_test)$", name)
+    if m:
+        return m.group(1)
+    m = re.search(r"veri776_(.+?)_(?:deit_run|deit_test)", str(p))
+    if m:
+        return m.group(1)
+    return name
+
 # --------- Robust re-test ---------
 def eval_missing_epochs_via_test_py(tag: str, config_path: str, log_root: Path):
     run_dir  = log_root / f"veri776_{tag}_deit_run"
     test_dir = log_root / f"veri776_{tag}_deit_test"
     test_dir.mkdir(parents=True, exist_ok=True)
 
-    ckpts = sorted(run_dir.glob("transformer_*.pth"),
-                   key=lambda p: int(re.search(r"(\d+)", p.name).group(1)))
+    ckpts = sorted(run_dir.glob("transformer_*.pth"), key=_int_from_name)
     device = pick_eval_device()
 
     for ck in ckpts:
-        ep = int(re.search(r"(\d+)", ck.name).group(1))
+        ep = _int_from_name(ck)
         out_ep = test_dir / f"epoch_{ep}"
         if any((out_ep / f).exists() for f in TEST_MARKER_FILES):
             continue
@@ -163,46 +196,52 @@ def eval_missing_epochs_via_test_py(tag: str, config_path: str, log_root: Path):
 
 # --------- One-seed run ---------
 def ensure_full_run(seed: int, epochs: int, ckp: int, eva: int,
-                    pk: int, log_root: Path, train_only: bool = False
+                    pk: int, log_root: Path, train_only: bool = False,
+                    fixed_tag: Optional[str] = None, cfg_path: str = CONFIG
                     ) -> Optional[Dict[str, Any]]:
+    """
+    Train (resume if needed) and/or test.
+    If fixed_tag is provided, reuse existing run/test folders:
+      logs/veri776_<fixed_tag>_deit_run/test
+    Otherwise, create a new tag with timestamp.
+    """
     ts = datetime.now().strftime("%Y%m%d_%H%M")
-    # Naming exactly like your screenshot:
-    # veri776_ce_tripletx_k{pk}_{YYYYMMDD_HHMM}_seed{seed}_deit_run/test
-    tag = f"ce_tripletx_k{pk}_{ts}_seed{seed}"
+    tag = fixed_tag if fixed_tag else f"ce_tripletx_k{pk}_{ts}_seed{seed}"
     run_dir  = log_root / f"veri776_{tag}_deit_run"
     test_dir = log_root / f"veri776_{tag}_deit_test"
 
-    trained_max = max([int(re.search(r"(\d+)", p.name).group(1)) for p in run_dir.glob("transformer_*.pth")], default=0)
+    # detect current progress
+    trained_max = max([_int_from_name(p) for p in run_dir.glob("transformer_*.pth")], default=0)
 
     if trained_max >= epochs:
         print(f"[TX] Trained to {trained_max}, reconstruct tests (seed={seed})")
         if not train_only:
-            eval_missing_epochs_via_test_py(tag, CONFIG, log_root)
+            eval_missing_epochs_via_test_py(tag, cfg_path, log_root)
     else:
         print(f"[TX] Training seed={seed} (resume {trained_max}/{epochs}), PK={pk}")
         ckpt_path = run_dir / f"transformer_{trained_max}.pth"
         cmd = [
             sys.executable, "run_modelB_deit.py",
-            "--config", CONFIG,
+            "--config", cfg_path,
             "--opts",
             "SOLVER.MAX_EPOCHS", str(epochs),
             "SOLVER.SEED", str(seed),
             "SOLVER.CHECKPOINT_PERIOD", str(ckp),
             "SOLVER.EVAL_PERIOD", str(eva),
-            "DATALOADER.NUM_INSTANCE", str(pk),   # <-- PK=4 by default
+            "DATALOADER.NUM_INSTANCE", str(pk),
             "LOSS.SUPCON.ENABLE", "False",
             "LOSS.TRIPLETX.ENABLE", "True",
             "MODEL.TRAINING_MODE", "supervised",
             "DATASETS.ROOT_DIR", DATA_ROOT,
             "OUTPUT_DIR", str(log_root),
-            "TAG", f"ce_tripletx_k{pk}_{ts}_seed{seed}",
+            "TAG", tag,
         ]
         if ckpt_path.exists() and trained_max > 0:
             cmd += ["MODEL.PRETRAIN_CHOICE", "resume", "MODEL.PRETRAIN_PATH", str(ckpt_path)]
         print("[TX][train] Launch:", " ".join(cmd))
         subprocess.check_call(cmd)
         if not train_only:
-            eval_missing_epochs_via_test_py(tag, CONFIG, log_root)
+            eval_missing_epochs_via_test_py(tag, cfg_path, log_root)
 
     if train_only:
         print(f"[TX] Seed {seed} training finished (test skipped).")
@@ -224,6 +263,11 @@ def build_cli() -> argparse.Namespace:
     p.add_argument("--output-root", type=str, default=None, help="Override output root directory.")
     p.add_argument("--train-only", action="store_true", help="Skip test phase.")
     p.add_argument("--pk", type=int, default=PK_DEFAULT, help="PK sampler K (DATALOADER.NUM_INSTANCE).")
+    # NEW:
+    p.add_argument("--test-only", action="store_true", help="Only run test for an existing run (no training).")
+    p.add_argument("--from-run", type=str, default=None, help="Path to an existing *_run/_test folder, or pure TAG.")
+    p.add_argument("--tag", type=str, default=None, help="Override TAG directly (e.g., ce_tripletx_k8_20251010_1507_seed0).")
+    p.add_argument("--cfg", type=str, default=CONFIG, help="Config yaml path to use.")
     return p.parse_args()
 
 def parse_seeds(raw: List[str]) -> List[int]:
@@ -239,10 +283,34 @@ def main():
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     print(f"[TX] Using log_root={log_root} | timestamp={ts} | PK={args.pk}")
 
+    fixed_tag: Optional[str] = None
+    if args.from_run:
+        fixed_tag = infer_tag_from_input(args.from_run)
+        print(f"[TX] Fixed TAG from --from-run → {fixed_tag}")
+    elif args.tag:
+        fixed_tag = args.tag
+        print(f"[TX] Fixed TAG from --tag → {fixed_tag}")
+
+    # test-only flow (no training)
+    if args.test_only:
+        if not fixed_tag:
+            raise ValueError("--test-only requires --from-run or --tag to locate checkpoints.")
+        eval_missing_epochs_via_test_py(fixed_tag, args.cfg, log_root)
+        test_dir = log_root / f"veri776_{fixed_tag}_deit_test"
+        best = pick_best_epoch_metrics(test_dir)
+        if best:
+            print(f"[TX][test-only] Best epoch: {best}")
+        else:
+            print("[TX][test-only] No valid metrics found.")
+        print("[TX] Done (test-only).")
+        return
+
+    # normal (train + test) flow
     seed_best: Dict[int, Dict[str, Any]] = {}
     for seed in seeds:
         rec = ensure_full_run(seed, args.epochs, args.ckp, args.eval, args.pk,
-                              log_root, train_only=args.train_only)
+                              log_root, train_only=args.train_only,
+                              fixed_tag=fixed_tag, cfg_path=args.cfg)
         if rec:
             seed_best[seed] = rec
 
@@ -250,7 +318,7 @@ def main():
         mAPs = [r["mAP"] for r in seed_best.values()]
         R1s  = [r["Rank-1"] for r in seed_best.values()]
         summary = {
-            "config": CONFIG,
+            "config": args.cfg,
             "epochs": args.epochs,
             "ckp_period": args.ckp,
             "eval_period": args.eval,
