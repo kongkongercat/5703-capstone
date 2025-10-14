@@ -7,12 +7,12 @@
 # ==========================================
 # Change Log
 # ==========================================
-# [2025-09-11 | Zhang Hang] Added support for Supervised Contrastive Loss (SupConLoss)
+# [2025-09-11 | Hang Zhang] Added support for Supervised Contrastive Loss (SupConLoss)
 #                           and integrated cfg.LOSS.SUPCON.ENABLE / W / T into total loss.
 # [2025-09-22 | Zeyu Yang] Added new branch for sampler == "random" (SupCon-only mode).
 # [2025-10-06 | Meng Fanyi] Fixed NameError when METRIC_LOSS_TYPE=none (triplet undefined).
 #                           Added graceful fallback for SupCon-only (self-supervised) training.
-# [2025-10-08 | Zhang Hang] Integrated TripletX path (B2/B4) with full argument binding from
+# [2025-10-08 | Hang Zhang] Integrated TripletX path (B2/B4) with full argument binding from
 #                           cfg.LOSS.TRIPLETX (BNNeck+L2, top-k mining, margin warmup, 
 #                           camera-aware, hardness-aware). 
 #                           Unified SupCon usage for B1/B2/B4 with safe z_supcon fallback.
@@ -22,6 +22,15 @@
 #                           - Conditionally pass camids/epoch only when TRIPLETX.ENABLE=True.
 #                           - Keep plain TripletLoss two-arg call in B0.
 #                           - Robust handling for tuple/single return from metric loss.
+# [2025-10-14 | Hang Zhang] Phased-loss scheduling (B2_phased_loss):
+#                           - A(0–30): TripletX, w_metric=1.2, w_sup=0.30
+#                           - B(30–60): Triplet,  w_metric=1.0, w_sup linearly 0.30→0.15
+#                           - C(60–120): Triplet, w_metric=1.0, w_sup=0.0
+#                           - If epoch is None → fallback to static cfg weights.
+# [2025-10-14 | Hang Zhang] **Guard switch to avoid affecting other configs.**   # [NEW]
+#                           - Add cfg.LOSS.PHASED.ENABLE (default False).
+#                           - Only when PHASED.ENABLE=True AND epoch is not None, 
+#                             run phased scheduling; otherwise use static weights.
 # ==========================================
 
 import torch
@@ -50,6 +59,36 @@ def _reduce_triplet_output(out):
     return out[0] if isinstance(out, (list, tuple)) else out
 
 
+# ------------------------------
+# Phased scheduling helpers
+# ------------------------------
+def _supcon_weight_by_epoch(epoch: int) -> float:        # [NEW] phased SupCon weight schedule
+    """A: 0–30 -> 0.30;  B: 30–60 -> 0.30→0.15 linear;  C: 60–120 -> 0.0"""
+    if epoch <= 30:
+        return 0.30
+    elif epoch <= 60:
+        # linear decay 0.30 -> 0.15 over 30 epochs
+        return 0.30 - 0.15 * ((epoch - 30) / 30.0)
+    else:
+        return 0.0
+
+
+def _phased_selector(epoch: int):                         # [NEW] decide TripletX/Triplet + metric/SupCon weights by epoch
+    """
+    Returns:
+        use_tripletx (bool), w_metric (float), w_sup (float)
+    A(0–30): TripletX, w_metric=1.2, w_sup=0.30
+    B(30–60): Triplet,  w_metric=1.0, w_sup=0.30→0.15
+    C(60–120): Triplet,  w_metric=1.0, w_sup=0.0
+    """
+    if epoch <= 30:
+        return True, 1.2, 0.30
+    elif epoch <= 60:
+        return False, 1.0, _supcon_weight_by_epoch(epoch)
+    else:
+        return False, 1.0, 0.0
+
+
 def make_loss(cfg, num_classes):
     sampler = cfg.DATALOADER.SAMPLER
     feat_dim = 2048
@@ -76,14 +115,14 @@ def make_loss(cfg, num_classes):
     # Metric loss: Triplet or TripletX
     # --------------------------------
     triplet = None
-    USE_TRIPLETX = False
+    USE_TRIPLETX_AVAILABLE = False  # availability flag
     if 'triplet' in str(cfg.MODEL.METRIC_LOSS_TYPE):
-        USE_TRIPLETX = (
+        USE_TRIPLETX_AVAILABLE = (
             TripletXLoss is not None
             and hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "TRIPLETX")
             and getattr(cfg.LOSS.TRIPLETX, "ENABLE", False)
         )
-        if USE_TRIPLETX:
+        if USE_TRIPLETX_AVAILABLE:
             triplet = TripletXLoss(
                 margin=cfg.LOSS.TRIPLETX.MARGIN,
                 use_soft_warmup=cfg.LOSS.TRIPLETX.SOFT_WARMUP,
@@ -124,7 +163,7 @@ def make_loss(cfg, num_classes):
 
     elif sampler == 'softmax_triplet':
         # Used in B0 (CE+Triplet), B1 (CE+Triplet+SupCon),
-        # B2/B4 (CE+TripletX+SupCon)
+        # B2/B4 (CE+TripletX+SupCon); supports phased scheduling by switch.
         def loss_func(score, feat, target, camids=None, z_supcon=None, epoch=None):
             # ---- ID Loss ----
             if xent is not None and getattr(cfg.MODEL, "IF_LABELSMOOTH", "off") == 'on':
@@ -140,35 +179,54 @@ def make_loss(cfg, num_classes):
                 else:
                     ID_LOSS = F.cross_entropy(score, target)
 
-            # ---- Triplet / TripletX (conditional argument binding) ----
+            # ---- Determine weights: phased vs static (guarded by cfg.LOSS.PHASED.ENABLE) ----  # [NEW]
+            phased_on = (
+                (epoch is not None)
+                and hasattr(cfg, "LOSS")
+                and hasattr(cfg.LOSS, "PHASED")
+                and bool(getattr(cfg.LOSS.PHASED, "ENABLE", False))
+            )
+            if phased_on:
+                use_tx_phase, w_metric, w_sup = _phased_selector(int(epoch))
+            else:
+                use_tx_phase = USE_TRIPLETX_AVAILABLE
+                w_metric = cfg.MODEL.TRIPLET_LOSS_WEIGHT
+                w_sup = getattr(cfg.LOSS.SUPCON, "W", 0.0) if supcon_criterion is not None else 0.0
+
+            # ---- Triplet / TripletX ----
+            TRI_LOSS = 0.0
             if triplet is not None:
+                use_tripletx_now = bool(use_tx_phase and USE_TRIPLETX_AVAILABLE)
                 if isinstance(feat, list):
                     tri_vals = []
                     for f in feat[1:]:
-                        if USE_TRIPLETX:
+                        if use_tripletx_now:
                             tri_vals.append(_reduce_triplet_output(triplet(f, target, camids=camids, epoch=epoch)))
                         else:
                             tri_vals.append(_reduce_triplet_output(triplet(f, target)))
-                    if USE_TRIPLETX:
+                    if use_tripletx_now:
                         tri0 = _reduce_triplet_output(triplet(feat[0], target, camids=camids, epoch=epoch))
                     else:
                         tri0 = _reduce_triplet_output(triplet(feat[0], target))
                     TRI_LOSS = (sum(tri_vals) / len(tri_vals) + tri0) * 0.5
                 else:
-                    if USE_TRIPLETX:
+                    if use_tripletx_now:
                         TRI_LOSS = _reduce_triplet_output(triplet(feat, target, camids=camids, epoch=epoch))
                     else:
                         TRI_LOSS = _reduce_triplet_output(triplet(feat, target))
-            else:
-                TRI_LOSS = 0.0
-
-            total = cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS + cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
 
             # ---- SupCon ----
-            if supcon_criterion is not None:
+            SUPCON_LOSS = 0.0
+            if supcon_criterion is not None and w_sup > 0:
                 z = _pick_z(z_supcon, feat)
-                total += cfg.LOSS.SUPCON.W * supcon_criterion(z, target, camids)
+                SUPCON_LOSS = supcon_criterion(z, target, camids)
 
+            # ---- Total ----
+            total = (
+                cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS
+                + w_metric * TRI_LOSS
+                + w_sup * SUPCON_LOSS
+            )
             return total
 
     elif sampler == 'random':

@@ -1,0 +1,135 @@
+# ==========================================
+# Model B (TransReID + DeiT + official stride)
+# B2 (Phased Loss): TripletX → Triplet across stages; SupCon still injected by the runner
+# File: deit_transreid_stride_b2_phased_loss.yml
+# Based on: deit_transreid_stride_b2_supcon_tripletx.yml
+#
+# Change Log
+# [2025-10-14 | Hang Zhang] New: Introduced phased-loss schedule (A/B/C):
+#                           - A (0–30): TripletX, w_metric=1.2, w_sup=0.30
+#                           - B (30–60): Triplet,  w_metric=1.0, w_sup linearly 0.30→0.15
+#                           - C (60–120): Triplet, w_metric=1.0, w_sup=0.0
+#                           SupCon is still injected by the runner (ENABLE/T/W);
+#                           the effective SupCon weight follows the schedule inside make_loss.
+# [2025-10-14 | Hang Zhang] Add: LOSS.PHASED.ENABLE=true (enabled only for this config);
+#                           keep TripletX enabled, K=8 P×K sampler, VeRi dataset, official stride.
+# ==========================================
+
+# ==========================================
+# MODEL
+# ==========================================
+MODEL:
+  NAME: 'transformer'
+  TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
+
+  PRETRAIN_CHOICE: 'imagenet'
+  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
+
+  # Loss plumbing (read by make_loss)
+  METRIC_LOSS_TYPE: 'triplet'    # TripletX is toggled via LOSS.TRIPLETX.ENABLE
+  ID_LOSS_WEIGHT: 1.0
+  TRIPLET_LOSS_WEIGHT: 1.0
+  IF_LABELSMOOTH: 'off'
+  IF_WITH_CENTER: 'no'
+  NO_MARGIN: False               # legacy triplet fallback only
+
+  # Runtime
+  TRAINING_MODE: 'supervised'
+  DEVICE_ID: ('0')
+
+  # Official stride & TransReID extras
+  STRIDE_SIZE: [12, 12]
+  SIE_CAMERA: True
+  SIE_VIEW: True
+  SIE_COE: 3.0
+  JPM: True
+  SHIFT_NUM: 8
+  RE_ARRANGE: True
+
+# ==========================================
+# INPUT / AUGMENTATION
+# ==========================================
+INPUT:
+  SIZE_TRAIN: [256, 256]
+  SIZE_TEST:  [256, 256]
+  PROB: 0.5
+  RE_PROB: 0.8
+  PADDING: 10
+
+# ==========================================
+# DATASETS
+# (Runner may override ROOT_DIR via --opts DATASETS.ROOT_DIR=...)
+# ==========================================
+DATASETS:
+  NAMES: 'veri'                  # VeRi-776
+  ROOT_DIR: '../datasets'
+
+# ==========================================
+# DATALOADER  (B2: K = 8 for PK-sampler)
+# ==========================================
+DATALOADER:
+  SAMPLER: 'softmax_triplet'
+  NUM_INSTANCE: 8                # K=8
+  NUM_WORKERS: 8
+
+# ==========================================
+# SOLVER / OPTIMIZATION
+# (Runner may override MAX_EPOCHS/CHECKPOINT_PERIOD/EVAL_PERIOD for screening runs)
+# ==========================================
+SOLVER:
+  OPTIMIZER_NAME: 'SGD'
+  MAX_EPOCHS: 120
+  BASE_LR: 0.01
+  IMS_PER_BATCH: 64
+  MARGIN: 0.3
+  WARMUP_METHOD: 'linear'
+  LARGE_FC_LR: False
+  CHECKPOINT_PERIOD: 120
+  LOG_PERIOD: 50
+  EVAL_PERIOD: 120
+  WEIGHT_DECAY: 1e-4
+  WEIGHT_DECAY_BIAS: 1e-4
+  BIAS_LR_FACTOR: 2
+
+# ==========================================
+# TEST / EVALUATION
+# ==========================================
+TEST:
+  EVAL: True
+  IMS_PER_BATCH: 256
+  RE_RANKING: False
+  WEIGHT: ''
+  NECK_FEAT: 'before'
+  FEAT_NORM: 'yes'
+
+# ==========================================
+# LOSS
+# ==========================================
+LOSS:
+  # Turn ON phased-loss scheduling only for this config.
+  # (Defaults to False in global defaults to avoid impacting other configs.)
+  PHASED:
+    ENABLE: true
+
+  # TripletX is enabled; make_loss will switch to plain Triplet automatically
+  # in B/C stages based on current epoch.
+  TRIPLETX:
+    ENABLE: true
+    MARGIN: 0.30
+    SOFT_WARMUP: true
+    WARMUP_EPOCHS: 10
+    K: 5
+    ALPHA: 2.0
+    CROSS_CAM_POS: true
+    SAME_CAM_NEG_BOOST: 1.2
+    NORM_FEAT: true
+    # The effective metric weight is scheduled inside make_loss (A: 1.2 / B,C: 1.0)
+
+  # SupCon is not fixed here; the runner injects ENABLE/T/W via --opts.
+  # The effective SupCon weight per epoch follows the phased schedule in make_loss.
+
+# ==========================================
+# OUTPUT
+# ==========================================
+# OUTPUT_DIR is controlled by the runner to avoid conflicts.
+# OUTPUT_DIR: '../logs/veri_deit_transreid_stride_b2_phased_loss_k8'

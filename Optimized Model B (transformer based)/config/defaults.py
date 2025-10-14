@@ -13,6 +13,8 @@ from yacs.config import CfgNode as CN
 #                           ViT backbone, STRIDE_SIZE=[12,12], SIE/JPM on, VeRi dataset, P×K sampler,
 #                           SGD schedule (120 epochs), test batch=256.
 # [2025-09-17 | Hang Zhang] Added SOLVER.MARGIN=0.3 for backward compatibility with legacy TripletLoss.
+# [2025-10-14 | Hang Zhang] **Add LOSS.PHASED guard switch (default False) to avoid impacting
+#                           non-phased configs; phased scheduling is only active when enabled.**  # [NEW]
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
@@ -99,6 +101,12 @@ _C.LOSS.TRIPLETX.ALPHA = 2.0
 _C.LOSS.TRIPLETX.CROSS_CAM_POS = True
 _C.LOSS.TRIPLETX.SAME_CAM_NEG_BOOST = 1.2
 _C.LOSS.TRIPLETX.NORM_FEAT = True
+
+# ---- Phased loss global guard (OFF by default) -------------------------------- # [NEW]
+# Only when LOSS.PHASED.ENABLE=True (e.g., in deit_transreid_stride_b2_phased_loss.yml),
+# make_loss(...) will activate epoch-aware scheduling; otherwise, all configs keep static weights.
+_C.LOSS.PHASED = CN()                                                                        # [NEW]
+_C.LOSS.PHASED.ENABLE = False                                                                # [NEW]
 
 # -----------------------------------------------------------------------------
 # INPUT / AUGMENTATION

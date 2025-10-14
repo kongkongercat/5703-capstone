@@ -12,6 +12,18 @@ from typing import Tuple
 from utils.meter import AverageMeter
 from utils.metrics import R1_mAP_eval
 
+# =============================================================================
+# Change Log (processor/processor.py)
+# -----------------------------------------------------------------------------
+# [2025-08-30 | Hang Zhang] Added start_epoch/resume & AMP scaler plumbing.
+# [2025-09-12 | Hang Zhang] SupCon integration in trainer (external add).
+# [2025-10-14 | Hang Zhang] Phased-loss integration (B2_phased_loss)  # [NEW]
+#   - Pass current `epoch` into loss_func(...) to enable phased weights.  # [NEW]
+#   - Route `z_supcon` into loss_func(...) and REMOVE external SupCon add  # [NEW]
+#     (SupCon weighting now handled inside make_loss by dynamic schedule).  # [NEW]
+#   - Simplify logs (no separate "SupCon+" piece) to avoid double counting. # [NEW]
+# =============================================================================
+
 
 def _pick_device_str(cfg) -> str:
     """
@@ -84,12 +96,8 @@ def do_train(
     start_epoch: int = 1,  # [2025-08-30 | Hang Zhang] Added start_epoch for seamless resume
 
     # =====================================================================================
-    # [Modified by] Hang Zhang (张航)
-    # [Date] 2025-09-12
-    # [Content] SupCon integration (accept kwargs from train.py)
-    #   - use_supcon: bool
-    #   - supcon_criterion: callable or None (features, labels, camids) -> loss
-    #   - supcon_weight: float
+    # (Kept for backward-compatibility) SupCon flags from entrypoint.                    # [CHG]
+    # NOTE: SupCon weighting is now handled INSIDE make_loss via phased schedule.        # [NEW]
     # =====================================================================================
     use_supcon: bool = False,
     supcon_criterion=None,
@@ -102,9 +110,9 @@ def do_train(
     - The outer script/train.py is responsible for restoring optimizer/scheduler/scaler and
       passing correct `start_epoch` (k+1) when resuming from transformer_k.pth and state_k.pth.
     - Here we start from `start_epoch` and save both model weights and training state at each epoch.
-    - SupCon integration:
-        * model.forward(...) may return z_supcon in training mode when enabled in cfg.
-        * This function will detect and add SupCon loss if (use_supcon and supcon_criterion is not None).
+    - SupCon handling:
+        * z_supcon is forwarded to loss_func(..., z_supcon=...) and weighted INSIDE make_loss
+          according to the current epoch (phased schedule).                                           # [NEW]
     """
 
     logger = logging.getLogger("transreid.train")
@@ -121,7 +129,8 @@ def do_train(
 
     logger.info(f"start training (device={device_str})")
     if use_supcon:
-        logger.info(f"[SupCon] training enabled (weight={supcon_weight})")
+        # visibility only; real weighting is inside make_loss
+        logger.info(f"[SupCon] training flag=True (note: weighted inside make_loss)")
 
     # Move model to device
     model.to(device)
@@ -153,10 +162,8 @@ def do_train(
 
         # Step the epoch-based scheduler (if applicable)
         try:
-            # some schedulers expect step(epoch), others step() every iteration
             scheduler.step(epoch)
         except TypeError:
-            # fallback: many schedulers work with step() per epoch
             try:
                 scheduler.step()
             except Exception:
@@ -188,15 +195,11 @@ def do_train(
             camids = camids.to(device, non_blocking=use_cuda)
 
             # ---------------------------------------------------------------------------------
-            # [Modified by] Hang Zhang (张航) | [Date] 2025-09-12
-            # [Content] Forward & loss with SupCon (auto-unpack outputs):
-            #   * Backbone/build_transformer:
-            #       - (score, feat) or (score, feat, z_supcon)
-            #   * build_transformer_local (JPM):
-            #       - (scores, feats) or (scores, feats, z_supcon)
-            #   Then:
-            #       loss_total = loss_func(score, feat, target, target_cam)
-            #       + supcon_weight * SupConLoss(z_supcon, target, camids)   [when enabled]
+            # Forward & total loss (SupCon + Triplet(X) handled INSIDE make_loss).            # [CHG][NEW]
+            # make_loss will:
+            #   * choose TripletX (A-stage) or Triplet (B/C) based on `epoch`
+            #   * apply dynamic w_metric and w_sup (SupCon) per epoch
+            #   * safely fallback when z_supcon is None (use feat)
             # ---------------------------------------------------------------------------------
             with torch.amp.autocast("cuda", enabled=use_cuda):
                 out = model(img, target, cam_label=target_cam, view_label=target_view)
@@ -207,33 +210,29 @@ def do_train(
                 z_supcon = None
 
                 # Unpack by type/length safely
-                if isinstance(out, tuple) or isinstance(out, list):
-                    # JPM/Local branch often returns multiple heads
+                if isinstance(out, (tuple, list)):
                     if len(out) == 3:
-                        # could be (score, feat, z_supcon) or (scores, feats, z_supcon)
                         maybe_scores, maybe_feats, z_supcon = out
-                        score = maybe_scores
-                        feat = maybe_feats
+                        score, feat = maybe_scores, maybe_feats
                     elif len(out) == 2:
                         score, feat = out
                     else:
-                        # unexpected length, best effort
                         score = out[0]
                         feat = out[1] if len(out) > 1 else None
                         z_supcon = out[2] if len(out) > 2 else None
                 else:
-                    # not expected, but keep compatibility
                     score = out
+                    feat = out  # best-effort fallback
 
-                # Base loss (CE + Triplet + Center inside make_loss)
-                base_loss = loss_func(score, feat, target, target_cam)
-
-                # Optional SupCon loss
-                if use_supcon and (supcon_criterion is not None) and (z_supcon is not None):
-                    supcon_loss = supcon_criterion(z_supcon, target, camids)
-                    loss = base_loss + supcon_weight * supcon_loss
-                else:
-                    loss = base_loss
+                # === The ONLY loss call (includes SupCon & phased weights) ===               # [NEW]
+                loss = loss_func(
+                    score,
+                    feat,
+                    target,
+                    camids=camids,       # TripletX/SupCon need camera ids
+                    z_supcon=z_supcon,   # may be None; make_loss will fallback to feat
+                    epoch=epoch,         # critical: enable phased scheduling
+                )
 
             # Backward & step with AMP
             scaler.scale(loss).backward()
@@ -265,25 +264,14 @@ def do_train(
                     lr_val = optimizer.param_groups[0]["lr"]
                 except Exception:
                     lr_val = 0.0
-                # Log SupCon piece when enabled
-                if use_supcon and (supcon_criterion is not None) and (z_supcon is not None):
-                    try:
-                        supcon_val = float((supcon_weight * supcon_loss).item())
-                    except Exception:
-                        supcon_val = 0.0
-                    logging.getLogger("transreid.train").info(
-                        "Epoch[{}] Iter[{}/{}] Loss: {:.3f} (SupCon+: {:.3f}), Acc: {:.3f}, LR: {:.2e}".format(
-                            epoch, (n_iter + 1), len(train_loader),
-                            loss_meter.avg, supcon_val, acc_meter.avg, lr_val
-                        )
+
+                # Unified log (SupCon already included inside total loss).                    # [CHG]
+                logging.getLogger("transreid.train").info(
+                    "Epoch[{}] Iter[{}/{}] Loss: {:.3f}, Acc: {:.3f}, LR: {:.2e}".format(
+                        epoch, (n_iter + 1), len(train_loader),
+                        loss_meter.avg, acc_meter.avg, lr_val
                     )
-                else:
-                    logging.getLogger("transreid.train").info(
-                        "Epoch[{}] Iter[{}/{}] Loss: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}".format(
-                            epoch, (n_iter + 1), len(train_loader),
-                            loss_meter.avg, acc_meter.avg, lr_val
-                        )
-                    )
+                )
 
         end_time = time.time()
         time_per_batch = (end_time - start_time) / max((n_iter + 1), 1)
@@ -295,7 +283,7 @@ def do_train(
             )
 
         # =========================
-        # [2025-08-30 | Hang Zhang] Save both model weights and training state for seamless resume.
+        # Save both model weights and training state for seamless resume.
         # =========================
         if (epoch % checkpoint_period == 0) or (epoch == start_epoch + epochs_this_run - 1):
             weight_path = os.path.join(cfg.OUTPUT_DIR, f"transformer_{epoch}.pth")
@@ -336,10 +324,7 @@ def do_train(
 
 
 # =========================
-# [2025-08-30 | Hang Zhang] Added do_inference for test.py compatibility
-# - Auto-detect device (cuda > mps > cpu)
-# - Optional DataParallel on multi-GPU CUDA
-# - Compute mAP and CMC (Rank-1/5/10)
+# do_inference for test.py compatibility
 # =========================
 @torch.no_grad()
 def do_inference(
