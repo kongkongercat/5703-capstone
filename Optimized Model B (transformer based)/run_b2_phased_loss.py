@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =============================================================================
-# B2_phased_loss launcher — run 3 seeds and summarize (SupCon T/W inherited from B1).
+# B2_phased_loss launcher — run N seeds and summarize (SupCon T/W inherited from B1).
 # =============================================================================
 # File: run_b2_phased_loss.py
 # Based on: run_b2.py
-# Change Log (2025-10-14 | Hang Zhang)
-# - Switch config to deit_transreid_stride_b2_phased_loss.yml (phased loss schedule).
-# - Set FULL_EPOCHS=120 to align with A(0–30)/B(30–60)/C(60–120).
-# - Keep SupCon T/W injection from B1 JSON; note: W is superseded by runtime phased weights.
-# - Keep seamless resume/test flow; enforce CHECKPOINT_PERIOD=1 & EVAL_PERIOD=1.
-# - No behavior changes beyond phased-loss adoption and epoch default.
+#
+# Change Log
+# [2025-10-14 | Hang Zhang] Initial migration to phased-loss config:
+#   - Use deit_transreid_stride_b2_phased_loss.yml (A/B/C schedule).
+#   - FULL_EPOCHS=120; SupCon T/W read from b1_supcon_best.json (W rescaled at runtime).
+#   - Seamless resume/test; force CHECKPOINT_PERIOD/EVAL_PERIOD previously to 1.
+# [2025-10-14 | Hang Zhang] Add --save-every (NEW):
+#   - New CLI flag `--save-every` controls both SOLVER.CHECKPOINT_PERIOD and SOLVER.EVAL_PERIOD.
+#   - Default 1 keeps prior behavior; e.g., `--save-every 3` saves/tests every 3 epochs.
 # =============================================================================
 """
 B2_phased_loss (ImageNet init):
 - Use T/W from B1 JSON (W will be scaled by phased schedule at runtime).
 - Always initialize from ImageNet (no warm-start from B1 checkpoint).
-- Run seeds=[0,1,2] with FULL_EPOCHS, pick best epoch per seed (by mAP; tie Rank-1),
+- Run multiple seeds with FULL_EPOCHS, pick best epoch per seed (by mAP; tie Rank-1),
   then aggregate mean/std across seeds.
 
 Seamless behavior:
 - If tests already cover FULL_EPOCHS -> skip training/testing; parse directly.
 - Else if checkpoints reached FULL_EPOCHS -> reconstruct missing tests via test.py.
-- Else -> (re)train with CHECKPOINT_PERIOD=1 & EVAL_PERIOD=1, then reconstruct tests.
+- Else -> (re)train with user-specified save/test interval, then reconstruct tests.
 """
 
 from __future__ import annotations
@@ -179,6 +182,9 @@ def build_cli() -> argparse.Namespace:
                    help="Comma or space separated seeds list. Default: [0,1,2].")
     p.add_argument("--output-root", type=str, default=None, help="Override output root directory.")
     p.add_argument("--tag", type=str, default=None, help="Custom tag (used in output dir names).")
+    # ---- NEW: save/eval interval
+    p.add_argument("--save-every", type=int, default=1,
+                   help="Checkpointing and testing interval in epochs (default: 1).")
     return p.parse_args()
 
 # ---------- Progress detection & test ----------
@@ -235,7 +241,7 @@ def eval_missing_epochs_via_test_py(tag: str, config: str, log_root: Path):
 
 # ---------- Seed runner ----------
 
-def ensure_full_run_seed(T, W, seed, epochs, log_root, test_enabled, tag=None):
+def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root, test_enabled, tag=None):
     tag = tag or f"b2_phased_T{_fmt(T)}_W{_fmt(W)}_seed{seed}"
     run_dir = log_root / f"veri776_{tag}_deit_run"
     test_dir = log_root / f"veri776_{tag}_deit_test"
@@ -262,8 +268,9 @@ def ensure_full_run_seed(T, W, seed, epochs, log_root, test_enabled, tag=None):
             "MODEL.TRAINING_MODE", "supervised",
             "SOLVER.MAX_EPOCHS", str(epochs),
             "SOLVER.SEED", str(seed),
-            "SOLVER.CHECKPOINT_PERIOD", "1",
-            "SOLVER.EVAL_PERIOD", "1",
+            # ---- use user-specified interval (NEW)
+            "SOLVER.CHECKPOINT_PERIOD", str(save_every),
+            "SOLVER.EVAL_PERIOD",      str(save_every),
             "DATASETS.ROOT_DIR", DATA_ROOT,
             "OUTPUT_DIR", str(log_root),
             "TAG", tag,
@@ -309,14 +316,14 @@ def main():
     seeds = parse_seeds(args.seeds)
     seed_best = {}
     for s in seeds:
-        rec = ensure_full_run_seed(T, W, s, args.epochs, log_root, args.test, args.tag)
+        rec = ensure_full_run_seed(T, W, s, args.epochs, args.save_every, log_root, args.test, args.tag)
         if rec:
             seed_best[s] = rec
 
     if seed_best:
         summary = {
-            "T": T, "W": W, "epochs": args.epochs, "config": B2_CONFIG,
-            "data_root": DATA_ROOT,
+            "T": T, "W": W, "epochs": args.epochs, "save_every": args.save_every,
+            "config": B2_CONFIG, "data_root": DATA_ROOT,
             "seeds": {str(k): v for k, v in seed_best.items()},
             "mean": {k: safe_mean([r[k] for r in seed_best.values()]) for k in ["mAP","Rank-1","Rank-5","Rank-10"]},
             "std":  {k: safe_stdev([r[k] for r in seed_best.values()]) for k in ["mAP","Rank-1","Rank-5","Rank-10"]},
