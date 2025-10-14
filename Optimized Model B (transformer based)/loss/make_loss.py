@@ -40,6 +40,11 @@
 #                           - Added _safe_mean() to avoid ZeroDivisionError when using list heads
 #                           - Added one-time phase-combo logging (combo + weights) whenever changed
 #                           - Removed unused LabelSmoothingCrossEntropy import
+# [2025-10-15 | Hang Zhang] Configurable phased schedule via CLI/YAML:
+#                           - _phased_selector now reads cfg.LOSS.PHASED:
+#                             BOUNDARIES, METRIC_SEQ, W_METRIC_SEQ, W_SUP_SPEC
+#                           - Supports 'const:x' and 'linear:x->y' for SupCon weight
+#                           - Falls back to original A/B/C if not provided
 # ==========================================
 
 import torch
@@ -102,13 +107,79 @@ def _supcon_weight_by_epoch(epoch: int) -> float:
         return 0.0
 
 
+def _parse_wsup(spec: str, epoch: int, left: int, right: int) -> float:
+    """
+    Parse SupCon weight spec:
+      - 'const:0.30'         -> constant value
+      - 'linear:0.30->0.00'  -> linear interpolation within [left, right)
+    """
+    try:
+        kind, payload = spec.split(":", 1)
+        kind = kind.strip().lower()
+        if kind == "const":
+            return float(payload)
+        if kind == "linear":
+            v0, v1 = payload.split("->")
+            v0, v1 = float(v0), float(v1)
+            if right <= left:
+                return v1
+            t = max(0.0, min(1.0, (epoch - left) / float(right - left)))
+            return v0 + (v1 - v0) * t
+    except Exception:
+        pass
+    return 0.0
+
+
 def _phased_selector(epoch: int):
     """
     Returns: use_tripletx (bool), w_metric (float), w_sup (float)
-    A(0–30):  TripletX, w_metric=1.2, w_sup=0.30
-    B(30–60): Triplet,  w_metric=1.0, w_sup from linear decay
-    C(60–120):Triplet,  w_metric=1.0, w_sup=0.0
+
+    New (configurable):
+      Reads cfg.LOSS.PHASED.{BOUNDARIES, METRIC_SEQ, W_METRIC_SEQ, W_SUP_SPEC}
+      if present and ENABLE=True. Otherwise falls back to the original A/B/C schedule.
+
+      - BOUNDARIES: list of ints, e.g. [31, 61] -> segments [0,31), [31,61), [61,∞)
+      - METRIC_SEQ: list of strings in {'tripletx','triplet'} per segment
+      - W_METRIC_SEQ: list of floats (metric weights) per segment
+      - W_SUP_SPEC: list of strings, each either 'const:x' or 'linear:x->y'
     """
+    # try to read cfg from the call stack (no signature change to keep API stable)
+    import inspect
+    outer_cfg = None
+    for frameinfo in inspect.stack():
+        if 'cfg' in frameinfo.frame.f_locals:
+            outer_cfg = frameinfo.frame.f_locals['cfg']
+            break
+
+    try:
+        phased = outer_cfg.LOSS.PHASED if (outer_cfg is not None and hasattr(outer_cfg, "LOSS")) else None
+        if phased is not None and bool(getattr(phased, "ENABLE", False)):
+            bounds     = list(getattr(phased, "BOUNDARIES", [30, 60]))
+            metrics    = list(getattr(phased, "METRIC_SEQ", ["tripletx", "triplet", "triplet"]))
+            w_metric   = list(getattr(phased, "W_METRIC_SEQ", [1.2, 1.0, 1.0]))
+            w_sup_spec = list(getattr(phased, "W_SUP_SPEC", ["const:0.30", "linear:0.30->0.15", "const:0.0"]))
+
+            # segments: [0,b0), [b0,b1), [b1,∞)
+            seg_left  = [0] + list(bounds)
+            seg_right = list(bounds) + [10**9]
+
+            # locate segment
+            idx = 0
+            for i, (L, R) in enumerate(zip(seg_left, seg_right)):
+                if L <= epoch < R:
+                    idx = i
+                    break
+
+            metric_name = str(metrics[idx]).lower()
+            use_tx = (metric_name == "tripletx")
+            w_m = float(w_metric[idx])
+            w_s = _parse_wsup(str(w_sup_spec[idx]), epoch, seg_left[idx], seg_right[idx])
+            return use_tx, w_m, w_s
+    except Exception:
+        # fall back silently to hard-coded plan
+        pass
+
+    # Fallback: original A/B/C schedule
     if epoch <= 30:
         return True, 1.2, 0.30
     elif epoch <= 60:
@@ -264,7 +335,7 @@ def make_loss(cfg, num_classes):
                 w_metric = tri_w
                 w_sup = supcon_w if supcon_enabled else 0.0
 
-            # ---- (NEW) schedule change logging (print-on-change) ----
+            # ---- schedule change logging (print-on-change) ----
             combo_name = "TripletX" if (use_tx_phase and USE_TRIPLETX_AVAILABLE) else \
                          ("Triplet" if (triplet is not None) else "NoMetric")
             current_sig = (combo_name, float(w_metric), float(w_sup))
