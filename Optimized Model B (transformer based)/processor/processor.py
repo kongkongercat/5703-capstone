@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import time
-import logging
-import torch
-import torch.nn as nn
-import torch.distributed as dist
-from typing import Tuple
-
-from utils.meter import AverageMeter
-from utils.metrics import R1_mAP_eval
-
 # =============================================================================
 # Change Log (processor/processor.py)
 # -----------------------------------------------------------------------------
@@ -22,8 +11,21 @@ from utils.metrics import R1_mAP_eval
 #   - Route `z_supcon` into loss_func(...) and REMOVE external SupCon add  # [NEW]
 #     (SupCon weighting now handled inside make_loss by dynamic schedule).  # [NEW]
 #   - Simplify logs (no separate "SupCon+" piece) to avoid double counting. # [NEW]
+# [2025-10-14 | Hang Zhang] Epoch-aware PK-sampler K: rebuild train_loader at phase boundaries.
+#                           from datasets import make_dataloader
 # =============================================================================
 
+import os
+import time
+import logging
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+from typing import Tuple
+
+from utils.meter import AverageMeter
+from utils.metrics import R1_mAP_eval
+from datasets import make_dataloader
 
 def _pick_device_str(cfg) -> str:
     """
@@ -80,6 +82,43 @@ def _validate_once(
     # return Rank-1, Rank-5, mAP
     return float(cmc[0]), float(cmc[4]), float(mAP)
 
+# ===== Helpers for phased PK-sampler K ======================================  # [NEW]
+def _phased_pk_enabled(cfg) -> bool:
+    """
+    [NEW] Guard for epoch-aware PK-sampler K.
+    Works only when BOTH switches are ON:
+      - cfg.LOSS.PHASED.ENABLE == True
+      - cfg.DATALOADER.PHASED.ENABLE == True
+    """
+    return (
+        hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "PHASED")
+        and bool(getattr(cfg.LOSS.PHASED, "ENABLE", False))
+        and hasattr(cfg, "DATALOADER") and hasattr(cfg.DATALOADER, "PHASED")
+        and bool(getattr(cfg.DATALOADER.PHASED, "ENABLE", False))
+    )
+
+
+def _tripletx_stage(epoch: int) -> bool:
+    """[NEW] TripletX active only in Stage A (epoch <= 30)."""
+    return int(epoch) <= 30
+
+
+def _desired_pk_k(epoch: int, cfg) -> int:
+    """
+    [NEW] Return desired K for PK-sampler given epoch & config.
+    A-stage (TripletX): K_WHEN_TRIPLETX, else K_OTHER.
+    Falls back to cfg.DATALOADER.NUM_INSTANCE when phased is disabled.
+    """
+    if not _phased_pk_enabled(cfg):
+        return int(getattr(cfg.DATALOADER, "NUM_INSTANCE", 4))
+    return int(
+        getattr(
+            cfg.DATALOADER.PHASED,
+            "K_WHEN_TRIPLETX" if _tripletx_stage(epoch) else "K_OTHER",
+            8 if _tripletx_stage(epoch) else 4,
+        )
+    )
+
 
 def do_train(
     cfg,
@@ -113,6 +152,10 @@ def do_train(
     - SupCon handling:
         * z_supcon is forwarded to loss_func(..., z_supcon=...) and weighted INSIDE make_loss
           according to the current epoch (phased schedule).                                           # [NEW]
+    - PK-sampler K scheduling:
+        * If enabled (LOSS.PHASED & DATALOADER.PHASED), rebuild train_loader at epoch boundaries:
+          - A-stage (epoch <= 30): K=8
+          - B/C-stage (epoch > 30): K=4
     """
 
     logger = logging.getLogger("transreid.train")
@@ -150,10 +193,32 @@ def do_train(
     # [2025-08-30 | Hang Zhang] AMP scaler kept for state saving during seamless resume.
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
 
+    # Track current K (for phased PK switching)                                         # [NEW]
+    current_K = int(getattr(cfg.DATALOADER, "NUM_INSTANCE", 4))                         # [NEW]
+
     # =========================
     # [2025-08-30 | Hang Zhang] Training loop now starts from `start_epoch`
     # =========================
     for epoch in range(start_epoch, start_epoch + epochs_this_run):
+
+        # ----- Epoch-aware PK-sampler K switch (rebuild train_loader) -----           # [NEW]
+        desired_K = _desired_pk_k(epoch, cfg)
+        if desired_K != current_K:
+            logging.getLogger("transreid.train").info(
+                f"[PK-sampler] Rebuilding train_loader: NUM_INSTANCE {current_K} → {desired_K} (epoch {epoch})"
+            )
+            cfg.defrost()
+            cfg.DATALOADER.NUM_INSTANCE = desired_K
+            # Rebuild only train_loader; keep val_loader unchanged
+            (train_loader,
+             _train_loader_normal,
+             _val_loader,
+             _num_query,
+             _num_classes,
+             _camera_num,
+             _view_num) = make_dataloader(cfg)
+            cfg.freeze()
+            current_K = desired_K
 
         start_time = time.time()
         loss_meter.reset()

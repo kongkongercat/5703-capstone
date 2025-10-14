@@ -15,6 +15,7 @@ from yacs.config import CfgNode as CN
 # [2025-09-17 | Hang Zhang] Added SOLVER.MARGIN=0.3 for backward compatibility with legacy TripletLoss.
 # [2025-10-14 | Hang Zhang] **Add LOSS.PHASED guard switch (default False) to avoid impacting
 #                           non-phased configs; phased scheduling is only active when enabled.**  # [NEW]
+# [2025-10-14 | Hang Zhang] Add DATALOADER.PHASED guard with K_WHEN_TRIPLETX/K_OTHER (default OFF).  # [NEW]
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
@@ -134,6 +135,13 @@ _C.DATALOADER = CN()
 _C.DATALOADER.NUM_WORKERS = 8
 _C.DATALOADER.SAMPLER = 'softmax_triplet'               # P×K sampler
 _C.DATALOADER.NUM_INSTANCE = 4
+
+# ---- Phased PK-sampler K (global guard; OFF by default) ---------------------  # [NEW]
+_C.DATALOADER.PHASED = CN()                                                     # [NEW]
+_C.DATALOADER.PHASED.ENABLE = False                                             # [NEW]
+_C.DATALOADER.PHASED.K_WHEN_TRIPLETX = 8                                        # [NEW]
+_C.DATALOADER.PHASED.K_OTHER = 4                                                # [NEW]
+
 
 # -----------------------------------------------------------------------------
 # SOLVER / OPTIMIZATION
