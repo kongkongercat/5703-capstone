@@ -18,6 +18,11 @@
 #   - Prefix all per-seed run/test folders with a unified timestamp `YYYYMMDD-HHMM_`.
 #   - Timestamp is generated once per script run (or from env RUN_TAG_TS) and shared across seeds.
 #   - Example: `20251014-0932_b2_phased_T0p07_W0p3_seed0_deit_run`
+# [2025-10-15 | Hang Zhang] CLI passthrough & dataset prefix (NEW):   <-- NEW
+#   - Added --config to override config path
+#   - Added --ds-prefix to customize run/test dir prefixes (default 'veri776')
+#   - Added --opts (REMAINDER) to pass arbitrary YACS options to run_modelB_deit.py
+#   - Made Drive root overridable via env MODEL_B_DRIVE_ROOT
 # =============================================================================
 """
 B2_phased_loss (ImageNet init):
@@ -33,7 +38,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime  # [NEW]
 
-# ---- User-configurable ----
+# ---- User-configurable defaults (can be overridden by CLI) ----
 B2_CONFIG    = "configs/VeRi/deit_transreid_stride_b2_phased_loss.yml"
 FULL_EPOCHS  = 120
 SEEDS        = [0, 1, 2]
@@ -131,6 +136,10 @@ def build_cli() -> argparse.Namespace:
     p.add_argument("--output-root", type=str, default=None)
     p.add_argument("--tag", type=str, default=None)
     p.add_argument("--save-every", type=int, default=1, help="Checkpointing/testing interval (epochs).")
+    # --- NEW: allow overriding config path, dataset prefix, and pass-through YACS opts
+    p.add_argument("--config", type=str, default=B2_CONFIG, help="Path to config YAML for run_modelB_deit.py")
+    p.add_argument("--ds-prefix", type=str, default="veri776", help="Prefix for run/test dir naming")
+    p.add_argument("--opts", nargs=argparse.REMAINDER, help="YACS-style options to pass through to run_modelB_deit.py")
     return p.parse_args()
 
 def _max_test_epoch(test_dir: Path) -> int:
@@ -151,9 +160,9 @@ def _max_epoch_from_checkpoints(run_dir: Path) -> int:
         if m: max_ep = max(max_ep, int(m.group(1)))
     return max_ep
 
-def eval_missing_epochs_via_test_py(tag: str, config: str, log_root: Path):
-    run_dir = log_root / f"veri776_{tag}_deit_run"
-    test_dir = log_root / f"veri776_{tag}_deit_test"
+def eval_missing_epochs_via_test_py(tag: str, config: str, log_root: Path, ds_prefix: str):
+    run_dir = log_root / f"{ds_prefix}_{tag}_deit_run"
+    test_dir = log_root / f"{ds_prefix}_{tag}_deit_test"
     test_dir.mkdir(parents=True, exist_ok=True)
     ckpts = sorted(run_dir.glob("transformer_*.pth"), key=lambda p: int(re.search(r"(\d+)", p.name).group(1)))
     if not ckpts:
@@ -171,14 +180,15 @@ def eval_missing_epochs_via_test_py(tag: str, config: str, log_root: Path):
                "DATASETS.ROOT_DIR", DATA_ROOT]
         print("[B2_phased][eval] Launch:", " ".join(cmd)); subprocess.call(cmd)
 
-def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root, test_enabled, tag_base, stamp):
+def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root, test_enabled, tag_base, stamp, *, args):
     """
     tag_base: user-provided or auto-generated base tag (without timestamp)
     stamp   : unified timestamp string "YYYYMMDD-HHMM"
+    args    : CLI args (provides config, ds-prefix, opts, etc.)
     """
-    tag = f"{stamp}_{tag_base}"  # [NEW] prefix timestamp
-    run_dir  = log_root / f"veri776_{tag}_deit_run"
-    test_dir = log_root / f"veri776_{tag}_deit_test"
+    tag = f"{stamp}_{tag}" if (tag := tag_base) else tag_base  # keep name stable
+    run_dir  = log_root / f"{args.ds_prefix}_{tag}_deit_run"
+    test_dir = log_root / f"{args.ds_prefix}_{tag}_deit_test"
 
     trained_max = _max_epoch_from_checkpoints(run_dir)
     tested_max  = _max_test_epoch(test_dir) if test_enabled else 0
@@ -190,7 +200,7 @@ def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root, test_enabled,
 
     if trained_max < epochs:
         cmd = [sys.executable, "run_modelB_deit.py",
-               "--config", B2_CONFIG, "--opts",
+               "--config", args.config, "--opts",
                "LOSS.SUPCON.ENABLE", "True",
                "LOSS.SUPCON.T", str(T),
                "LOSS.SUPCON.W", str(W),  # runtime will rescale by phased schedule
@@ -203,12 +213,18 @@ def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root, test_enabled,
                "DATASETS.ROOT_DIR", DATA_ROOT,
                "OUTPUT_DIR", str(log_root),
                "TAG", tag]
-        print("[B2_phased] Launch:", " ".join(cmd)); subprocess.check_call(cmd)
+
+        # Pass-through arbitrary YACS opts if provided
+        if args.opts:
+            cmd += args.opts
+
+        print("[B2_phased] Launch:", " ".join(cmd))
+        subprocess.check_call(cmd)
 
     if not test_enabled:
         print(f"[B2_phased] Seed {seed} training done (test skipped)."); return None
 
-    eval_missing_epochs_via_test_py(tag, B2_CONFIG, log_root)
+    eval_missing_epochs_via_test_py(tag, args.config, log_root, args.ds_prefix)
     best_ep = pick_best_epoch_metrics(test_dir)
     if not best_ep: print(f"[B2_phased][warn] No metrics found under {test_dir}"); return None
     print(f"[B2_phased] Seed {seed} best epoch → {best_ep}"); return best_ep
@@ -223,7 +239,10 @@ def main():
     print(f"[B2_phased] Using run timestamp: {stamp}")
 
     # Locate SupCon (T, W)
-    drive_root = Path("/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)")
+    drive_root = Path(os.getenv(
+        "MODEL_B_DRIVE_ROOT",
+        "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)"
+    ))
     candidates = [log_root / "b1_supcon_best.json",
                   drive_root / "logs/b1_supcon_best.json",
                   Path("logs/b1_supcon_best.json"),
@@ -239,14 +258,14 @@ def main():
         # base tag (without timestamp)
         auto_base = f"b2_phased_T{_fmt(T)}_W{_fmt(W)}_seed{s}"
         tag_base  = args.tag if args.tag else auto_base
-        rec = ensure_full_run_seed(T, W, s, args.epochs, args.save_every, log_root, args.test, tag_base, stamp)
+        rec = ensure_full_run_seed(T, W, s, args.epochs, args.save_every, log_root, args.test, tag_base, stamp, args=args)
         if rec: seed_best[s] = rec
 
     if seed_best:
         summary = {
             "timestamp": stamp, "T": T, "W": W,
             "epochs": args.epochs, "save_every": args.save_every,
-            "config": B2_CONFIG, "data_root": DATA_ROOT,
+            "config": args.config, "data_root": DATA_ROOT,
             "seeds": {str(k): v for k, v in seed_best.items()},
             "mean": {k: safe_mean([r[k] for r in seed_best.values()]) for k in ["mAP","Rank-1","Rank-5","Rank-10"]},
             "std":  {k: safe_stdev([r[k] for r in seed_best.values()]) for k in ["mAP","Rank-1","Rank-5","Rank-10"]},
