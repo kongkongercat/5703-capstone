@@ -8,6 +8,11 @@
 #                                       forwards return extra L2-normalized z_supcon when enabled.
 # [2025-09-15 | Zhang Hang]            Added load_param() to build_transformer_local for
 #                                       evaluation/test checkpoint loading.
+# [2025-10-15 | Zhang Hang]            SupCon head now consumes pre-BN global features
+#                                       (global_feat) instead of BNNeck features (feat) in
+#                                       Backbone / build_transformer / build_transformer_local,
+#                                       to align SupCon with metric-learning space and reduce
+#                                       CE conflict. Comments updated accordingly.
 # =============================================================================
 
 import torch
@@ -96,7 +101,7 @@ class Backbone(nn.Module):
         self.bottleneck.bias.requires_grad_(False)
         self.bottleneck.apply(weights_init_kaiming)
 
-        # SupCon projection head (2048 -> 128)
+        # SupCon projection head (pre-BN: 2048 -> 128)
         if hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "SUPCON") and getattr(cfg.LOSS.SUPCON, "ENABLE", False):
             self.supcon_head = nn.Sequential(
                 nn.Linear(self.in_planes, 2048),
@@ -107,12 +112,12 @@ class Backbone(nn.Module):
     def forward(self, x, label=None):  # label is unused if self.cos_layer == 'no'
         x = self.base(x)
         global_feat = nn.functional.avg_pool2d(x, x.shape[2:4])
-        global_feat = global_feat.view(global_feat.shape[0], -1)  # (bs, 2048)
+        global_feat = global_feat.view(global_feat.shape[0], -1)  # (bs, 2048) pre-BN features
 
         if self.neck == 'no':
             feat = global_feat
         elif self.neck == 'bnneck':
-            feat = self.bottleneck(global_feat)
+            feat = self.bottleneck(global_feat)  # BNNeck for CE head
 
         if self.training:
             if self.cos_layer:
@@ -121,7 +126,8 @@ class Backbone(nn.Module):
                 cls_score = self.classifier(feat)
 
             if hasattr(self, "supcon_head"):
-                z_supcon = self.supcon_head(feat)
+                # Use pre-BN global features for SupCon (metric-learning space)
+                z_supcon = self.supcon_head(global_feat)
                 z_supcon = F.normalize(z_supcon, dim=1)
                 return cls_score, global_feat, z_supcon
             else:
@@ -205,7 +211,7 @@ class build_transformer(nn.Module):
         self.bottleneck.bias.requires_grad_(False)
         self.bottleneck.apply(weights_init_kaiming)
 
-        # SupCon projection head (in_planes -> 128)
+        # SupCon projection head (pre-BN: in_planes -> 128)
         if hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "SUPCON") and getattr(cfg.LOSS.SUPCON, "ENABLE", False):
             self.supcon_head = nn.Sequential(
                 nn.Linear(self.in_planes, 2048),
@@ -214,8 +220,8 @@ class build_transformer(nn.Module):
             )
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
-        global_feat = self.base(x, cam_label=cam_label, view_label=view_label)
-        feat = self.bottleneck(global_feat)
+        global_feat = self.base(x, cam_label=cam_label, view_label=view_label)  # pre-BN features
+        feat = self.bottleneck(global_feat)  # BNNeck for CE head
 
         if self.training:
             if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
@@ -224,7 +230,8 @@ class build_transformer(nn.Module):
                 cls_score = self.classifier(feat)
 
             if hasattr(self, "supcon_head"):
-                z_supcon = self.supcon_head(feat)
+                # Feed pre-BN features to SupCon projection head
+                z_supcon = self.supcon_head(global_feat)
                 z_supcon = F.normalize(z_supcon, dim=1)
                 return cls_score, global_feat, z_supcon
             else:
@@ -331,7 +338,7 @@ class build_transformer_local(nn.Module):
         self.divide_length = cfg.MODEL.DEVIDE_LENGTH
         self.rearrange = rearrange
 
-        # SupCon projection head (in_planes -> 128)
+        # SupCon projection head (pre-BN: in_planes -> 128)
         if hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "SUPCON") and getattr(cfg.LOSS.SUPCON, "ENABLE", False):
             self.supcon_head = nn.Sequential(
                 nn.Linear(self.in_planes, 2048),
@@ -342,7 +349,7 @@ class build_transformer_local(nn.Module):
     def forward(self, x, label=None, cam_label=None, view_label=None):  # label is unused if self.cos_layer == 'no'
         features = self.base(x, cam_label=cam_label, view_label=view_label)
 
-        # global branch
+        # global branch (pre-BN)
         b1_feat = self.b1(features)  # [B, tokens, C]
         global_feat = b1_feat[:, 0]
 
@@ -367,7 +374,7 @@ class build_transformer_local(nn.Module):
         local_feat_3 = extract_local(patch_length * 2, patch_length * 3)
         local_feat_4 = extract_local(patch_length * 3, patch_length * 4)
 
-        feat = self.bottleneck(global_feat)
+        feat = self.bottleneck(global_feat)  # BN for CE head (global)
         local_feat_1_bn = self.bottleneck_1(local_feat_1)
         local_feat_2_bn = self.bottleneck_2(local_feat_2)
         local_feat_3_bn = self.bottleneck_3(local_feat_3)
@@ -389,7 +396,8 @@ class build_transformer_local(nn.Module):
             feats = [global_feat, local_feat_1, local_feat_2, local_feat_3, local_feat_4]
 
             if hasattr(self, "supcon_head"):
-                z_supcon = self.supcon_head(feat)
+                # Use global pre-BN feature for SupCon; keep local feats for metric losses if needed
+                z_supcon = self.supcon_head(global_feat)
                 z_supcon = F.normalize(z_supcon, dim=1)
                 return scores, feats, z_supcon
             else:
