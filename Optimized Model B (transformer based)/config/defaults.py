@@ -14,8 +14,10 @@ from yacs.config import CfgNode as CN
 #                           SGD schedule (120 epochs), test batch=256.
 # [2025-09-17 | Hang Zhang] Added SOLVER.MARGIN=0.3 for backward compatibility with legacy TripletLoss.
 # [2025-10-14 | Hang Zhang] **Add LOSS.PHASED guard switch (default False) to avoid impacting
-#                           non-phased configs; phased scheduling is only active when enabled.**  # [NEW]
-# [2025-10-14 | Hang Zhang] Add DATALOADER.PHASED guard with K_WHEN_TRIPLETX/K_OTHER (default OFF).  # [NEW]
+#                           non-phased configs; phased scheduling is only active when enabled.**
+# [2025-10-14 | Hang Zhang] Add DATALOADER.PHASED guard with K_WHEN_TRIPLETX/K_OTHER (default OFF).
+# [2025-10-15 | Hang Zhang] Add editable phased-loss keys so YACS can merge from CLI safely:
+#                           LOSS.PHASED.{BOUNDARIES, METRIC_SEQ, W_METRIC_SEQ, W_SUP_SPEC}.
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
@@ -103,17 +105,26 @@ _C.LOSS.TRIPLETX.CROSS_CAM_POS = True
 _C.LOSS.TRIPLETX.SAME_CAM_NEG_BOOST = 1.2
 _C.LOSS.TRIPLETX.NORM_FEAT = True
 
-# ---- Phased loss global guard (OFF by default) -------------------------------- # [NEW]
+# ---- Phased loss global guard (OFF by default) --------------------------------
 # Only when LOSS.PHASED.ENABLE=True (e.g., in deit_transreid_stride_b2_phased_loss.yml),
 # make_loss(...) will activate epoch-aware scheduling; otherwise, all configs keep static weights.
-_C.LOSS.PHASED = CN()                                                                        # [NEW]
-_C.LOSS.PHASED.ENABLE = False                                                                # [NEW]
+_C.LOSS.PHASED = CN()
+_C.LOSS.PHASED.ENABLE = False
+
+# Editable phased-loss keys (so CLI/YAML can override safely)
+# Semantics: half-open segments using boundaries B = [b0, b1, ...]
+#   [0, b0), [b0, b1), [b1, +∞)
+_C.LOSS.PHASED.BOUNDARIES   = [30, 60]                      # default A/B/C 切点
+_C.LOSS.PHASED.METRIC_SEQ   = ['tripletx', 'triplet', 'triplet']
+_C.LOSS.PHASED.W_METRIC_SEQ = [1.2, 1.0, 1.0]
+# SupCon权重规格：'const:x' 或 'linear:x->y'（在所在区间内线性插值）
+_C.LOSS.PHASED.W_SUP_SPEC   = ['const:0.30', 'linear:0.30->0.15', 'const:0.0']
 
 # -----------------------------------------------------------------------------
 # INPUT / AUGMENTATION
 # -----------------------------------------------------------------------------
 _C.INPUT = CN()
-_C.INPUT.SIZE_TRAIN = [256, 256]                        # project baseline
+_C.INPUT.SIZE_TRAIN = [256, 256]
 _C.INPUT.SIZE_TEST  = [256, 256]
 _C.INPUT.PROB = 0.5
 _C.INPUT.RE_PROB = 0.8
@@ -125,8 +136,8 @@ _C.INPUT.PADDING = 10
 # DATASETS
 # -----------------------------------------------------------------------------
 _C.DATASETS = CN()
-_C.DATASETS.NAMES = 'veri'                              # ← string
-_C.DATASETS.ROOT_DIR = '../datasets'                    # ← string
+_C.DATASETS.NAMES = 'veri'
+_C.DATASETS.ROOT_DIR = '../datasets'
 
 # -----------------------------------------------------------------------------
 # DATALOADER
@@ -136,19 +147,18 @@ _C.DATALOADER.NUM_WORKERS = 8
 _C.DATALOADER.SAMPLER = 'softmax_triplet'               # P×K sampler
 _C.DATALOADER.NUM_INSTANCE = 4
 
-# ---- Phased PK-sampler K (global guard; OFF by default) ---------------------  # [NEW]
-_C.DATALOADER.PHASED = CN()                                                     # [NEW]
-_C.DATALOADER.PHASED.ENABLE = False                                             # [NEW]
-_C.DATALOADER.PHASED.K_WHEN_TRIPLETX = 8                                        # [NEW]
-_C.DATALOADER.PHASED.K_OTHER = 4                                                # [NEW]
-
+# ---- Phased PK-sampler K (global guard; OFF by default) -----------------------
+_C.DATALOADER.PHASED = CN()
+_C.DATALOADER.PHASED.ENABLE = False
+_C.DATALOADER.PHASED.K_WHEN_TRIPLETX = 8
+_C.DATALOADER.PHASED.K_OTHER = 4
 
 # -----------------------------------------------------------------------------
 # SOLVER / OPTIMIZATION
 # -----------------------------------------------------------------------------
 _C.SOLVER = CN()
 _C.SOLVER.OPTIMIZER_NAME = "SGD"
-_C.SOLVER.MAX_EPOCHS = 120                              # full baseline schedule
+_C.SOLVER.MAX_EPOCHS = 120
 _C.SOLVER.BASE_LR = 0.01
 _C.SOLVER.LARGE_FC_LR = False
 _C.SOLVER.BIAS_LR_FACTOR = 2
@@ -158,7 +168,7 @@ _C.SOLVER.WEIGHT_DECAY_BIAS = 1e-4
 _C.SOLVER.GAMMA = 0.1
 _C.SOLVER.STEPS = (40, 70)
 
-# Triplet loss margin (legacy baseline, still referenced in make_loss.py)
+# Triplet loss margin (legacy baseline)
 _C.SOLVER.MARGIN = 0.3
 
 # Warmup
@@ -174,7 +184,7 @@ _C.SOLVER.EVAL_PERIOD = 120
 # Global batch size
 _C.SOLVER.IMS_PER_BATCH = 64
 
-# Cosine head defaults (kept for compatibility)
+# Cosine head defaults
 _C.SOLVER.COSINE_MARGIN = 0.5
 _C.SOLVER.COSINE_SCALE = 30
 _C.SOLVER.CENTER_LR = 0.5
@@ -185,7 +195,7 @@ _C.SOLVER.SEED = 1234
 # TEST / EVALUATION
 # -----------------------------------------------------------------------------
 _C.TEST = CN()
-_C.TEST.IMS_PER_BATCH = 256                             # larger test batch
+_C.TEST.IMS_PER_BATCH = 256
 _C.TEST.RE_RANKING = False
 _C.TEST.WEIGHT = ""
 _C.TEST.NECK_FEAT = 'before'
@@ -196,4 +206,4 @@ _C.TEST.EVAL = True
 # -----------------------------------------------------------------------------
 # Misc options
 # -----------------------------------------------------------------------------
-_C.OUTPUT_DIR = ""                                      # set via YAML/--opts
+_C.OUTPUT_DIR = ""
