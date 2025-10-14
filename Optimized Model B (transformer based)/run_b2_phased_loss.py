@@ -14,6 +14,10 @@
 # [2025-10-14 | Hang Zhang] Add --save-every (NEW):
 #   - New CLI flag `--save-every` controls both SOLVER.CHECKPOINT_PERIOD and SOLVER.EVAL_PERIOD.
 #   - Default 1 keeps prior behavior; e.g., `--save-every 3` saves/tests every 3 epochs.
+# [2025-10-14 | Hang Zhang] Timestamped output dirs (NEW):
+#   - Prefix all per-seed run/test folders with a unified timestamp `YYYYMMDD-HHMM_`.
+#   - Timestamp is generated once per script run (or from env RUN_TAG_TS) and shared across seeds.
+#   - Example: `20251014-0932_b2_phased_T0p07_W0p3_seed0_deit_run`
 # =============================================================================
 """
 B2_phased_loss (ImageNet init):
@@ -21,23 +25,13 @@ B2_phased_loss (ImageNet init):
 - Always initialize from ImageNet (no warm-start from B1 checkpoint).
 - Run multiple seeds with FULL_EPOCHS, pick best epoch per seed (by mAP; tie Rank-1),
   then aggregate mean/std across seeds.
-
-Seamless behavior:
-- If tests already cover FULL_EPOCHS -> skip training/testing; parse directly.
-- Else if checkpoints reached FULL_EPOCHS -> reconstruct missing tests via test.py.
-- Else -> (re)train with user-specified save/test interval, then reconstruct tests.
 """
 
 from __future__ import annotations
-import argparse
-import json
-import os
-import re
-import statistics as stats
-import subprocess
-import sys
+import argparse, json, os, re, statistics as stats, subprocess, sys
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
+from datetime import datetime  # [NEW]
 
 # ---- User-configurable ----
 B2_CONFIG    = "configs/VeRi/deit_transreid_stride_b2_phased_loss.yml"
@@ -51,35 +45,14 @@ DRIVE_LOG_ROOT = "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (trans
 DATASET_CANDIDATES = [
     "/content/5703-capstone/Optimized Model B (transformer based)/datasets",
     "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/datasets",
-    "/content/drive/MyDrive/datasets",
-    "/content/datasets",
-    "/workspace/datasets",
+    "/content/drive/MyDrive/datasets", "/content/datasets", "/workspace/datasets",
 ]
 
 # ---- Test completion markers (unified) ----
-TEST_MARKER_FILES_DEFAULT = (
-    "summary.json", "test_summary.txt", "results.txt", "log.txt",
-    "test_log.txt",
-    "dist_mat.npy",
-)
-
-# ---------- Environment helpers ----------
-
-def _in_colab() -> bool:
-    try:
-        import google.colab  # noqa: F401
-        return True
-    except Exception:
-        return False
+TEST_MARKER_FILES_DEFAULT = ("summary.json", "test_summary.txt", "results.txt",
+                             "log.txt", "test_log.txt", "dist_mat.npy")
 
 def pick_log_root(cli_output_root: Optional[str]) -> Path:
-    """
-    Choose output root in priority:
-    1) CLI argument (--output-root)
-    2) Environment variable OUTPUT_ROOT
-    3) Google Drive project logs (preferred)
-    4) ./logs fallback
-    """
     if cli_output_root:
         base = Path(cli_output_root)
     else:
@@ -89,10 +62,7 @@ def pick_log_root(cli_output_root: Optional[str]) -> Path:
     base.mkdir(parents=True, exist_ok=True)
     return base
 
-# ---------- Dataset root detection ----------
-
 def detect_data_root() -> str:
-    """Return a directory path whose subfolder 'VeRi' exists."""
     env = os.getenv("DATASETS_ROOT")
     if env and (Path(env) / "VeRi").exists():
         return env
@@ -104,31 +74,22 @@ def detect_data_root() -> str:
 DATA_ROOT = detect_data_root()
 print(f"[B2_phased] Using DATASETS.ROOT_DIR={DATA_ROOT}")
 
-# ---------- Helpers ----------
-
-def _fmt(v: float) -> str:
-    return str(v).replace(".", "p")
-
+def _fmt(v: float) -> str: return str(v).replace(".", "p")
 def _re_pick(text: str, pat: str) -> float:
-    m = re.search(pat, text, re.I)
-    return float(m.group(1)) if m else -1.0
+    m = re.search(pat, text, re.I); return float(m.group(1)) if m else -1.0
 
-# ---------- Metrics parsing ----------
-
-def parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, float]:
+def parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float,float,float,float]:
     sj = epoch_dir / "summary.json"
     if sj.exists():
         try:
             obj = json.loads(sj.read_text())
-            return (
-                float(obj.get("mAP", -1)),
-                float(obj.get("Rank-1", obj.get("Rank1", -1))),
-                float(obj.get("Rank-5", obj.get("Rank5", -1))),
-                float(obj.get("Rank-10", obj.get("Rank10", -1))),
-            )
+            return (float(obj.get("mAP", -1)),
+                    float(obj.get("Rank-1", obj.get("Rank1", -1))),
+                    float(obj.get("Rank-5", obj.get("Rank5", -1))),
+                    float(obj.get("Rank-10", obj.get("Rank10", -1))))
         except Exception:
             pass
-    for name in ("test_summary.txt", "results.txt", "log.txt", "test_log.txt"):
+    for name in ("test_summary.txt","results.txt","log.txt","test_log.txt"):
         p = epoch_dir / name
         if p.exists():
             s = p.read_text(encoding="utf-8", errors="ignore")
@@ -140,16 +101,13 @@ def parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, 
     return -1.0, -1.0, -1.0, -1.0
 
 def pick_best_epoch_metrics(test_dir: Path) -> Optional[Dict[str, Any]]:
-    epochs = sorted(
-        [p for p in test_dir.glob("epoch_*") if p.is_dir()],
-        key=lambda p: int(p.name.split("_")[-1])
-    )
+    epochs = sorted([p for p in test_dir.glob("epoch_*") if p.is_dir()],
+                    key=lambda p: int(p.name.split("_")[-1]))
     best, best_key = None, None
     for ep in epochs:
         ep_idx = int(ep.name.split("_")[-1])
         mAP, r1, r5, r10 = parse_metrics_from_epoch_dir(ep)
-        if mAP < 0:
-            continue
+        if mAP < 0: continue
         key = (mAP, r1)
         if (best_key is None) or (key > best_key):
             best_key = key
@@ -157,61 +115,40 @@ def pick_best_epoch_metrics(test_dir: Path) -> Optional[Dict[str, Any]]:
     return best
 
 def safe_mean(vals: List[float]) -> float:
-    valid = [v for v in vals if v >= 0]
-    return round(stats.mean(valid), 4) if valid else -1.0
-
+    valid = [v for v in vals if v >= 0]; return round(stats.mean(valid), 4) if valid else -1.0
 def safe_stdev(vals: List[float]) -> float:
-    valid = [v for v in vals if v >= 0]
-    return round(stats.stdev(valid), 4) if len(valid) >= 2 else 0.0
-
-# ---------- CLI args ----------
+    valid = [v for v in vals if v >= 0]; return round(stats.stdev(valid), 4) if len(valid) >= 2 else 0.0
 
 def parse_seeds(arg_list: List[str]) -> List[int]:
-    flat = []
-    for a in arg_list:
-        flat += [x for x in a.split(",") if x.strip()]
+    flat = [];  [flat.append(x) for a in arg_list for x in a.split(",") if x.strip()]
     return [int(x) for x in flat]
 
 def build_cli() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run B2_phased_loss with flexible options.")
-    p.add_argument("--test", dest="test", action="store_true", help="Enable test phase (default).")
-    p.add_argument("--no-test", dest="test", action="store_false", help="Skip test phase (train only).")
-    p.set_defaults(test=True)
-    p.add_argument("--epochs", type=int, default=FULL_EPOCHS, help="Number of training epochs.")
-    p.add_argument("--seeds", nargs="+", default=[str(s) for s in SEEDS],
-                   help="Comma or space separated seeds list. Default: [0,1,2].")
-    p.add_argument("--output-root", type=str, default=None, help="Override output root directory.")
-    p.add_argument("--tag", type=str, default=None, help="Custom tag (used in output dir names).")
-    # ---- NEW: save/eval interval
-    p.add_argument("--save-every", type=int, default=1,
-                   help="Checkpointing and testing interval in epochs (default: 1).")
+    p.add_argument("--test", dest="test", action="store_true"); p.add_argument("--no-test", dest="test", action="store_false"); p.set_defaults(test=True)
+    p.add_argument("--epochs", type=int, default=FULL_EPOCHS)
+    p.add_argument("--seeds", nargs="+", default=[str(s) for s in SEEDS])
+    p.add_argument("--output-root", type=str, default=None)
+    p.add_argument("--tag", type=str, default=None)
+    p.add_argument("--save-every", type=int, default=1, help="Checkpointing/testing interval (epochs).")
     return p.parse_args()
-
-# ---------- Progress detection & test ----------
 
 def _max_test_epoch(test_dir: Path) -> int:
     max_ep = 0
     for ep in test_dir.glob("epoch_*"):
-        if not ep.is_dir():
-            continue
-        try:
-            idx = int(ep.name.split("_")[-1])
-        except:
-            continue
+        if not ep.is_dir(): continue
+        try: idx = int(ep.name.split("_")[-1])
+        except: continue
         for f in TEST_MARKER_FILES_DEFAULT:
-            if (ep / f).exists():
-                max_ep = max(max_ep, idx)
-                break
+            if (ep / f).exists(): max_ep = max(max_ep, idx); break
     return max_ep
 
 def _max_epoch_from_checkpoints(run_dir: Path) -> int:
     max_ep = 0
-    if not run_dir.exists():
-        return 0
+    if not run_dir.exists(): return 0
     for p in run_dir.glob("transformer_*.pth"):
         m = re.search(r"transformer_(\d+)\.pth", p.name)
-        if m:
-            max_ep = max(max_ep, int(m.group(1)))
+        if m: max_ep = max(max_ep, int(m.group(1)))
     return max_ep
 
 def eval_missing_epochs_via_test_py(tag: str, config: str, log_root: Path):
@@ -220,109 +157,95 @@ def eval_missing_epochs_via_test_py(tag: str, config: str, log_root: Path):
     test_dir.mkdir(parents=True, exist_ok=True)
     ckpts = sorted(run_dir.glob("transformer_*.pth"), key=lambda p: int(re.search(r"(\d+)", p.name).group(1)))
     if not ckpts:
-        print(f"[B2_phased][eval] No checkpoints under {run_dir}")
-        return
+        print(f"[B2_phased][eval] No checkpoints under {run_dir}"); return
     for ck in ckpts:
         ep = int(re.search(r"(\d+)", ck.name).group(1))
         out_ep = test_dir / f"epoch_{ep}"
         if any((out_ep / f).exists() for f in TEST_MARKER_FILES_DEFAULT):
-            print(f"[B2_phased][eval] Skip epoch {ep} (already tested)")
-            continue
+            print(f"[B2_phased][eval] Skip epoch {ep} (already tested)"); continue
         out_ep.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            sys.executable, "test.py", "--config_file", config,
-            "MODEL.DEVICE", "cuda",
-            "TEST.WEIGHT", str(ck),
-            "OUTPUT_DIR", str(out_ep),
-            "DATASETS.ROOT_DIR", DATA_ROOT,
-        ]
-        print("[B2_phased][eval] Launch:", " ".join(cmd))
-        subprocess.call(cmd)
+        cmd = [sys.executable, "test.py", "--config_file", config,
+               "MODEL.DEVICE", "cuda",
+               "TEST.WEIGHT", str(ck),
+               "OUTPUT_DIR", str(out_ep),
+               "DATASETS.ROOT_DIR", DATA_ROOT]
+        print("[B2_phased][eval] Launch:", " ".join(cmd)); subprocess.call(cmd)
 
-# ---------- Seed runner ----------
-
-def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root, test_enabled, tag=None):
-    tag = tag or f"b2_phased_T{_fmt(T)}_W{_fmt(W)}_seed{seed}"
-    run_dir = log_root / f"veri776_{tag}_deit_run"
+def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root, test_enabled, tag_base, stamp):
+    """
+    tag_base: user-provided or auto-generated base tag (without timestamp)
+    stamp   : unified timestamp string "YYYYMMDD-HHMM"
+    """
+    tag = f"{stamp}_{tag_base}"  # [NEW] prefix timestamp
+    run_dir  = log_root / f"veri776_{tag}_deit_run"
     test_dir = log_root / f"veri776_{tag}_deit_test"
 
     trained_max = _max_epoch_from_checkpoints(run_dir)
-    tested_max = _max_test_epoch(test_dir) if test_enabled else 0
+    tested_max  = _max_test_epoch(test_dir) if test_enabled else 0
     print(f"[B2_phased][diagnose] seed={seed} trained_max={trained_max} tested_max={tested_max}")
 
     if test_enabled and tested_max >= epochs:
         best_ep = pick_best_epoch_metrics(test_dir)
-        if best_ep:
-            print(f"[B2_phased] Already tested up to {tested_max}. Best={best_ep}")
-            return best_ep
+        if best_ep: print(f"[B2_phased] Already tested up to {tested_max}. Best={best_ep}"); return best_ep
 
     if trained_max < epochs:
-        cmd = [
-            sys.executable, "run_modelB_deit.py",
-            "--config", B2_CONFIG,
-            "--opts",
-            "LOSS.SUPCON.ENABLE", "True",
-            "LOSS.SUPCON.T", str(T),
-            "LOSS.SUPCON.W", str(W),  # Note: runtime phased weights will rescale this.
-            "LOSS.TRIPLETX.ENABLE", "True",
-            "MODEL.TRAINING_MODE", "supervised",
-            "SOLVER.MAX_EPOCHS", str(epochs),
-            "SOLVER.SEED", str(seed),
-            # ---- use user-specified interval (NEW)
-            "SOLVER.CHECKPOINT_PERIOD", str(save_every),
-            "SOLVER.EVAL_PERIOD",      str(save_every),
-            "DATASETS.ROOT_DIR", DATA_ROOT,
-            "OUTPUT_DIR", str(log_root),
-            "TAG", tag,
-        ]
-        print("[B2_phased] Launch:", " ".join(cmd))
-        subprocess.check_call(cmd)
+        cmd = [sys.executable, "run_modelB_deit.py",
+               "--config", B2_CONFIG, "--opts",
+               "LOSS.SUPCON.ENABLE", "True",
+               "LOSS.SUPCON.T", str(T),
+               "LOSS.SUPCON.W", str(W),  # runtime will rescale by phased schedule
+               "LOSS.TRIPLETX.ENABLE", "True",
+               "MODEL.TRAINING_MODE", "supervised",
+               "SOLVER.MAX_EPOCHS", str(epochs),
+               "SOLVER.SEED", str(seed),
+               "SOLVER.CHECKPOINT_PERIOD", str(save_every),
+               "SOLVER.EVAL_PERIOD",      str(save_every),
+               "DATASETS.ROOT_DIR", DATA_ROOT,
+               "OUTPUT_DIR", str(log_root),
+               "TAG", tag]
+        print("[B2_phased] Launch:", " ".join(cmd)); subprocess.check_call(cmd)
 
     if not test_enabled:
-        print(f"[B2_phased] Seed {seed} training done (test skipped).")
-        return None
+        print(f"[B2_phased] Seed {seed} training done (test skipped)."); return None
 
     eval_missing_epochs_via_test_py(tag, B2_CONFIG, log_root)
     best_ep = pick_best_epoch_metrics(test_dir)
-    if not best_ep:
-        print(f"[B2_phased][warn] No metrics found under {test_dir}")
-        return None
-    print(f"[B2_phased] Seed {seed} best epoch → {best_ep}")
-    return best_ep
-
-# ---------- Main ----------
+    if not best_ep: print(f"[B2_phased][warn] No metrics found under {test_dir}"); return None
+    print(f"[B2_phased] Seed {seed} best epoch → {best_ep}"); return best_ep
 
 def main():
     args = build_cli()
     log_root = pick_log_root(args.output_root)
     print(f"[B2_phased] Using log_root={log_root}")
 
-    # Locate SupCon (T, W) JSON from multiple candidates
-    drive_root = Path("/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)")
-    candidates = [
-        log_root / "b1_supcon_best.json",                    # preferred: current log root
-        drive_root / "logs/b1_supcon_best.json",             # project logs on Drive
-        Path("logs/b1_supcon_best.json"),                    # local fallback
-        Path(os.getenv("B1_JSON", "")) if os.getenv("B1_JSON") else None,  # env override
-    ]
-    best_json = next((p for p in candidates if p and p.exists()), None)
-    if not best_json:
-        raise SystemExit(f"[B2_phased] Missing b1_supcon_best.json in any of: {candidates}")
+    # Unified timestamp (allow override via env for reproducibility)
+    stamp = os.getenv("RUN_TAG_TS") or datetime.now().strftime("%Y%m%d-%H%M")  # [NEW]
+    print(f"[B2_phased] Using run timestamp: {stamp}")
 
-    obj = json.loads(best_json.read_text())
-    T, W = float(obj["T"]), float(obj["W"])
+    # Locate SupCon (T, W)
+    drive_root = Path("/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)")
+    candidates = [log_root / "b1_supcon_best.json",
+                  drive_root / "logs/b1_supcon_best.json",
+                  Path("logs/b1_supcon_best.json"),
+                  Path(os.getenv("B1_JSON", "")) if os.getenv("B1_JSON") else None]
+    best_json = next((p for p in candidates if p and p.exists()), None)
+    if not best_json: raise SystemExit(f"[B2_phased] Missing b1_supcon_best.json in any of: {candidates}")
+    obj = json.loads(best_json.read_text()); T, W = float(obj["T"]), float(obj["W"])
     print(f"[B2_phased] Using SupCon T={T}, W={W} from {best_json}")
 
     seeds = parse_seeds(args.seeds)
     seed_best = {}
     for s in seeds:
-        rec = ensure_full_run_seed(T, W, s, args.epochs, args.save_every, log_root, args.test, args.tag)
-        if rec:
-            seed_best[s] = rec
+        # base tag (without timestamp)
+        auto_base = f"b2_phased_T{_fmt(T)}_W{_fmt(W)}_seed{s}"
+        tag_base  = args.tag if args.tag else auto_base
+        rec = ensure_full_run_seed(T, W, s, args.epochs, args.save_every, log_root, args.test, tag_base, stamp)
+        if rec: seed_best[s] = rec
 
     if seed_best:
         summary = {
-            "T": T, "W": W, "epochs": args.epochs, "save_every": args.save_every,
+            "timestamp": stamp, "T": T, "W": W,
+            "epochs": args.epochs, "save_every": args.save_every,
             "config": B2_CONFIG, "data_root": DATA_ROOT,
             "seeds": {str(k): v for k, v in seed_best.items()},
             "mean": {k: safe_mean([r[k] for r in seed_best.values()]) for k in ["mAP","Rank-1","Rank-5","Rank-10"]},
