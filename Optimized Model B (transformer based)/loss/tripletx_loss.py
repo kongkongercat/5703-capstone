@@ -47,7 +47,7 @@ def _topk_mean(dist_mat: torch.Tensor, mask: torch.Tensor, k: int = 5, largest: 
     fill_val = float("-inf") if largest else float("inf")
     work = dist_mat.masked_fill(~mask, fill_val)
 
-    # Fallback: rows with no valid entries -> whole row minus diagonal
+    # [FIX 2025-10-09] Fallback: rows with no valid entries -> whole row minus diagonal
     row_has_any = mask.any(dim=1)
     if (~row_has_any).any():
         rows = ~row_has_any
