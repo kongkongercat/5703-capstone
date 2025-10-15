@@ -18,6 +18,9 @@ from yacs.config import CfgNode as CN
 # [2025-10-14 | Hang Zhang] Add DATALOADER.PHASED guard with K_WHEN_TRIPLETX/K_OTHER (default OFF).
 # [2025-10-15 | Hang Zhang] Add editable phased-loss keys so YACS can merge from CLI safely:
 #                           LOSS.PHASED.{BOUNDARIES, METRIC_SEQ, W_METRIC_SEQ, W_SUP_SPEC}.
+# [2025-10-15 | Hang Zhang] **NEW:** Add FEAT_SRC routing keys for each loss:
+#                           LOSS.CE.FEAT_SRC, LOSS.TRIPLET.FEAT_SRC, LOSS.TRIPLETX.FEAT_SRC, LOSS.SUPCON.FEAT_SRC.
+#                           Defaults: CE/Triplet/TripletX='bnneck', SupCon='pre_bn'.
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
@@ -34,7 +37,7 @@ _C.MODEL.DEVICE = "cuda"
 _C.MODEL.DEVICE_ID = '0'
 
 # Backbone
-_C.MODEL.NAME = 'transformer'                           # ← ViT-TransReID as default
+_C.MODEL.NAME = 'transformer'                           # ViT-TransReID as default
 _C.MODEL.TRANSFORMER_TYPE = 'vit_base_patch16_224_TransReID'
 _C.MODEL.LAST_STRIDE = 1
 _C.MODEL.STRIDE_SIZE = [12, 12]                         # official stride
@@ -43,7 +46,7 @@ _C.MODEL.DROP_OUT = 0.0
 _C.MODEL.ATT_DROP_RATE = 0.0
 
 # Pretrain
-_C.MODEL.PRETRAIN_PATH = ''                             # leave empty; set in YAML/--opts
+_C.MODEL.PRETRAIN_PATH = ''                             # set in YAML/--opts if needed
 _C.MODEL.PRETRAIN_CHOICE = 'imagenet'                   # imagenet | self | finetune
 
 # Neck / losses (supervised baseline)
@@ -79,20 +82,17 @@ _C.MODEL.TRAINING_MODE = "supervised"                   # "supervised" | "self_s
 # -----------------------------------------------------------------------------
 _C.LOSS = CN()
 
-# SupCon (supervised contrastive) — default OFF; enable in B1/B2 YAML or via --opts
-_C.LOSS.SUPCON = CN()
-_C.LOSS.SUPCON.ENABLE = False
-_C.LOSS.SUPCON.W = 0.30
-_C.LOSS.SUPCON.T = 0.07
-_C.LOSS.SUPCON.CAM_AWARE = False
-_C.LOSS.SUPCON.POS_RULE = "class"
+# ====== Cross-Entropy (ID) ======
+_C.LOSS.CE = CN()
+# Which feature branch to use for CE: ['bnneck', 'pre_bn', 'backbone']
+_C.LOSS.CE.FEAT_SRC = 'bnneck'
 
-# Grid for B1 auto search
-_C.LOSS.SUPCON.SEARCH = CN()
-_C.LOSS.SUPCON.SEARCH.W = [0.25, 0.30, 0.35]
-_C.LOSS.SUPCON.SEARCH.T = [0.07]
+# ====== Triplet (baseline) ======
+_C.LOSS.TRIPLET = CN()
+# Which feature branch to use for Triplet: ['bnneck', 'pre_bn', 'backbone']
+_C.LOSS.TRIPLET.FEAT_SRC = 'bnneck'
 
-# TripletX (for B2) — stub defaults; enable explicitly when needed
+# ====== TripletX (enhanced triplet) ======
 _C.LOSS.TRIPLETX = CN()
 _C.LOSS.TRIPLETX.ENABLE = False
 _C.LOSS.TRIPLETX.W = 1.0
@@ -104,6 +104,24 @@ _C.LOSS.TRIPLETX.ALPHA = 2.0
 _C.LOSS.TRIPLETX.CROSS_CAM_POS = True
 _C.LOSS.TRIPLETX.SAME_CAM_NEG_BOOST = 1.2
 _C.LOSS.TRIPLETX.NORM_FEAT = True
+# Which feature branch to use for TripletX: ['bnneck', 'pre_bn', 'backbone']
+_C.LOSS.TRIPLETX.FEAT_SRC = 'bnneck'
+
+# ====== SupCon (supervised contrastive) ======
+_C.LOSS.SUPCON = CN()
+_C.LOSS.SUPCON.ENABLE = False
+_C.LOSS.SUPCON.W = 0.30
+_C.LOSS.SUPCON.T = 0.07
+_C.LOSS.SUPCON.CAM_AWARE = False
+_C.LOSS.SUPCON.POS_RULE = "class"
+# Which feature branch to use for SupCon: ['bnneck', 'pre_bn', 'backbone']
+# NOTE: default to 'pre_bn' so SupCon uses backbone/pre-BN features.
+_C.LOSS.SUPCON.FEAT_SRC = 'pre_bn'
+
+# Grid for B1 auto search
+_C.LOSS.SUPCON.SEARCH = CN()
+_C.LOSS.SUPCON.SEARCH.W = [0.25, 0.30, 0.35]
+_C.LOSS.SUPCON.SEARCH.T = [0.07]
 
 # ---- Phased loss global guard (OFF by default) --------------------------------
 # Only when LOSS.PHASED.ENABLE=True (e.g., in deit_transreid_stride_b2_phased_loss.yml),
@@ -114,10 +132,10 @@ _C.LOSS.PHASED.ENABLE = False
 # Editable phased-loss keys (so CLI/YAML can override safely)
 # Semantics: half-open segments using boundaries B = [b0, b1, ...]
 #   [0, b0), [b0, b1), [b1, +∞)
-_C.LOSS.PHASED.BOUNDARIES   = [30, 60]                      # default A/B/C 切点
+_C.LOSS.PHASED.BOUNDARIES   = [30, 60]                      # default A/B/C boundaries
 _C.LOSS.PHASED.METRIC_SEQ   = ['tripletx', 'triplet', 'triplet']
 _C.LOSS.PHASED.W_METRIC_SEQ = [1.2, 1.0, 1.0]
-# SupCon权重规格：'const:x' 或 'linear:x->y'（在所在区间内线性插值）
+# SupCon weight spec per phase: 'const:x' or 'linear:x->y' (linear interpolation within phase)
 _C.LOSS.PHASED.W_SUP_SPEC   = ['const:0.30', 'linear:0.30->0.15', 'const:0.0']
 
 # -----------------------------------------------------------------------------
