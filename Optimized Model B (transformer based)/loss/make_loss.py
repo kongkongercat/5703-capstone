@@ -45,6 +45,16 @@
 #                             BOUNDARIES, METRIC_SEQ, W_METRIC_SEQ, W_SUP_SPEC
 #                           - Supports 'const:x' and 'linear:x->y' for SupCon weight
 #                           - Falls back to original A/B/C if not provided
+# [2025-10-15 | Team 5703]  **NEW: CLI-switchable feature source (layer) for TripletX & SupCon**
+#                           - Read cfg.LOSS.TRIPLETX.FEAT_SRC and cfg.LOSS.SUPCON.FEAT_SRC
+#                             ('pre_bn' | 'bnneck') to pick features dynamically.
+#                           - Backward compatible: if BNNeck feature is not provided, gracefully
+#                             fall back to pre_bn with a one-time warning.
+#                           - Extended loss_func signature with optional feat_bn=None to accept
+#                             BNNeck feature without breaking old trainers.
+# [2025-10-15 | Team 5703]  **NEW: Init logging of feature sources**
+#                           - Print once at init: the chosen sources for Triplet/TripletX and SupCon.
+#                           - If both use the same layer, print a caution about potential gradient interaction.
 # ==========================================
 
 import torch
@@ -77,7 +87,10 @@ def _safe_mean(values):
 
 
 def _pick_z(z_supcon, feat):
-    """Select z_supcon if provided; otherwise fall back to backbone features."""
+    """
+    Select z_supcon if provided; otherwise fall back to backbone features.
+    For transformer_local (feats is list), we use feats[0] = global pre-BN.
+    """
     if z_supcon is not None:
         return z_supcon
     return feat[0] if isinstance(feat, list) else feat
@@ -88,17 +101,49 @@ def _reduce_triplet_output(out):
     return out[0] if isinstance(out, (list, tuple)) else out
 
 
+def _unpack_feats_for_sources(feat, feat_bn):
+    """
+    Try to recover (global_pre_bn, bnneck_feat) from various trainer/model conventions.
+    Priority:
+      1) Explicit feat_bn argument if tensor.
+      2) Tuple-like feat=(global, bn) if both tensors.
+      3) For transformer_local: feat is list [global, local1, ...]; bnneck unavailable here unless feat_bn provided.
+      4) Fallback: (feat, None)
+    """
+    g, b = None, None
+    if isinstance(feat_bn, torch.Tensor):
+        b = feat_bn
+    if isinstance(feat, (tuple, list)) and len(feat) >= 2 and isinstance(feat[0], torch.Tensor) and isinstance(feat[1], torch.Tensor):
+        g = feat[0]
+        b = feat[1]
+    elif isinstance(feat, list) and len(feat) >= 1 and isinstance(feat[0], torch.Tensor):
+        g = feat[0]
+    elif isinstance(feat, torch.Tensor):
+        g = feat
+    return g, b
+
+
+def _pick_by_src_with_fallback(src, global_pre_bn, bnneck_feat, once_flag: dict, warn_tag: str):
+    """
+    Return feature according to src ('pre_bn' | 'bnneck').
+    If bnneck is requested but unavailable, fall back to pre_bn with a one-time warning.
+    """
+    src = (src or "pre_bn").lower()
+    if src == "bnneck":
+        if isinstance(bnneck_feat, torch.Tensor):
+            return bnneck_feat
+        if not once_flag.get('warned', False):
+            print(f"[make_loss][warn] {warn_tag}: requested FEAT_SRC='bnneck' but BNNeck feature is not provided "
+                  f"(trainer/model did not pass it). Falling back to pre_bn.")
+            once_flag['warned'] = True
+        return global_pre_bn
+    return global_pre_bn
+
+
 # ------------------------------
 # Phased scheduling helpers
 # ------------------------------
 def _supcon_weight_by_epoch(epoch: int) -> float:
-    """
-    A: 0–30  -> 0.30
-    B: 30–60 -> linear 0.30 → 0.15
-    C: 60–120 -> 0.0
-    NOTE: boundaries follow the original <= style. If you prefer half-open
-    intervals [0,30), [30,60), adjust conditions accordingly.
-    """
     if epoch <= 30:
         return 0.30
     elif epoch <= 60:
@@ -108,11 +153,6 @@ def _supcon_weight_by_epoch(epoch: int) -> float:
 
 
 def _parse_wsup(spec: str, epoch: int, left: int, right: int) -> float:
-    """
-    Parse SupCon weight spec:
-      - 'const:0.30'         -> constant value
-      - 'linear:0.30->0.00'  -> linear interpolation within [left, right)
-    """
     try:
         kind, payload = spec.split(":", 1)
         kind = kind.strip().lower()
@@ -131,19 +171,6 @@ def _parse_wsup(spec: str, epoch: int, left: int, right: int) -> float:
 
 
 def _phased_selector(epoch: int):
-    """
-    Returns: use_tripletx (bool), w_metric (float), w_sup (float)
-
-    New (configurable):
-      Reads cfg.LOSS.PHASED.{BOUNDARIES, METRIC_SEQ, W_METRIC_SEQ, W_SUP_SPEC}
-      if present and ENABLE=True. Otherwise falls back to the original A/B/C schedule.
-
-      - BOUNDARIES: list of ints, e.g. [31, 61] -> segments [0,31), [31,61), [61,∞)
-      - METRIC_SEQ: list of strings in {'tripletx','triplet'} per segment
-      - W_METRIC_SEQ: list of floats (metric weights) per segment
-      - W_SUP_SPEC: list of strings, each either 'const:x' or 'linear:x->y'
-    """
-    # try to read cfg from the call stack (no signature change to keep API stable)
     import inspect
     outer_cfg = None
     for frameinfo in inspect.stack():
@@ -159,11 +186,9 @@ def _phased_selector(epoch: int):
             w_metric   = list(getattr(phased, "W_METRIC_SEQ", [1.2, 1.0, 1.0]))
             w_sup_spec = list(getattr(phased, "W_SUP_SPEC", ["const:0.30", "linear:0.30->0.15", "const:0.0"]))
 
-            # segments: [0,b0), [b0,b1), [b1,∞)
             seg_left  = [0] + list(bounds)
             seg_right = list(bounds) + [10**9]
 
-            # locate segment
             idx = 0
             for i, (L, R) in enumerate(zip(seg_left, seg_right)):
                 if L <= epoch < R:
@@ -176,10 +201,8 @@ def _phased_selector(epoch: int):
             w_s = _parse_wsup(str(w_sup_spec[idx]), epoch, seg_left[idx], seg_right[idx])
             return use_tx, w_m, w_s
     except Exception:
-        # fall back silently to hard-coded plan
         pass
 
-    # Fallback: original A/B/C schedule
     if epoch <= 30:
         return True, 1.2, 0.30
     elif epoch <= 60:
@@ -221,14 +244,33 @@ def make_loss(cfg, num_classes):
         supcon_enabled = True
         print(f"[make_loss] SupCon enabled: W={supcon_w}, T={getattr(cfg.LOSS.SUPCON, 'T', 0.07)}")
 
+    # NEW: read feature source preferences (with safe defaults reflecting current baseline)
+    tri_src = "pre_bn"
+    sup_src = "bnneck"
+    try:
+        if hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "TRIPLETX"):
+            tri_src = str(getattr(cfg.LOSS.TRIPLETX, "FEAT_SRC", "pre_bn")).lower()
+        if hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "SUPCON"):
+            sup_src = str(getattr(cfg.LOSS.SUPCON, "FEAT_SRC", "bnneck")).lower()
+    except Exception:
+        pass
+
+    # --- one-time display of feature-source config ---
+    print("[make_loss][init] Triplet/TripletX feature source:", tri_src)
+    print("[make_loss][init] SupCon feature source:", sup_src)
+    if tri_src == sup_src:
+        print("[make_loss][init] ⚠ Note: Both losses use same feature layer → gradients may interact.")
+
+    _warn_once_tri = {"warned": False}
+    _warn_once_sup = {"warned": False}
+
     # --------------------------------
     # Metric loss: Triplet or TripletX
     # --------------------------------
     triplet = None
-    USE_TRIPLETX_AVAILABLE = False  # availability flag
+    USE_TRIPLETX_AVAILABLE = False
     metric_type = str(getattr(cfg.MODEL, "METRIC_LOSS_TYPE", "")).lower()
 
-    # Only create metric loss if declared and weighted
     if ('triplet' in metric_type) and (tri_w > 0.0):
         USE_TRIPLETX_AVAILABLE = (
             TripletXLoss is not None
@@ -268,20 +310,18 @@ def make_loss(cfg, num_classes):
     # Define loss function per sampler type
     # -----------------------------
     if sampler == 'softmax':
-        # B0/B1/B4: ID (+ optional SupCon). We keep a light static log once.
         _static_log_printed = {"done": False}
 
-        def loss_func(score, feat, target, camids=None, z_supcon=None, epoch=None):
+        def loss_func(score, feat, target, camids=None, z_supcon=None, epoch=None, feat_bn=None):
             total = 0.0
 
-            # (Optional) one-time static combo logging
             if not _static_log_printed["done"]:
-                combo_name = "NoMetric"  # softmax sampler has no metric part
+                combo_name = "NoMetric"
                 print(f"[make_loss][phase] sampler=softmax | static combo={combo_name} "
                       f"| id_w={id_w:.3f}, sup_w={(supcon_w if supcon_enabled else 0.0):.3f}")
                 _static_log_printed["done"] = True
 
-            # ---- ID loss ----
+            # ID loss
             if id_w > 0:
                 if xent is not None and getattr(cfg.MODEL, "IF_LABELSMOOTH", "off") == 'on':
                     ce = xent(score, target)
@@ -289,22 +329,23 @@ def make_loss(cfg, num_classes):
                     ce = F.cross_entropy(score, target)
                 total += id_w * ce
 
-            # ---- SupCon ----
+            # SupCon (with dynamic source & fallback)
             if supcon_enabled and supcon_w > 0:
-                z = _pick_z(z_supcon, feat)
+                global_pre_bn, bnneck = _unpack_feats_for_sources(feat, feat_bn)
+                sup_input = _pick_by_src_with_fallback(sup_src, global_pre_bn, bnneck,
+                                                       _warn_once_sup, "SupCon")
+                z = z_supcon if z_supcon is not None else F.normalize(sup_input, dim=1)
                 total += supcon_w * supcon_criterion(z, target, camids)
 
             return total
 
     elif sampler == 'softmax_triplet':
-        # B0（CE+Triplet）、B1（CE+Triplet+SupCon）、B2/B4（CE+TripletX+SupCon）
-        # Keep a small mutable state to print schedule changes only when they occur.
         _phase_log_state = {"last": None}
 
-        def loss_func(score, feat, target, camids=None, z_supcon=None, epoch=None):
+        def loss_func(score, feat, target, camids=None, z_supcon=None, epoch=None, feat_bn=None):
             total = 0.0
 
-            # ---- ID loss ----
+            # ID loss
             if id_w > 0:
                 if isinstance(score, list):
                     if xent is not None and getattr(cfg.MODEL, "IF_LABELSMOOTH", "off") == 'on':
@@ -321,7 +362,7 @@ def make_loss(cfg, num_classes):
                         ID_LOSS = F.cross_entropy(score, target)
                 total += id_w * ID_LOSS
 
-            # ---- weights: phased vs static ----
+            # phased vs static weights
             phased_on = (
                 (epoch is not None)
                 and hasattr(cfg, "LOSS")
@@ -331,12 +372,13 @@ def make_loss(cfg, num_classes):
             if phased_on:
                 use_tx_phase, w_metric, w_sup = _phased_selector(int(epoch))
             else:
-                use_tx_phase = USE_TRIPLETX_AVAILABLE
+                use_tx_phase = (TripletXLoss is not None
+                                and hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "TRIPLETX")
+                                and bool(getattr(cfg.LOSS.TRIPLETX, "ENABLE", False)))
                 w_metric = tri_w
                 w_sup = supcon_w if supcon_enabled else 0.0
 
-            # ---- schedule change logging (print-on-change) ----
-            combo_name = "TripletX" if (use_tx_phase and USE_TRIPLETX_AVAILABLE) else \
+            combo_name = "TripletX" if (use_tx_phase and TripletXLoss is not None) else \
                          ("Triplet" if (triplet is not None) else "NoMetric")
             current_sig = (combo_name, float(w_metric), float(w_sup))
             if _phase_log_state["last"] != current_sig:
@@ -348,15 +390,20 @@ def make_loss(cfg, num_classes):
                           f"| id_w={id_w:.3f}, tri_w={float(w_metric):.3f}, sup_w={float(w_sup):.3f}")
                 _phase_log_state["last"] = current_sig
 
-            # ---- Triplet / TripletX ----
-            if triplet is not None and w_metric > 0:
+            # prepare features for dynamic source picking
+            global_pre_bn, bnneck = _unpack_feats_for_sources(feat, feat_bn)
+
+            # Triplet / TripletX
+            if triplet is not None and w_metric > 0 and global_pre_bn is not None:
+                tri_in = _pick_by_src_with_fallback(tri_src, global_pre_bn, bnneck,
+                                                    _warn_once_tri, "Triplet/TripletX")
+                tri_in = F.normalize(tri_in, dim=1)
+
                 def _call_triplet(f):
-                    # TripletX: pass (camids, epoch); plain Triplet: do not pass
-                    if use_tx_phase and USE_TRIPLETX_AVAILABLE:
+                    if use_tx_phase and TripletXLoss is not None:
                         try:
                             return _reduce_triplet_output(triplet(f, target, camids=camids, epoch=epoch))
                         except TypeError:
-                            # Backward compatibility (no epoch)
                             return _reduce_triplet_output(triplet(f, target, camids=camids))
                     else:
                         try:
@@ -364,28 +411,39 @@ def make_loss(cfg, num_classes):
                         except TypeError:
                             return _reduce_triplet_output(triplet(f, target))
 
-                if isinstance(feat, list):
-                    tri_vals = [_call_triplet(f) for f in feat[1:]]
-                    tri0 = _call_triplet(feat[0])
-                    TRI_LOSS = 0.5 * (_safe_mean(tri_vals) + tri0)
+                if isinstance(feat, list) and len(feat) > 1 and isinstance(feat[1], torch.Tensor):
+                    TRI_LOSS = _call_triplet(tri_in)  # keep global-only by default
                 else:
-                    TRI_LOSS = _call_triplet(feat)
+                    TRI_LOSS = _call_triplet(tri_in)
 
                 total += float(w_metric) * TRI_LOSS
 
-            # ---- SupCon ----
+            # SupCon
             if supcon_enabled and w_sup > 0:
-                z = _pick_z(z_supcon, feat)
+                if z_supcon is not None:
+                    z = z_supcon
+                else:
+                    sup_input = _pick_by_src_with_fallback(sup_src, global_pre_bn, bnneck,
+                                                           _warn_once_sup, "SupCon")
+                    z = F.normalize(sup_input, dim=1)
                 total += float(w_sup) * supcon_criterion(z, target, camids)
 
             return total
 
     elif sampler == 'random':
-        # B3: self-supervised pretraining with SupCon only
-        def loss_func(score, feat, target, camids=None, z_supcon=None, epoch=None):
+        # SSL/SupCon-only mode
+        def loss_func(score, feat, target, camids=None, z_supcon=None, epoch=None, feat_bn=None):
             if not (supcon_enabled and supcon_w > 0):
                 raise RuntimeError("sampler='random' requires LOSS.SUPCON.ENABLE=True and W>0.")
-            z = _pick_z(z_supcon, feat)
+
+            global_pre_bn, bnneck = _unpack_feats_for_sources(feat, feat_bn)
+
+            if z_supcon is not None:
+                z = z_supcon
+            else:
+                sup_input = _pick_by_src_with_fallback(sup_src, global_pre_bn, bnneck,
+                                                       _warn_once_sup, "SupCon")
+                z = F.normalize(sup_input, dim=1)
             return supcon_w * supcon_criterion(z, target, camids)
 
     else:
