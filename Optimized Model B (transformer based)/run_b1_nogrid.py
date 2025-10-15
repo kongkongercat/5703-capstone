@@ -15,6 +15,9 @@
 #                           - Added CLI --T/--W (override YAML)
 #                           - Kept resume/re-test, timestamped TAG,
 #                             and seed summary logic
+# [2025-10-15 | Hang Zhang] Tag format update:
+#                           - Use TAG base "b1_supcon" (no "_fixed" nor "_T/_W")
+#                           - Final dirs: {DS_PREFIX}_b1_supcon_seed{S}_{YYYYMMDD_HHMM}_{...}
 # ===========================================================
 
 import argparse
@@ -73,6 +76,7 @@ LOG_ROOT.mkdir(parents=True, exist_ok=True)
 SUMMARY_JSON = LOG_ROOT / "b1_supcon_nogrid_summary.json"
 
 def _fmt(v: float) -> str:
+    """Turn 0.07 -> 0p07 for safe filename segments."""
     return str(v).replace(".", "p")
 
 def detect_data_root() -> str:
@@ -316,8 +320,10 @@ def _max_epoch_from_checkpoints(run_dir: Path) -> int:
 def _now_stamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M")  # minute precision
 
+# ====== Tag builders (updated: no "_fixed" nor T/W in tag) ======
 def _base_tag_fixed(t: float, w: float) -> str:
-    return f"b1_supcon_fixed_T{_fmt(t)}_W{_fmt(w)}"
+    """Return base tag for this B1 run (no T/W in tag per requirement)."""
+    return "b1_supcon"
 
 def _tag_with_seed(base: str, seed: int) -> str:
     return f"{base}_seed{seed}"
