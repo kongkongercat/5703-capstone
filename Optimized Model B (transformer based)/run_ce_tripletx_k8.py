@@ -14,6 +14,7 @@
 #                           - Section layout (Defaults/Env&Paths/CLI/Helpers/Launcher/Main)
 #                           - Consistent prints and tag naming with DS prefix
 #                           - Explicit OUTPUT_ROOT/DATA_ROOT handling
+# [2025-10-18 | Hang Zhang] Default PK updated to 8 (DATALOADER.NUM_INSTANCE=8).
 # ===========================================================
 
 import argparse
@@ -33,7 +34,7 @@ DEFAULT_EPOCHS      = 120
 DEFAULT_SAVE_EVERY  = 3         # also used as eval period by default
 DEFAULT_SEEDS       = "0"
 DEFAULT_DSPREFIX    = "veri776"
-DEFAULT_PK          = 4         # DATALOADER.NUM_INSTANCE (PK sampler K)
+DEFAULT_PK          = 8         # <-- CHANGED: default K for PK sampler
 
 # ================= Env / paths =================
 def _in_colab() -> bool:
@@ -97,7 +98,7 @@ def build_cli() -> argparse.Namespace:
     # evaluation-only utilities (style aligned with previous script family)
     p.add_argument("--test-only", action="store_true", help="Only run evaluation for an existing TAG.")
     p.add_argument("--from-run", type=str, default=None, help="Path to existing *_deit_run/_deit_test, or a TAG.")
-    p.add_argument("--tag", type=str, default=None, help="Direct TAG (e.g., ce_tripletx_k4_20251010_1507_seed0).")
+    p.add_argument("--tag", type=str, default=None, help="Direct TAG (e.g., ce_tripletx_k8_20251010_1507_seed0).")
     p.add_argument("--cfg", type=str, default=None, help="Alias of --config for compatibility.")
     return p.parse_args()
 
@@ -116,7 +117,7 @@ def _infer_tag_from_input(s: str) -> str:
     """
     Accept:
       - full path to <ds>_<TAG>_deit_run or _deit_test
-      - pure TAG ('ce_tripletx_k4_20251010_1507_seed0')
+      - pure TAG ('ce_tripletx_k8_20251010_1507_seed0')
     Return the <TAG> part only.
     """
     p = Path(s)
@@ -351,7 +352,7 @@ def main():
         if best:
             best_records[seed] = best
             (LOG_ROOT / f"{(tag if not fixed_tag else fixed_tag)}_best.json").write_text(json.dumps(best, indent=2))
-            print(f"[TripletX] Seed {seed} best: {best}")
+            print(f."[TripletX] Seed {seed} best: {best}")
 
     # summary across seeds
     if best_records:
