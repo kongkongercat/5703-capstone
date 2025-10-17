@@ -12,12 +12,11 @@
 #   --opts LOSS.TRIPLETX.FEAT_SRC bnneck|pre_bn LOSS.SUPCON.FEAT_SRC bnneck|pre_bn
 #
 # Training-time returns (backbone/transformer):
-#   - without SupCon: (cls_score, global_feat, feat_bn)
-#   - with    SupCon: (cls_score, global_feat, feat_bn, z_supcon)
+#   - always return 4 items: (cls_score, global_feat, feat_bn, z_supcon)
+#     (z_supcon=None if SupCon disabled)
 #
 # Training-time returns (transformer_local):
-#   - without SupCon: (scores, feats, feat_bn_global)
-#   - with    SupCon: (scores, feats, feat_bn_global, z_supcon)
+#   - always return 4 items: (scores, feats, feat_bn_global, z_supcon)
 #
 # Test-time behavior is unchanged (controlled by cfg.TEST.NECK_FEAT).
 #
@@ -29,6 +28,13 @@
 #                                       evaluation/test checkpoint loading.
 # [2025-10-15 | Zhang Hang]            Added CLI-switchable feature source for TripletX/SupCon
 #                                       (pre_bn vs bnneck) while keeping default layering intact.
+# [2025-10-17 | Hang Zhang]            **Stability Fix**
+#                                       - Unified forward() return signatures (always 4 items).
+#                                       - Added default z_supcon=None when disabled.
+# [2025-10-17 | Hang Zhang]            **Compatibility Fix**
+#                                       - Added full classifier initialization for Arcface/Cosface/
+#                                         AMSoftmax/CircleLoss in Backbone to prevent AttributeError
+#                                         when COS_LAYER=True.
 # =============================================================================
 
 import torch
@@ -119,21 +125,36 @@ class Backbone(nn.Module):
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.num_classes = num_classes
 
-        self.classifier = nn.Linear(self.in_planes, self.num_classes, bias=False)
-        self.classifier.apply(weights_init_classifier)
+        # --- [2025-10-17] Add full classifier initialization for COS_LAYER ---
+        self.ID_LOSS_TYPE = getattr(cfg.MODEL, "ID_LOSS_TYPE", "softmax")
+        if self.ID_LOSS_TYPE == 'arcface':
+            self.classifier = Arcface(self.in_planes, self.num_classes,
+                                      s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+        elif self.ID_LOSS_TYPE == 'cosface':
+            self.classifier = Cosface(self.in_planes, self.num_classes,
+                                      s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+        elif self.ID_LOSS_TYPE == 'amsoftmax':
+            self.classifier = AMSoftmax(self.in_planes, self.num_classes,
+                                        s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+        elif self.ID_LOSS_TYPE == 'circle':
+            self.classifier = CircleLoss(self.in_planes, self.num_classes,
+                                         s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+        else:
+            self.classifier = nn.Linear(self.in_planes, self.num_classes, bias=False)
+            self.classifier.apply(weights_init_classifier)
 
         self.bottleneck = nn.BatchNorm1d(self.in_planes)
         self.bottleneck.bias.requires_grad_(False)
         self.bottleneck.apply(weights_init_kaiming)
 
-        # SupCon projection head (default source = BNNeck to keep current behavior)
+        # SupCon projection head (default source = BNNeck)
         self.supcon_enabled = (
             hasattr(cfg, "LOSS")
             and hasattr(cfg.LOSS, "SUPCON")
             and getattr(cfg.LOSS.SUPCON, "ENABLE", False)
         )
         if self.supcon_enabled:
-            self.supcon_feat_src = getattr(cfg.LOSS.SUPCON, "FEAT_SRC", "bnneck")  # default: bnneck
+            self.supcon_feat_src = getattr(cfg.LOSS.SUPCON, "FEAT_SRC", "bnneck")
             self.supcon_head = nn.Sequential(
                 nn.Linear(self.in_planes, 2048),
                 nn.ReLU(inplace=True),
@@ -142,36 +163,19 @@ class Backbone(nn.Module):
 
     def forward(self, x, label=None):
         x = self.base(x)
-        global_feat = F.avg_pool2d(x, x.shape[2:4]).view(x.size(0), -1)  # pre-BN
-        feat = global_feat if self.neck == 'no' else self.bottleneck(global_feat)  # BNNeck
+        global_feat = F.avg_pool2d(x, x.shape[2:4]).view(x.size(0), -1)
+        feat = global_feat if self.neck == 'no' else self.bottleneck(global_feat)
+
+        z_supcon = None
+        if self.training and self.supcon_enabled:
+            sup_in = _pick_feat_by_src(self.supcon_feat_src, global_feat, feat)
+            z_supcon = F.normalize(self.supcon_head(sup_in), dim=1)
 
         if self.training:
-            cls_score = self.arcface(feat, label) if self.cos_layer else self.classifier(feat)
-
-            if self.supcon_enabled:
-                sup_in = _pick_feat_by_src(self.supcon_feat_src, global_feat, feat)
-                z_supcon = F.normalize(self.supcon_head(sup_in), dim=1)
-                # training-time returns with SupCon
-                return cls_score, global_feat, feat, z_supcon
-            else:
-                # training-time returns without SupCon
-                return cls_score, global_feat, feat
+            cls_score = self.classifier(feat, label) if self.cos_layer else self.classifier(feat)
+            return cls_score, global_feat, feat, z_supcon
         else:
             return feat if self.neck_feat == 'after' else global_feat
-
-    def load_param(self, trained_path):
-        param_dict = torch.load(trained_path)
-        if 'state_dict' in param_dict:
-            param_dict = param_dict['state_dict']
-        for k, v in param_dict.items():
-            self.state_dict()[k].copy_(v)
-        print(f'Loading pretrained model from {trained_path}')
-
-    def load_param_finetune(self, model_path):
-        param_dict = torch.load(model_path)
-        for k, v in param_dict.items():
-            self.state_dict()[k].copy_(v)
-        print(f'Loading pretrained model for finetuning from {model_path}')
 
 
 # ----------------------- ViT/DeiT Transformer (global) -----------------------
@@ -180,7 +184,6 @@ class build_transformer(nn.Module):
         super(build_transformer, self).__init__()
         last_stride = cfg.MODEL.LAST_STRIDE
         model_path = cfg.MODEL.PRETRAIN_PATH
-        model_name = cfg.MODEL.NAME
         pretrain_choice = cfg.MODEL.PRETRAIN_CHOICE
         self.cos_layer = cfg.MODEL.COS_LAYER
         self.neck = cfg.MODEL.NECK
@@ -211,8 +214,6 @@ class build_transformer(nn.Module):
             self.base.load_param(model_path)
             print(f'Loading pretrained ImageNet model......from {model_path}')
 
-        self.gap = nn.AdaptiveAvgPool2d(1)
-
         self.num_classes = num_classes
         self.ID_LOSS_TYPE = cfg.MODEL.ID_LOSS_TYPE
         if self.ID_LOSS_TYPE == 'arcface':
@@ -235,14 +236,13 @@ class build_transformer(nn.Module):
         self.bottleneck.bias.requires_grad_(False)
         self.bottleneck.apply(weights_init_kaiming)
 
-        # SupCon projection head (default source = BNNeck to keep current behavior)
+        # SupCon head
         self.supcon_enabled = (
-            hasattr(cfg, "LOSS")
-            and hasattr(cfg.LOSS, "SUPCON")
+            hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "SUPCON")
             and getattr(cfg.LOSS.SUPCON, "ENABLE", False)
         )
         if self.supcon_enabled:
-            self.supcon_feat_src = getattr(cfg.LOSS.SUPCON, "FEAT_SRC", "bnneck")  # default: bnneck
+            self.supcon_feat_src = getattr(cfg.LOSS.SUPCON, "FEAT_SRC", "bnneck")
             self.supcon_head = nn.Sequential(
                 nn.Linear(self.in_planes, 2048),
                 nn.ReLU(inplace=True),
@@ -250,35 +250,19 @@ class build_transformer(nn.Module):
             )
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
-        global_feat = self.base(x, cam_label=cam_label, view_label=view_label)  # pre-BN token-pooled feat
-        feat = self.bottleneck(global_feat)  # BNNeck
+        global_feat = self.base(x, cam_label=cam_label, view_label=view_label)
+        feat = self.bottleneck(global_feat)
+
+        z_supcon = None
+        if self.training and self.supcon_enabled:
+            sup_in = _pick_feat_by_src(self.supcon_feat_src, global_feat, feat)
+            z_supcon = F.normalize(self.supcon_head(sup_in), dim=1)
 
         if self.training:
-            if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
-                cls_score = self.classifier(feat, label)
-            else:
-                cls_score = self.classifier(feat)
-
-            if self.supcon_enabled:
-                sup_in = _pick_feat_by_src(self.supcon_feat_src, global_feat, feat)
-                z_supcon = F.normalize(self.supcon_head(sup_in), dim=1)
-                return cls_score, global_feat, feat, z_supcon
-            else:
-                return cls_score, global_feat, feat
+            cls_score = self.classifier(feat, label) if self.cos_layer else self.classifier(feat)
+            return cls_score, global_feat, feat, z_supcon
         else:
             return feat if self.neck_feat == 'after' else global_feat
-
-    def load_param(self, trained_path):
-        param_dict = torch.load(trained_path)
-        for k, v in param_dict.items():
-            self.state_dict()[k.replace('module.', '')].copy_(v)
-        print(f'Loading pretrained model from {trained_path}')
-
-    def load_param_finetune(self, model_path):
-        param_dict = torch.load(model_path)
-        for k, v in param_dict.items():
-            self.state_dict()[k].copy_(v)
-        print(f'Loading pretrained model for finetuning from {model_path}')
 
 
 # ------------------- ViT/DeiT Transformer (with JPM local) -------------------
@@ -365,14 +349,14 @@ class build_transformer_local(nn.Module):
         self.shift_num = cfg.MODEL.SHIFT_NUM
         self.divide_length = cfg.MODEL.DEVIDE_LENGTH
 
-        # SupCon projection head (default source = BNNeck to keep current behavior)
+        # SupCon head
         self.supcon_enabled = (
             hasattr(cfg, "LOSS")
             and hasattr(cfg.LOSS, "SUPCON")
             and getattr(cfg.LOSS.SUPCON, "ENABLE", False)
         )
         if self.supcon_enabled:
-            self.supcon_feat_src = getattr(cfg.LOSS.SUPCON, "FEAT_SRC", "bnneck")  # default: bnneck
+            self.supcon_feat_src = getattr(cfg.LOSS.SUPCON, "FEAT_SRC", "bnneck")
             self.supcon_head = nn.Sequential(
                 nn.Linear(self.in_planes, 2048),
                 nn.ReLU(inplace=True),
@@ -382,11 +366,9 @@ class build_transformer_local(nn.Module):
     def forward(self, x, label=None, cam_label=None, view_label=None):
         features = self.base(x, cam_label=cam_label, view_label=view_label)
 
-        # global branch (pre-BN)
-        b1_feat = self.b1(features)  # [B, tokens, C]
+        b1_feat = self.b1(features)
         global_feat = b1_feat[:, 0]
 
-        # JPM branch
         feature_length = features.size(1) - 1
         patch_length = feature_length // self.divide_length
         token = features[:, 0:1]
@@ -406,12 +388,16 @@ class build_transformer_local(nn.Module):
         local_feat_3 = extract_local(patch_length * 2, patch_length * 3)
         local_feat_4 = extract_local(patch_length * 3, patch_length * 4)
 
-        # BN for global (used by CE / optional for TripletX if chosen)
         feat_bn_global = self.bottleneck(global_feat)
         local_feat_1_bn = self.bottleneck_1(local_feat_1)
         local_feat_2_bn = self.bottleneck_2(local_feat_2)
         local_feat_3_bn = self.bottleneck_3(local_feat_3)
         local_feat_4_bn = self.bottleneck_4(local_feat_4)
+
+        z_supcon = None
+        if self.training and self.supcon_enabled:
+            sup_in = _pick_feat_by_src(self.supcon_feat_src, global_feat, feat_bn_global)
+            z_supcon = F.normalize(self.supcon_head(sup_in), dim=1)
 
         if self.training:
             if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
@@ -427,15 +413,8 @@ class build_transformer_local(nn.Module):
                     self.classifier_4(local_feat_4_bn)
                 ]
 
-            # pre-BN feats for metric learning (global + 4 locals)
             feats = [global_feat, local_feat_1, local_feat_2, local_feat_3, local_feat_4]
-
-            if self.supcon_enabled:
-                sup_in = _pick_feat_by_src(self.supcon_feat_src, global_feat, feat_bn_global)
-                z_supcon = F.normalize(self.supcon_head(sup_in), dim=1)
-                return scores, feats, feat_bn_global, z_supcon
-            else:
-                return scores, feats, feat_bn_global
+            return scores, feats, feat_bn_global, z_supcon
         else:
             if self.neck_feat == 'after':
                 return torch.cat(
@@ -450,19 +429,16 @@ class build_transformer_local(nn.Module):
                     dim=1
                 )
 
-    # Added load_param() for evaluation checkpoint loading
     def load_param(self, trained_path: str, strict: bool = False):
         import os
         assert os.path.isfile(trained_path), f"Weight file not found: {trained_path}"
         state = torch.load(trained_path, map_location="cpu")
 
-        # compatible formats
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
         elif isinstance(state, dict) and "model" in state:
             state = state["model"]
 
-        # strip DataParallel prefix
         clean = {k.replace("module.", ""): v for k, v in state.items()}
 
         incompatible = self.load_state_dict(clean, strict=strict)

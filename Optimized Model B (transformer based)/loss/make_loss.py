@@ -55,6 +55,15 @@
 # [2025-10-15 | Team 5703]  **NEW: Init logging of feature sources**
 #                           - Print once at init: the chosen sources for Triplet/TripletX and SupCon.
 #                           - If both use the same layer, print a caution about potential gradient interaction.
+# [2025-10-17 | Team 5703]  **Single-source policy for SupCon (log & behavior)**
+#                           - If model returns z_supcon, always use it and IGNORE LOSS.SUPCON.FEAT_SRC.
+#                           - Added one-time info log:
+#                             "[make_loss][info] [SupCon] using z_supcon from model; LOSS.SUPCON.FEAT_SRC ignored."
+#                           - Applied to 'softmax', 'softmax_triplet' and 'random' branches.
+# [2025-10-17 | Team 5703]  **Stability & clarity**
+#                           - _phased_selector now takes (cfg, epoch) explicitly (removed inspect.stack()).
+#                           - Added one-time note: "SupConLoss instantiated here (entry should not rebuild)".
+#                           - Added one-time note: "CE.FEAT_SRC='<v>' ignored (CE uses classifier score)".
 # ==========================================
 
 import torch
@@ -170,16 +179,10 @@ def _parse_wsup(spec: str, epoch: int, left: int, right: int) -> float:
     return 0.0
 
 
-def _phased_selector(epoch: int):
-    import inspect
-    outer_cfg = None
-    for frameinfo in inspect.stack():
-        if 'cfg' in frameinfo.frame.f_locals:
-            outer_cfg = frameinfo.frame.f_locals['cfg']
-            break
-
+def _phased_selector(cfg, epoch: int):
+    """Explicit cfg-based selector (no inspect)."""
     try:
-        phased = outer_cfg.LOSS.PHASED if (outer_cfg is not None and hasattr(outer_cfg, "LOSS")) else None
+        phased = cfg.LOSS.PHASED if (cfg is not None and hasattr(cfg, "LOSS")) else None
         if phased is not None and bool(getattr(phased, "ENABLE", False)):
             bounds     = list(getattr(phased, "BOUNDARIES", [30, 60]))
             metrics    = list(getattr(phased, "METRIC_SEQ", ["tripletx", "triplet", "triplet"]))
@@ -243,6 +246,7 @@ def make_loss(cfg, num_classes):
         supcon_w = _to_float(getattr(cfg.LOSS.SUPCON, "W", 0.0), 0.0)
         supcon_enabled = True
         print(f"[make_loss] SupCon enabled: W={supcon_w}, T={getattr(cfg.LOSS.SUPCON, 'T', 0.07)}")
+        print("[make_loss][init] SupConLoss instantiated here (entry should not rebuild).")
 
     # NEW: read feature source preferences (with safe defaults reflecting current baseline)
     tri_src = "pre_bn"
@@ -261,8 +265,10 @@ def make_loss(cfg, num_classes):
     if tri_src == sup_src:
         print("[make_loss][init] ⚠ Note: Both losses use same feature layer → gradients may interact.")
 
+    # Track warnings & one-time notes
     _warn_once_tri = {"warned": False}
-    _warn_once_sup = {"warned": False}
+    _warn_once_sup = {"warned": False, "model_src_noted": False}
+    _ce_note_once  = {"done": False}
 
     # --------------------------------
     # Metric loss: Triplet or TripletX
@@ -321,7 +327,15 @@ def make_loss(cfg, num_classes):
                       f"| id_w={id_w:.3f}, sup_w={(supcon_w if supcon_enabled else 0.0):.3f}")
                 _static_log_printed["done"] = True
 
-            # ID loss
+            # ID loss (CE always uses classifier score; FEAT_SRC is ignored)
+            if not _ce_note_once["done"]:
+                try:
+                    ce_src = str(getattr(cfg.LOSS.CE, "FEAT_SRC", "bnneck"))
+                except Exception:
+                    ce_src = "bnneck"
+                print(f"[make_loss][info] CE.FEAT_SRC='{ce_src}' ignored (CE uses classifier score).")
+                _ce_note_once["done"] = True
+
             if id_w > 0:
                 if xent is not None and getattr(cfg.MODEL, "IF_LABELSMOOTH", "off") == 'on':
                     ce = xent(score, target)
@@ -332,9 +346,15 @@ def make_loss(cfg, num_classes):
             # SupCon (with dynamic source & fallback)
             if supcon_enabled and supcon_w > 0:
                 global_pre_bn, bnneck = _unpack_feats_for_sources(feat, feat_bn)
-                sup_input = _pick_by_src_with_fallback(sup_src, global_pre_bn, bnneck,
-                                                       _warn_once_sup, "SupCon")
-                z = z_supcon if z_supcon is not None else F.normalize(sup_input, dim=1)
+                if z_supcon is not None:
+                    if not _warn_once_sup["model_src_noted"]:
+                        print("[make_loss][info] [SupCon] using z_supcon from model; LOSS.SUPCON.FEAT_SRC ignored.")
+                        _warn_once_sup["model_src_noted"] = True
+                    z = z_supcon
+                else:
+                    sup_input = _pick_by_src_with_fallback(sup_src, global_pre_bn, bnneck,
+                                                           _warn_once_sup, "SupCon")
+                    z = F.normalize(sup_input, dim=1)
                 total += supcon_w * supcon_criterion(z, target, camids)
 
             return total
@@ -345,7 +365,15 @@ def make_loss(cfg, num_classes):
         def loss_func(score, feat, target, camids=None, z_supcon=None, epoch=None, feat_bn=None):
             total = 0.0
 
-            # ID loss
+            # ID loss (CE always uses classifier score; FEAT_SRC is ignored)
+            if not _ce_note_once["done"]:
+                try:
+                    ce_src = str(getattr(cfg.LOSS.CE, "FEAT_SRC", "bnneck"))
+                except Exception:
+                    ce_src = "bnneck"
+                print(f"[make_loss][info] CE.FEAT_SRC='{ce_src}' ignored (CE uses classifier score).")
+                _ce_note_once["done"] = True
+
             if id_w > 0:
                 if isinstance(score, list):
                     if xent is not None and getattr(cfg.MODEL, "IF_LABELSMOOTH", "off") == 'on':
@@ -370,7 +398,7 @@ def make_loss(cfg, num_classes):
                 and bool(getattr(cfg.LOSS.PHASED, "ENABLE", False))
             )
             if phased_on:
-                use_tx_phase, w_metric, w_sup = _phased_selector(int(epoch))
+                use_tx_phase, w_metric, w_sup = _phased_selector(cfg, int(epoch))
             else:
                 use_tx_phase = (TripletXLoss is not None
                                 and hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "TRIPLETX")
@@ -421,6 +449,9 @@ def make_loss(cfg, num_classes):
             # SupCon
             if supcon_enabled and w_sup > 0:
                 if z_supcon is not None:
+                    if not _warn_once_sup["model_src_noted"]:
+                        print("[make_loss][info] [SupCon] using z_supcon from model; LOSS.SUPCON.FEAT_SRC ignored.")
+                        _warn_once_sup["model_src_noted"] = True
                     z = z_supcon
                 else:
                     sup_input = _pick_by_src_with_fallback(sup_src, global_pre_bn, bnneck,
@@ -439,6 +470,9 @@ def make_loss(cfg, num_classes):
             global_pre_bn, bnneck = _unpack_feats_for_sources(feat, feat_bn)
 
             if z_supcon is not None:
+                if not _warn_once_sup["model_src_noted"]:
+                    print("[make_loss][info] [SupCon] using z_supcon from model; LOSS.SUPCON.FEAT_SRC ignored.")
+                    _warn_once_sup["model_src_noted"] = True
                 z = z_supcon
             else:
                 sup_input = _pick_by_src_with_fallback(sup_src, global_pre_bn, bnneck,
