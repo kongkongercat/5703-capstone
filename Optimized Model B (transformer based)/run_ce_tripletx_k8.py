@@ -1,46 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ===========================================================
-# File: run_ce_tripletx_k8.py
-# Purpose: TripletX-only runner (CE + TripletX), multi-seed,
-#          with auto-resume, robust re-test, and summary.
+# File: run_ce_tripletx.py
+# Purpose: TripletX-only (CrossEntropy + TripletX) training/eval launcher
+#          with unified naming, multi-seed support, auto-resume, and
+#          robust re-test of missing epochs.
 # Author: Hang Zhang (hzha0521)
 # ===========================================================
 # Change Log
-# [2025-10-10 | Hang Zhang] Initial version: TripletX-only (CE+TripletX) runner,
-#                           120e by default, PK sampler configurable, auto-resume,
-#                           re-test missing epochs, and per-seed best summary.
-# [2025-10-12 | Hang Zhang] NEW CLI & capabilities:
-#   - --test-only: run evaluation only (no training)
-#   - --from-run: accept a path to existing *_deit_run/_deit_test folder or pure TAG
-#   - --tag: directly pass a TAG (e.g., ce_tripletx_k8_20251010_1507_seed0)
-#   - --cfg: override config YAML path (defaults to B2 TripletX yaml)
-#   - Fixed-tag flow: training/testing can resume into the SAME run/test folders
-#                     when --from-run/--tag is provided.
-#   - Refactors: pass cfg_path through, keep English comments, robust path parsing.
+# [2025-10-10 | Hang Zhang] Initial version (TripletX-only runner, 120e default, PK configurable).
+# [2025-10-12 | Hang Zhang] Add --test-only / --from-run / --tag / --cfg flows; fixed-tag resume.
+# [2025-10-18 | Hang Zhang] Unify style with run_ce_triplet/run_b0/run_b1:
+#                           - Section layout (Defaults/Env&Paths/CLI/Helpers/Launcher/Main)
+#                           - Consistent prints and tag naming with DS prefix
+#                           - Explicit OUTPUT_ROOT/DATA_ROOT handling
 # ===========================================================
 
-from __future__ import annotations
-import json, os, re, subprocess, sys, statistics as stats, argparse
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+import argparse
+import json
+import os
+import re
+import statistics as stats
+import subprocess
+import sys
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-# =============== Defaults ===============
-CONFIG            = "configs/VeRi/deit_transreid_stride_b2_supcon_tripletx.yml"
-FULL_EPOCHS       = 120
-CHECKPOINT_PERIOD = 3
-EVAL_PERIOD       = 3
-SEEDS_DEFAULT     = [0]
-PK_DEFAULT        = 4   # DATALOADER.NUM_INSTANCE (PK sampler K)
-# =======================================
+# ================= Defaults =================
+DEFAULT_CONFIG      = "configs/VeRi/deit_transreid_stride_b2_supcon_tripletx.yml"
+DEFAULT_EPOCHS      = 120
+DEFAULT_SAVE_EVERY  = 3         # also used as eval period by default
+DEFAULT_SEEDS       = "0"
+DEFAULT_DSPREFIX    = "veri776"
+DEFAULT_PK          = 4         # DATALOADER.NUM_INSTANCE (PK sampler K)
 
-TEST_MARKER_FILES = (
-    "summary.json", "test_summary.txt", "results.txt",
-    "log.txt", "test_log.txt", "dist_mat.npy",
-)
-
-# --------- Colab / Log root ---------
+# ================= Env / paths =================
 def _in_colab() -> bool:
     try:
         import google.colab  # noqa
@@ -48,45 +43,123 @@ def _in_colab() -> bool:
     except Exception:
         return False
 
-def pick_log_root(cli_output_root: Optional[str]) -> Path:
-    if cli_output_root:
-        root = Path(cli_output_root)
-    else:
-        env = os.getenv("OUTPUT_ROOT")
-        if env:
-            root = Path(env)
-        elif _in_colab():
-            root = Path(os.getenv(
-                "DRIVE_LOG_ROOT",
-                "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/logs",
-            ))
-        else:
-            root = Path("logs")
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+def pick_log_root() -> Path:
+    env = os.getenv("OUTPUT_ROOT")
+    if env:
+        return Path(env)
+    if _in_colab():
+        try:
+            from google.colab import drive
+            if not Path("/content/drive/MyDrive").exists():
+                drive.mount("/content/drive", force_remount=False)
+        except Exception:
+            pass
+        dflt = "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/logs"
+        return Path(os.getenv("DRIVE_LOG_ROOT", dflt))
+    return Path("logs")
 
-# --------- Dataset root detection ---------
 def detect_data_root() -> str:
-    env = os.getenv("DATASETS.ROOT_DIR") or os.getenv("DATASETS_ROOT")
+    env = os.getenv("DATASETS_ROOT") or os.getenv("DATASETS.ROOT_DIR")
     if env and (Path(env) / "VeRi").exists():
         return env
-    for c in [
+    candidates = [
         "/content/5703-capstone/Optimized Model B (transformer based)/datasets",
         "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/datasets",
         "/content/drive/MyDrive/datasets",
         "/content/datasets",
         "/workspace/datasets",
         str(Path.cwd() / "datasets"),
-    ]:
+    ]
+    for c in candidates:
         if (Path(c) / "VeRi").exists():
             return c
     return str(Path.cwd() / "datasets")
 
+LOG_ROOT = pick_log_root()
+LOG_ROOT.mkdir(parents=True, exist_ok=True)
 DATA_ROOT = detect_data_root()
-print(f"[TX] Using DATASETS.ROOT_DIR={DATA_ROOT}")
 
-# --------- Helpers ---------
-def _re_pick(s: str, pat: str) -> float:
+def _now_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M")
+
+# ================= CLI =================
+def build_cli() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Run CE + TripletX with unified naming (DS prefix, PK, seeds).")
+    p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    p.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY)
+    p.add_argument("--seeds", type=str, default=DEFAULT_SEEDS, help="comma/space separated, e.g. '0,1,2'")
+    p.add_argument("--config", type=str, default=DEFAULT_CONFIG)
+    p.add_argument("--output-root", type=str, default=None)
+    p.add_argument("--data-root", type=str, default=None)
+    p.add_argument("--ds-prefix", type=str, default=DEFAULT_DSPREFIX)
+    p.add_argument("--pk", type=int, default=DEFAULT_PK, help="PK sampler K (DATALOADER.NUM_INSTANCE)")
+    p.add_argument("--opts", nargs=argparse.REMAINDER, help="extra YACS options passed to run_modelB_deit.py")
+    # evaluation-only utilities (style aligned with previous script family)
+    p.add_argument("--test-only", action="store_true", help="Only run evaluation for an existing TAG.")
+    p.add_argument("--from-run", type=str, default=None, help="Path to existing *_deit_run/_deit_test, or a TAG.")
+    p.add_argument("--tag", type=str, default=None, help="Direct TAG (e.g., ce_tripletx_k4_20251010_1507_seed0).")
+    p.add_argument("--cfg", type=str, default=None, help="Alias of --config for compatibility.")
+    return p.parse_args()
+
+# ================= Helpers =================
+def _max_epoch_from_checkpoints(run_dir: Path) -> int:
+    if not run_dir.exists():
+        return 0
+    max_ep = 0
+    for p in run_dir.glob("transformer_*.pth"):
+        m = re.search(r"transformer_(\d+)\.pth", p.name)
+        if m:
+            max_ep = max(max_ep, int(m.group(1)))
+    return max_ep
+
+def _infer_tag_from_input(s: str) -> str:
+    """
+    Accept:
+      - full path to <ds>_<TAG>_deit_run or _deit_test
+      - pure TAG ('ce_tripletx_k4_20251010_1507_seed0')
+    Return the <TAG> part only.
+    """
+    p = Path(s)
+    name = p.name
+    m = re.match(r".+?_(.+)_(?:deit_run|deit_test)$", name)
+    if m:
+        return m.group(1)
+    m = re.search(r".+?_(.+?)_(?:deit_run|deit_test)", str(p))
+    if m:
+        return m.group(1)
+    return name
+
+def _safe_mean(v: List[float]) -> float:
+    vals = [x for x in v if x >= 0]
+    return round(stats.mean(vals), 4) if vals else -1.0
+
+def _safe_stdev(v: List[float]) -> float:
+    vals = [x for x in v if x >= 0]
+    return round(stats.stdev(vals), 4) if len(vals) >= 2 else 0.0
+
+def _parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, float]:
+    for name in ("summary.json", "test_summary.txt", "results.txt", "log.txt", "test_log.txt"):
+        p = epoch_dir / name
+        if not p.exists():
+            continue
+        s = p.read_text(encoding="utf-8", errors="ignore")
+        if name == "summary.json":
+            try:
+                o = json.loads(s)
+                return float(o.get("mAP", -1)), float(o.get("Rank-1", -1)), \
+                       float(o.get("Rank-5", -1)), float(o.get("Rank-10", -1))
+            except Exception:
+                pass
+        # fallback regex parse
+        mAP = _pick_float(s, r"mAP[^0-9]*([0-9]+(?:\.[0-9]+)?)")
+        r1  = _pick_float(s, r"Rank[-\s]?1[^0-9]*([0-9]+(?:\.[0-9]+)?)")
+        r5  = _pick_float(s, r"Rank[-\s]?5[^0-9]*([0-9]+(?:\.[0-9]+)?)")
+        r10 = _pick_float(s, r"Rank[-\s]?10[^0-9]*([0-9]+(?:\.[0-9]+)?)")
+        if mAP >= 0:
+            return mAP, r1, r5, r10
+    return -1.0, -1.0, -1.0, -1.0
+
+def _pick_float(s: str, pat: str) -> float:
     m = re.search(pat, s, re.I)
     return float(m.group(1)) if m else -1.0
 
@@ -94,50 +167,7 @@ def _int_from_name(p: Path) -> int:
     m = re.search(r"(\d+)", p.name)
     return int(m.group(1)) if m else 0
 
-def parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, float]:
-    sj = epoch_dir / "summary.json"
-    if sj.exists():
-        try:
-            o = json.loads(sj.read_text())
-            return float(o.get("mAP", -1)), float(o.get("Rank-1", -1)), \
-                   float(o.get("Rank-5", -1)), float(o.get("Rank-10", -1))
-        except Exception:
-            pass
-    for name in ("test_summary.txt", "results.txt", "log.txt", "test_log.txt"):
-        p = epoch_dir / name
-        if p.exists():
-            s = p.read_text(encoding="utf-8", errors="ignore")
-            mAP = _re_pick(s, r"mAP[^0-9]*([0-9]+(?:\.[0-9]+)?)")
-            r1  = _re_pick(s, r"Rank[-\s]?1[^0-9]*([0-9]+(?:\.[0-9]+)?)")
-            r5  = _re_pick(s, r"Rank[-\s]?5[^0-9]*([0-9]+(?:\.[0-9]+)?)")
-            r10 = _re_pick(s, r"Rank[-\s]?10[^0-9]*([0-9]+(?:\.[0-9]+)?)")
-            return mAP, r1, r5, r10
-    return -1.0, -1.0, -1.0, -1.0
-
-def pick_best_epoch_metrics(test_dir: Path) -> Optional[Dict[str, Any]]:
-    epochs = sorted([p for p in test_dir.glob("epoch_*") if p.is_dir()],
-                    key=lambda p: int(p.name.split("_")[-1]))
-    best, best_key = None, None
-    for ep in epochs:
-        idx = int(ep.name.split("_")[-1])
-        mAP, r1, r5, r10 = parse_metrics_from_epoch_dir(ep)
-        if mAP < 0:
-            continue
-        key = (mAP, r1)
-        if (best_key is None) or (key > best_key):
-            best_key = key
-            best = {"epoch": idx, "mAP": mAP, "Rank-1": r1, "Rank-5": r5, "Rank-10": r10}
-    return best
-
-def safe_mean(v: List[float]) -> float:
-    vals = [x for x in v if x >= 0]
-    return round(stats.mean(vals), 4) if vals else -1.0
-
-def safe_stdev(v: List[float]) -> float:
-    vals = [x for x in v if x >= 0]
-    return round(stats.stdev(vals), 4) if len(vals) >= 2 else 0.0
-
-def pick_eval_device() -> str:
+def _pick_eval_device() -> str:
     env = os.getenv("EVAL_DEVICE")
     if env:
         return env
@@ -151,187 +181,199 @@ def pick_eval_device() -> str:
         pass
     return "cpu"
 
-def infer_tag_from_input(s: str) -> str:
-    """
-    Accept:
-      - full path to veri776_<TAG>_deit_run
-      - full path to veri776_<TAG>_deit_test
-      - pure TAG ('ce_tripletx_k8_20251010_1507_seed0')
-    Return: <TAG> part only.
-    """
-    p = Path(s)
-    name = p.name
-    m = re.match(r"veri776_(.+)_(?:deit_run|deit_test)$", name)
-    if m:
-        return m.group(1)
-    m = re.search(r"veri776_(.+?)_(?:deit_run|deit_test)", str(p))
-    if m:
-        return m.group(1)
-    return name
-
-# --------- Robust re-test ---------
-def eval_missing_epochs_via_test_py(tag: str, config_path: str, log_root: Path):
-    run_dir  = log_root / f"veri776_{tag}_deit_run"
-    test_dir = log_root / f"veri776_{tag}_deit_test"
+def _eval_missing_epochs(tag: str, cfg_path: str, ds_prefix: str, log_root: Path):
+    run_dir  = log_root / f"{ds_prefix}_{tag}_deit_run"
+    test_dir = log_root / f"{ds_prefix}_{tag}_deit_test"
     test_dir.mkdir(parents=True, exist_ok=True)
 
     ckpts = sorted(run_dir.glob("transformer_*.pth"), key=_int_from_name)
-    device = pick_eval_device()
+    device = _pick_eval_device()
 
     for ck in ckpts:
         ep = _int_from_name(ck)
         out_ep = test_dir / f"epoch_{ep}"
-        if any((out_ep / f).exists() for f in TEST_MARKER_FILES):
+        if any((out_ep / name).exists() for name in ("summary.json", "test_summary.txt", "results.txt", "log.txt", "test_log.txt", "dist_mat.npy")):
             continue
         out_ep.mkdir(parents=True, exist_ok=True)
         cmd = [
-            sys.executable, "test.py", "--config_file", str(config_path),
+            sys.executable, "test.py", "--config_file", str(cfg_path),
             "MODEL.DEVICE", device,
             "TEST.WEIGHT", str(ck),
             "OUTPUT_DIR", str(out_ep),
             "DATASETS.ROOT_DIR", DATA_ROOT,
         ]
-        print("[TX][eval] Launch:", " ".join(cmd))
+        print("[TripletX][eval] ", " ".join(cmd))
         subprocess.call(cmd)
 
-# --------- One-seed run ---------
-def ensure_full_run(seed: int, epochs: int, ckp: int, eva: int,
-                    pk: int, log_root: Path, train_only: bool = False,
-                    fixed_tag: Optional[str] = None, cfg_path: str = CONFIG
-                    ) -> Optional[Dict[str, Any]]:
-    """
-    Train (resume if needed) and/or test.
-    If fixed_tag is provided, reuse existing run/test folders:
-      logs/veri776_<fixed_tag>_deit_run/test
-    Otherwise, create a new tag with timestamp.
-    """
-    ts = datetime.now().strftime("%Y%m%d_%H%M")
-    tag = fixed_tag if fixed_tag else f"ce_tripletx_k{pk}_{ts}_seed{seed}"
-    run_dir  = log_root / f"veri776_{tag}_deit_run"
-    test_dir = log_root / f"veri776_{tag}_deit_test"
-
-    # detect current progress
-    trained_max = max([_int_from_name(p) for p in run_dir.glob("transformer_*.pth")], default=0)
-
-    if trained_max >= epochs:
-        print(f"[TX] Trained to {trained_max}, reconstruct tests (seed={seed})")
-        if not train_only:
-            eval_missing_epochs_via_test_py(tag, cfg_path, log_root)
-    else:
-        print(f"[TX] Training seed={seed} (resume {trained_max}/{epochs}), PK={pk}")
-        ckpt_path = run_dir / f"transformer_{trained_max}.pth"
-        cmd = [
-            sys.executable, "run_modelB_deit.py",
-            "--config", cfg_path,
-            "--opts",
-            "SOLVER.MAX_EPOCHS", str(epochs),
-            "SOLVER.SEED", str(seed),
-            "SOLVER.CHECKPOINT_PERIOD", str(ckp),
-            "SOLVER.EVAL_PERIOD", str(eva),
-            "DATALOADER.NUM_INSTANCE", str(pk),
-            "LOSS.SUPCON.ENABLE", "False",
-            "LOSS.TRIPLETX.ENABLE", "True",
-            "MODEL.TRAINING_MODE", "supervised",
-            "DATASETS.ROOT_DIR", DATA_ROOT,
-            "OUTPUT_DIR", str(log_root),
-            "TAG", tag,
-        ]
-        if ckpt_path.exists() and trained_max > 0:
-            cmd += ["MODEL.PRETRAIN_CHOICE", "resume", "MODEL.PRETRAIN_PATH", str(ckpt_path)]
-        print("[TX][train] Launch:", " ".join(cmd))
-        subprocess.check_call(cmd)
-        if not train_only:
-            eval_missing_epochs_via_test_py(tag, cfg_path, log_root)
-
-    if train_only:
-        print(f"[TX] Seed {seed} training finished (test skipped).")
-        return None
-
-    best = pick_best_epoch_metrics(test_dir)
-    if best:
-        print(f"[TX] Seed {seed} best epoch: {best}")
-        (log_root / f"{tag}_best.json").write_text(json.dumps(best, indent=2))
+def _pick_best_epoch_metrics(test_dir: Path) -> Optional[Dict[str, Any]]:
+    epochs = sorted([p for p in test_dir.glob("epoch_*") if p.is_dir()],
+                    key=lambda p: int(p.name.split("_")[-1]))
+    best, best_key = None, None
+    for ep in epochs:
+        idx = int(ep.name.split("_")[-1])
+        mAP, r1, r5, r10 = _parse_metrics_from_epoch_dir(ep)
+        if mAP < 0:
+            continue
+        key = (mAP, r1)
+        if (best_key is None) or (key > best_key):
+            best_key = key
+            best = {"epoch": idx, "mAP": mAP, "Rank-1": r1, "Rank-5": r5, "Rank-10": r10}
     return best
 
-# --------- CLI & Main ---------
-def build_cli() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="TripletX-only runner (PK sampler configurable, robust resume/test).")
-    p.add_argument("--epochs", type=int, default=FULL_EPOCHS)
-    p.add_argument("--ckp", type=int, default=CHECKPOINT_PERIOD, help="Checkpoint period.")
-    p.add_argument("--eval", type=int, default=EVAL_PERIOD, help="Eval period. Set large to skip during train.")
-    p.add_argument("--seeds", nargs="+", default=[str(s) for s in SEEDS_DEFAULT])
-    p.add_argument("--output-root", type=str, default=None, help="Override output root directory.")
-    p.add_argument("--train-only", action="store_true", help="Skip test phase.")
-    p.add_argument("--pk", type=int, default=PK_DEFAULT, help="PK sampler K (DATALOADER.NUM_INSTANCE).")
-    # NEW:
-    p.add_argument("--test-only", action="store_true", help="Only run test for an existing run (no training).")
-    p.add_argument("--from-run", type=str, default=None, help="Path to an existing *_run/_test folder, or pure TAG.")
-    p.add_argument("--tag", type=str, default=None, help="Override TAG directly (e.g., ce_tripletx_k8_20251010_1507_seed0).")
-    p.add_argument("--cfg", type=str, default=CONFIG, help="Config yaml path to use.")
-    return p.parse_args()
+# ================= Train launcher =================
+def _launch_training(config_path: str,
+                     seed: int,
+                     target_epochs: int,
+                     log_root: Path,
+                     ds_prefix: str,
+                     data_root: str,
+                     ckpt_period: int,
+                     eval_period: int,
+                     pk: int,
+                     extra_opts,
+                     fixed_tag: Optional[str] = None) -> str:
+    """
+    Train (resume if needed). If fixed_tag is provided, reuse existing run/test dirs.
+    """
+    ts = _now_stamp()
+    tag = fixed_tag if fixed_tag else f"ce_tripletx_k{pk}_{ts}_seed{seed}"
+    run_dir  = log_root / f"{ds_prefix}_{tag}_deit_run"
+    test_dir = log_root / f"{ds_prefix}_{tag}_deit_test"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    test_dir.mkdir(parents=True, exist_ok=True)
 
-def parse_seeds(raw: List[str]) -> List[int]:
-    flat: List[str] = []
-    for s in raw:
-        flat += [x for x in s.split(",") if x.strip()]
-    return [int(x) for x in flat]
+    trained_max = _max_epoch_from_checkpoints(run_dir)
 
+    # YACS opts
+    opts = [
+        "SOLVER.MAX_EPOCHS", str(target_epochs),
+        "SOLVER.SEED", str(seed),
+        "SOLVER.CHECKPOINT_PERIOD", str(ckpt_period),
+        "SOLVER.EVAL_PERIOD", str(eval_period),  # set big number to skip during train if needed
+        "DATALOADER.NUM_INSTANCE", str(pk),
+        "LOSS.SUPCON.ENABLE", "False",
+        "LOSS.TRIPLETX.ENABLE", "True",
+        "MODEL.TRAINING_MODE", "supervised",
+        "DATASETS.ROOT_DIR", data_root,
+        "OUTPUT_DIR", str(log_root),
+        "TAG", tag,
+    ]
+    if extra_opts:
+        opts += extra_opts
+
+    # resume
+    if trained_max > 0:
+        last_ckpt = run_dir / f"transformer_{trained_max}.pth"
+        if last_ckpt.exists():
+            print(f"[TripletX][resume] {last_ckpt} (seed={seed})")
+            opts += [
+                "MODEL.PRETRAIN_CHOICE", "resume",
+                "MODEL.PRETRAIN_PATH", str(last_ckpt),
+            ]
+
+    cmd = [sys.executable, "run_modelB_deit.py", "--config", config_path, "--opts"] + opts
+    print(f"[TripletX] Launch tag={tag} | PK={pk} | seed={seed}")
+    print("[TripletX] CMD:", " ".join(cmd))
+    subprocess.check_call(cmd)
+    return tag
+
+# ================= Main =================
 def main():
     args = build_cli()
-    seeds = parse_seeds(args.seeds)
-    log_root = pick_log_root(args.output_root)
-    ts = datetime.now().strftime("%Y%m%d_%H%M")
-    print(f"[TX] Using log_root={log_root} | timestamp={ts} | PK={args.pk}")
 
+    # config alias compatibility
+    if args.cfg and not args.config:
+        args.config = args.cfg
+
+    global LOG_ROOT, DATA_ROOT
+    if args.output_root:
+        LOG_ROOT = Path(args.output_root); LOG_ROOT.mkdir(parents=True, exist_ok=True)
+    if args.data_root:
+        DATA_ROOT = args.data_root
+
+    seed_list = [int(s) for s in re.split(r"[,\s]+", args.seeds) if s.strip()]
+    if not seed_list:
+        raise SystemExit("[TripletX] No valid seeds given.")
+
+    print(f"[TripletX-CLI] CONFIG={args.config}")
+    print(f"[TripletX-CLI] EPOCHS={args.epochs}")
+    print(f"[TripletX-CLI] SEEDS={seed_list}")
+    print(f"[TripletX-CLI] OUTPUT_ROOT={LOG_ROOT}")
+    print(f"[TripletX-CLI] DATA_ROOT={DATA_ROOT}")
+    print(f"[TripletX-CLI] DS_PREFIX={args.ds_prefix}")
+    print(f"[TripletX-CLI] PK={args.pk}")
+
+    # fixed TAG from --from-run / --tag
     fixed_tag: Optional[str] = None
     if args.from_run:
-        fixed_tag = infer_tag_from_input(args.from_run)
-        print(f"[TX] Fixed TAG from --from-run → {fixed_tag}")
+        fixed_tag = _infer_tag_from_input(args.from_run)
+        print(f"[TripletX-CLI] Fixed TAG from --from-run → {fixed_tag}")
     elif args.tag:
         fixed_tag = args.tag
-        print(f"[TX] Fixed TAG from --tag → {fixed_tag}")
+        print(f"[TripletX-CLI] Fixed TAG from --tag → {fixed_tag}")
 
-    # test-only flow (no training)
+    # test-only flow
     if args.test_only:
         if not fixed_tag:
             raise ValueError("--test-only requires --from-run or --tag to locate checkpoints.")
-        eval_missing_epochs_via_test_py(fixed_tag, args.cfg, log_root)
-        test_dir = log_root / f"veri776_{fixed_tag}_deit_test"
-        best = pick_best_epoch_metrics(test_dir)
+        _eval_missing_epochs(fixed_tag, args.config, args.ds_prefix, LOG_ROOT)
+        test_dir = LOG_ROOT / f"{args.ds_prefix}_{fixed_tag}_deit_test"
+        best = _pick_best_epoch_metrics(test_dir)
         if best:
-            print(f"[TX][test-only] Best epoch: {best}")
+            print(f"[TripletX][test-only] Best epoch: {best}")
         else:
-            print("[TX][test-only] No valid metrics found.")
-        print("[TX] Done (test-only).")
+            print("[TripletX][test-only] No valid metrics found.")
+        print("[TripletX] Done (test-only).")
         return
 
-    # normal (train + test) flow
-    seed_best: Dict[int, Dict[str, Any]] = {}
-    for seed in seeds:
-        rec = ensure_full_run(seed, args.epochs, args.ckp, args.eval, args.pk,
-                              log_root, train_only=args.train_only,
-                              fixed_tag=fixed_tag, cfg_path=args.cfg)
-        if rec:
-            seed_best[seed] = rec
+    # normal flow (train + re-test)
+    extra_opts = (args.opts or [])
+    best_records: Dict[int, Dict[str, Any]] = {}
 
-    if seed_best:
-        mAPs = [r["mAP"] for r in seed_best.values()]
-        R1s  = [r["Rank-1"] for r in seed_best.values()]
+    for seed in seed_list:
+        tag = _launch_training(
+            config_path=args.config,
+            seed=seed,
+            target_epochs=args.epochs,
+            log_root=LOG_ROOT,
+            ds_prefix=args.ds_prefix,
+            data_root=DATA_ROOT,
+            ckpt_period=args.save_every,
+            eval_period=args.save_every,
+            pk=args.pk,
+            extra_opts=extra_opts,
+            fixed_tag=fixed_tag
+        )
+        # robust re-test after training
+        _eval_missing_epochs(tag if not fixed_tag else fixed_tag, args.config, args.ds_prefix, LOG_ROOT)
+        test_dir = LOG_ROOT / f"{args.ds_prefix}_{tag if not fixed_tag else fixed_tag}_deit_test"
+        best = _pick_best_epoch_metrics(test_dir)
+        if best:
+            best_records[seed] = best
+            (LOG_ROOT / f"{(tag if not fixed_tag else fixed_tag)}_best.json").write_text(json.dumps(best, indent=2))
+            print(f"[TripletX] Seed {seed} best: {best}")
+
+    # summary across seeds
+    if best_records:
+        mAPs = [rec["mAP"] for rec in best_records.values()]
+        R1s  = [rec["Rank-1"] for rec in best_records.values()]
+        ts = _now_stamp()
         summary = {
-            "config": args.cfg,
+            "config": args.config,
             "epochs": args.epochs,
-            "ckp_period": args.ckp,
-            "eval_period": args.eval,
+            "save_every": args.save_every,
             "pk": args.pk,
-            "log_root": str(log_root),
-            "mean": {"mAP": safe_mean(mAPs), "Rank-1": safe_mean(R1s)},
-            "std":  {"mAP": safe_stdev(mAPs), "Rank-1": safe_stdev(R1s)},
+            "log_root": str(LOG_ROOT),
+            "mean": {"mAP": _safe_mean(mAPs), "Rank-1": _safe_mean(R1s)},
+            "std":  {"mAP": _safe_stdev(mAPs), "Rank-1": _safe_stdev(R1s)},
+            "seeds": seed_list,
         }
-        (log_root / f"veri776_ce_tripletx_k{args.pk}_{ts}_summary.json").write_text(json.dumps(summary, indent=2))
-        print(f"[TX] Wrote summary → veri776_ce_tripletx_k{args.pk}_{ts}_summary.json")
+        (LOG_ROOT / f"{args.ds_prefix}_ce_tripletx_k{args.pk}_{ts}_summary.json").write_text(json.dumps(summary, indent=2))
+        print(f"[TripletX] Wrote summary → {args.ds_prefix}_ce_tripletx_k{args.pk}_{ts}_summary.json")
     else:
-        print("[TX] No valid results collected.")
-    print("[TX] Done.")
+        print("[TripletX] No valid results collected.")
+
+    print("[TripletX] Done.")
 
 if __name__ == "__main__":
     main()
