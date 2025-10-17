@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ===========================================================
-# File: run_ce_tripletx.py
+# File: run_ce_tripletx_k8.py
 # Purpose: TripletX-only (CrossEntropy + TripletX) training/eval launcher
 #          with unified naming, multi-seed support, auto-resume, and
 #          robust re-test of missing epochs.
@@ -34,7 +34,7 @@ DEFAULT_EPOCHS      = 120
 DEFAULT_SAVE_EVERY  = 3         # also used as eval period by default
 DEFAULT_SEEDS       = "0"
 DEFAULT_DSPREFIX    = "veri776"
-DEFAULT_PK          = 8         # <-- CHANGED: default K for PK sampler
+DEFAULT_PK          = 8         # default K for PK sampler
 
 # ================= Env / paths =================
 def _in_colab() -> bool:
@@ -138,6 +138,10 @@ def _safe_stdev(v: List[float]) -> float:
     vals = [x for x in v if x >= 0]
     return round(stats.stdev(vals), 4) if len(vals) >= 2 else 0.0
 
+def _pick_float(s: str, pat: str) -> float:
+    m = re.search(pat, s, re.I)
+    return float(m.group(1)) if m else -1.0
+
 def _parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, float]:
     for name in ("summary.json", "test_summary.txt", "results.txt", "log.txt", "test_log.txt"):
         p = epoch_dir / name
@@ -159,10 +163,6 @@ def _parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float,
         if mAP >= 0:
             return mAP, r1, r5, r10
     return -1.0, -1.0, -1.0, -1.0
-
-def _pick_float(s: str, pat: str) -> float:
-    m = re.search(pat, s, re.I)
-    return float(m.group(1)) if m else -1.0
 
 def _int_from_name(p: Path) -> int:
     m = re.search(r"(\d+)", p.name)
@@ -352,7 +352,7 @@ def main():
         if best:
             best_records[seed] = best
             (LOG_ROOT / f"{(tag if not fixed_tag else fixed_tag)}_best.json").write_text(json.dumps(best, indent=2))
-            print(f."[TripletX] Seed {seed} best: {best}")
+            print(f"[TripletX] Seed {seed} best: {best}")
 
     # summary across seeds
     if best_records:
