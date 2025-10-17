@@ -20,7 +20,7 @@ from yacs.config import CfgNode as CN
 #                           LOSS.PHASED.{BOUNDARIES, METRIC_SEQ, W_METRIC_SEQ, W_SUP_SPEC}.
 # [2025-10-15 | Hang Zhang] **NEW:** Add FEAT_SRC routing keys for each loss:
 #                           LOSS.CE.FEAT_SRC, LOSS.TRIPLET.FEAT_SRC, LOSS.TRIPLETX.FEAT_SRC, LOSS.SUPCON.FEAT_SRC.
-#                           Defaults: CE/Triplet/TripletX='bnneck', SupCon='pre_bn'.
+#                           Defaults: CE/SupCon='bnneck', Triplet/TripletX='pre_bn'
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
@@ -90,7 +90,7 @@ _C.LOSS.CE.FEAT_SRC = 'bnneck'
 # ====== Triplet (baseline) ======
 _C.LOSS.TRIPLET = CN()
 # Which feature branch to use for Triplet: ['bnneck', 'pre_bn', 'backbone']
-_C.LOSS.TRIPLET.FEAT_SRC = 'bnneck'
+_C.LOSS.TRIPLET.FEAT_SRC = 'pre_bn'
 
 # ====== TripletX (enhanced triplet) ======
 _C.LOSS.TRIPLETX = CN()
@@ -105,7 +105,7 @@ _C.LOSS.TRIPLETX.CROSS_CAM_POS = True
 _C.LOSS.TRIPLETX.SAME_CAM_NEG_BOOST = 1.2
 _C.LOSS.TRIPLETX.NORM_FEAT = True
 # Which feature branch to use for TripletX: ['bnneck', 'pre_bn', 'backbone']
-_C.LOSS.TRIPLETX.FEAT_SRC = 'bnneck'
+_C.LOSS.TRIPLETX.FEAT_SRC = 'pre_bn'
 
 # ====== SupCon (supervised contrastive) ======
 _C.LOSS.SUPCON = CN()
@@ -115,8 +115,7 @@ _C.LOSS.SUPCON.T = 0.07
 _C.LOSS.SUPCON.CAM_AWARE = False
 _C.LOSS.SUPCON.POS_RULE = "class"
 # Which feature branch to use for SupCon: ['bnneck', 'pre_bn', 'backbone']
-# NOTE: default to 'pre_bn' so SupCon uses backbone/pre-BN features.
-_C.LOSS.SUPCON.FEAT_SRC = 'pre_bn'
+_C.LOSS.SUPCON.FEAT_SRC = 'bnneck'
 
 # Grid for B1 auto search
 _C.LOSS.SUPCON.SEARCH = CN()
