@@ -64,6 +64,12 @@
 #                           - _phased_selector now takes (cfg, epoch) explicitly (removed inspect.stack()).
 #                           - Added one-time note: "SupConLoss instantiated here (entry should not rebuild)".
 #                           - Added one-time note: "CE.FEAT_SRC='<v>' ignored (CE uses classifier score)".
+# [2025-10-17 | Team 5703]  **NEW: Triplet vs TripletX independent FEAT_SRC + external L2**
+#                           - Read LOSS.TRIPLET.FEAT_SRC and LOSS.TRIPLETX.FEAT_SRC separately.
+#                           - Choose FEAT_SRC based on whether TripletX is used in current step.
+#                           - Set TripletX(normalize_feature=False); we L2-normalize externally:
+#                             **FEAT_SRC → F.normalize → Loss**.
+#                           - One-time check log: "[make_loss][check] Metric src=<...>, L2=on".
 # ==========================================
 
 import torch
@@ -248,27 +254,32 @@ def make_loss(cfg, num_classes):
         print(f"[make_loss] SupCon enabled: W={supcon_w}, T={getattr(cfg.LOSS.SUPCON, 'T', 0.07)}")
         print("[make_loss][init] SupConLoss instantiated here (entry should not rebuild).")
 
-    # NEW: read feature source preferences (with safe defaults reflecting current baseline)
-    tri_src = "pre_bn"
-    sup_src = "bnneck"
+    # === Read feature-source preferences (Triplet / TripletX / SupCon) ===
+    tri_src_triplet  = "pre_bn"
+    tri_src_tripletx = "pre_bn"
+    sup_src          = "bnneck"
     try:
-        if hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "TRIPLETX"):
-            tri_src = str(getattr(cfg.LOSS.TRIPLETX, "FEAT_SRC", "pre_bn")).lower()
-        if hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "SUPCON"):
-            sup_src = str(getattr(cfg.LOSS.SUPCON, "FEAT_SRC", "bnneck")).lower()
+        if hasattr(cfg, "LOSS"):
+            if hasattr(cfg.LOSS, "TRIPLET"):
+                tri_src_triplet  = str(getattr(cfg.LOSS.TRIPLET,  "FEAT_SRC", "pre_bn")).lower()
+            if hasattr(cfg.LOSS, "TRIPLETX"):
+                tri_src_tripletx = str(getattr(cfg.LOSS.TRIPLETX, "FEAT_SRC", "pre_bn")).lower()
+            if hasattr(cfg.LOSS, "SUPCON"):
+                sup_src = str(getattr(cfg.LOSS.SUPCON, "FEAT_SRC", "bnneck")).lower()
     except Exception:
         pass
 
-    # --- one-time display of feature-source config ---
-    print("[make_loss][init] Triplet/TripletX feature source:", tri_src)
-    print("[make_loss][init] SupCon feature source:", sup_src)
-    if tri_src == sup_src:
-        print("[make_loss][init] ⚠ Note: Both losses use same feature layer → gradients may interact.")
+    print("[make_loss][init] Triplet  feature source:",  tri_src_triplet)
+    print("[make_loss][init] TripletX feature source:", tri_src_tripletx)
+    print("[make_loss][init] SupCon   feature source:",  sup_src)
+    if (tri_src_triplet == sup_src) or (tri_src_tripletx == sup_src):
+        print("[make_loss][init] ⚠ Note: Metric and SupCon share the same layer → gradients may interact.")
 
     # Track warnings & one-time notes
     _warn_once_tri = {"warned": False}
     _warn_once_sup = {"warned": False, "model_src_noted": False}
     _ce_note_once  = {"done": False}
+    _metric_src_log_once = {"done": False}
 
     # --------------------------------
     # Metric loss: Triplet or TripletX
@@ -284,12 +295,13 @@ def make_loss(cfg, num_classes):
             and bool(getattr(cfg.LOSS.TRIPLETX, "ENABLE", False))
         )
         if USE_TRIPLETX_AVAILABLE:
+            # We normalize externally → avoid double normalize here
             triplet = TripletXLoss(
                 margin=_to_float(getattr(cfg.LOSS.TRIPLETX, "MARGIN", 0.3), 0.3),
                 use_soft_warmup=bool(getattr(cfg.LOSS.TRIPLETX, "SOFT_WARMUP", False)),
                 warmup_epochs=int(getattr(cfg.LOSS.TRIPLETX, "WARMUP_EPOCHS", 0)),
                 k=int(getattr(cfg.LOSS.TRIPLETX, "K", 4)),
-                normalize_feature=bool(getattr(cfg.LOSS.TRIPLETX, "NORM_FEAT", False)),
+                normalize_feature=False,  # <<< unified outer L2
                 cross_cam_pos=bool(getattr(cfg.LOSS.TRIPLETX, "CROSS_CAM_POS", False)),
                 same_cam_neg_boost=_to_float(getattr(cfg.LOSS.TRIPLETX, "SAME_CAM_NEG_BOOST", 0.0), 0.0),
                 alpha=_to_float(getattr(cfg.LOSS.TRIPLETX, "ALPHA", 1.0), 1.0),
@@ -297,7 +309,8 @@ def make_loss(cfg, num_classes):
             print("[make_loss] Using TripletX loss "
                   f"(K={getattr(cfg.LOSS.TRIPLETX, 'K', 4)}, margin={getattr(cfg.LOSS.TRIPLETX, 'MARGIN', 0.3)}, "
                   f"warmup={getattr(cfg.LOSS.TRIPLETX, 'SOFT_WARMUP', False)}/{getattr(cfg.LOSS.TRIPLETX, 'WARMUP_EPOCHS', 0)}, "
-                  f"cross_cam_pos={getattr(cfg.LOSS.TRIPLETX, 'CROSS_CAM_POS', False)})")
+                  f"cross_cam_pos={getattr(cfg.LOSS.TRIPLETX, 'CROSS_CAM_POS', False)}, "
+                  f"normalize_feature=False)")
         else:
             if bool(getattr(cfg.MODEL, "NO_MARGIN", False)):
                 triplet = TripletLoss()
@@ -418,6 +431,9 @@ def make_loss(cfg, num_classes):
                           f"| id_w={id_w:.3f}, tri_w={float(w_metric):.3f}, sup_w={float(w_sup):.3f}")
                 _phase_log_state["last"] = current_sig
 
+            # choose correct FEAT_SRC for this step (Triplet vs TripletX)
+            tri_src = tri_src_tripletx if (use_tx_phase and TripletXLoss is not None) else tri_src_triplet
+
             # prepare features for dynamic source picking
             global_pre_bn, bnneck = _unpack_feats_for_sources(feat, feat_bn)
 
@@ -426,6 +442,10 @@ def make_loss(cfg, num_classes):
                 tri_in = _pick_by_src_with_fallback(tri_src, global_pre_bn, bnneck,
                                                     _warn_once_tri, "Triplet/TripletX")
                 tri_in = F.normalize(tri_in, dim=1)
+
+                if not _metric_src_log_once["done"]:
+                    print(f"[make_loss][check] Metric src='{tri_src}', L2=on")
+                    _metric_src_log_once["done"] = True
 
                 def _call_triplet(f):
                     if use_tx_phase and TripletXLoss is not None:
@@ -439,11 +459,7 @@ def make_loss(cfg, num_classes):
                         except TypeError:
                             return _reduce_triplet_output(triplet(f, target))
 
-                if isinstance(feat, list) and len(feat) > 1 and isinstance(feat[1], torch.Tensor):
-                    TRI_LOSS = _call_triplet(tri_in)  # keep global-only by default
-                else:
-                    TRI_LOSS = _call_triplet(tri_in)
-
+                TRI_LOSS = _call_triplet(tri_in)
                 total += float(w_metric) * TRI_LOSS
 
             # SupCon
