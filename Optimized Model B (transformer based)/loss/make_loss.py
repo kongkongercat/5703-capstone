@@ -1,7 +1,7 @@
 # encoding: utf-8
 """
-@author:  Hang Zhang
-@contact: hzha0521
+@author:  liaoxingyu
+@contact: sherlockliao01@gmail.com
 """
 
 # ==========================================
@@ -63,7 +63,7 @@
 # [2025-10-17 | Hang Zhang]  **Stability & clarity**
 #                           - _phased_selector now takes (cfg, epoch) explicitly (removed inspect.stack()).
 #                           - Added one-time note: "SupConLoss instantiated here (entry should not rebuild)".
-#                           - Added one-time note: "CE.FEAT_SRC='<v>' ignored (CE uses classifier score)".
+#                           - Added one-time note: "CE.FEAT_SRC is removed; CE uses classifier score."
 # [2025-10-17 | Hang Zhang]  **Triplet vs TripletX independent FEAT_SRC**
 #                           - Read LOSS.TRIPLET.FEAT_SRC and LOSS.TRIPLETX.FEAT_SRC separately.
 #                           - Choose FEAT_SRC based on whether TripletX is used in current step.
@@ -78,6 +78,9 @@
 #                           - Fix: Triplet uses LOSS.TRIPLET.FEAT_SRC; TripletX uses LOSS.TRIPLETX.FEAT_SRC.
 # [2025-10-18 | Hang Zhang]  **Compatibility for baseline Triplet**
 #                           - Safe fallback for TripletLoss without (camids/epoch) arguments.
+# [2025-10-19 | Hang Zhang]  **Remove unused helper & fix CE policy**
+#                           - Deleted unused _pick_z() helper.
+#                           - Explicit note: CE has no dynamic FEAT_SRC; always uses logits (score).
 # ==========================================
 
 import torch
@@ -107,13 +110,6 @@ def _to_float(x, default=0.0):
 def _safe_mean(values):
     """Return mean(values) if non-empty else 0.0 (avoid ZeroDivisionError)."""
     return (sum(values) / len(values)) if values else 0.0
-
-
-def _pick_z(z_supcon, feat):
-    """Select z_supcon if provided; otherwise fall back to backbone features."""
-    if z_supcon is not None:
-        return z_supcon
-    return feat[0] if isinstance(feat, list) else feat
 
 
 def _reduce_triplet_output(out):
@@ -166,6 +162,7 @@ def make_loss(cfg, num_classes):
     if getattr(cfg.MODEL, "IF_LABELSMOOTH", "off") == "on":
         xent = CrossEntropyLabelSmooth(num_classes=num_classes)
         print(f"[make_loss] Label smoothing ON, num_classes={num_classes}")
+    # CE uses classifier logits (score) directly; no dynamic FEAT_SRC.
 
     # ---- SupCon (optional; may be disabled in baseline) ----
     supcon_criterion = None

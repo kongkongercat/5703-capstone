@@ -21,6 +21,9 @@ from yacs.config import CfgNode as CN
 # [2025-10-15 | Hang Zhang] **NEW:** Add FEAT_SRC routing keys for each loss:
 #                           LOSS.CE.FEAT_SRC, LOSS.TRIPLET.FEAT_SRC, LOSS.TRIPLETX.FEAT_SRC, LOSS.SUPCON.FEAT_SRC.
 #                           Defaults: CE/SupCon='bnneck', Triplet/TripletX='pre_bn'
+# [2025-10-19 | Hang Zhang] **Remove dynamic CE source key**:
+#                           - Deleted LOSS.CE.FEAT_SRC; CE always uses classifier logits (score).
+#                           - Any YAML/CLI setting for CE.FEAT_SRC is no longer supported/needed.
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
@@ -83,9 +86,8 @@ _C.MODEL.TRAINING_MODE = "supervised"                   # "supervised" | "self_s
 _C.LOSS = CN()
 
 # ====== Cross-Entropy (ID) ======
+# CE uses classifier logits (score) directly; no FEAT_SRC needed.
 _C.LOSS.CE = CN()
-# Which feature branch to use for CE: ['bnneck', 'pre_bn', 'backbone']
-_C.LOSS.CE.FEAT_SRC = 'bnneck'
 
 # ====== Triplet (baseline) ======
 _C.LOSS.TRIPLET = CN()
