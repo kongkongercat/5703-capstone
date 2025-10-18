@@ -15,7 +15,7 @@ ReID Training Entrypoint
 # [2025-10-17 | Zhang Hang] Added unified feature-source summary logging
 #                            (CE / Triplet / TripletX / SupCon) after make_model–make_loss.
 #                            Added '--config' CLI alias for consistency.
-# [2025-10-17 | Team 5703]  Removed redundant SupConLoss instantiation from entry script.
+# [2025-10-17 | Zhang Hang]  Removed redundant SupConLoss instantiation from entry script.
 #                            SupConLoss is now built exclusively inside make_loss.py.
 #                            Entry only logs SupCon ENABLED/DISABLED for clarity.
 # ==========================================
