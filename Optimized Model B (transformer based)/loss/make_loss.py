@@ -51,7 +51,7 @@
 #                           - Backward compatible: if BNNeck feature is not provided, gracefully
 #                             fall back to pre_bn with a one-time warning.
 #                           - Extended loss_func signature with optional feat_bn=None to accept
-#                             BNNeck feature without breaking old trainers.
+#                           BNNeck feature without breaking old trainers.
 # [2025-10-15 | Hang Zhang]  **NEW: Init logging of feature sources**
 #                           - Print once at init: the chosen sources for Triplet/TripletX and SupCon.
 #                           - If both use the same layer, print a caution about potential gradient interaction.
@@ -69,9 +69,10 @@
 #                           - Choose FEAT_SRC based on whether TripletX is used in current step.
 #                           - TripletX(normalize_feature=False); removed redundant external L2 normalization.
 #                           - One-time check log: "[make_loss][check] Metric src=<...>, L2=off".
-# [2025-10-18 | Hang Zhang]  **Removed all normalization inside make_loss**
-#                           - Deleted F.normalize for Triplet, TripletX, and SupCon (handled internally).
-#                           - Ensured no double normalization and unified author name.
+# [2025-10-18 | Hang Zhang]  **Baseline-safe ID/Metric list handling & tri_src fix**
+#                           - CE: support list outputs with 0.5*(head0 + mean(others)); single Tensor unchanged.
+#                           - Triplet: support list features with same 0.5 scheme; single Tensor unchanged.
+#                           - Fix: Triplet uses LOSS.TRIPLET.FEAT_SRC; TripletX uses LOSS.TRIPLETX.FEAT_SRC.
 # ==========================================
 
 import torch
@@ -81,16 +82,12 @@ from .triplet_loss import TripletLoss
 from .center_loss import CenterLoss
 from .supcon_loss import SupConLoss
 
-# Optional: Enhanced TripletX (used in B2/B4)
 try:
     from .tripletx_loss import TripletLossX as TripletXLoss
 except Exception:
     TripletXLoss = None
 
 
-# ------------------------------
-# Utilities
-# ------------------------------
 def _to_float(x, default=0.0):
     try:
         return float(x)
@@ -99,24 +96,14 @@ def _to_float(x, default=0.0):
 
 
 def _safe_mean(values):
-    """Return mean(values) if non-empty else 0.0 (avoid ZeroDivisionError)."""
     return (sum(values) / len(values)) if values else 0.0
 
 
-def _pick_z(z_supcon, feat):
-    """Select z_supcon if provided; otherwise fall back to backbone features."""
-    if z_supcon is not None:
-        return z_supcon
-    return feat[0] if isinstance(feat, list) else feat
-
-
 def _reduce_triplet_output(out):
-    """Return scalar loss if metric loss returns (loss, aux) or a single value."""
     return out[0] if isinstance(out, (list, tuple)) else out
 
 
 def _unpack_feats_for_sources(feat, feat_bn):
-    """Recover (global_pre_bn, bnneck_feat) for flexible feature routing."""
     g, b = None, None
     if isinstance(feat_bn, torch.Tensor):
         b = feat_bn
@@ -130,7 +117,6 @@ def _unpack_feats_for_sources(feat, feat_bn):
 
 
 def _pick_by_src_with_fallback(src, global_pre_bn, bnneck_feat, once_flag, warn_tag):
-    """Return feature by FEAT_SRC with fallback warning."""
     src = (src or "pre_bn").lower()
     if src == "bnneck":
         if isinstance(bnneck_feat, torch.Tensor):
@@ -142,9 +128,6 @@ def _pick_by_src_with_fallback(src, global_pre_bn, bnneck_feat, once_flag, warn_
     return global_pre_bn
 
 
-# ------------------------------
-# Factory
-# ------------------------------
 def make_loss(cfg, num_classes):
     sampler = cfg.DATALOADER.SAMPLER
     feat_dim = 2048
@@ -159,6 +142,7 @@ def make_loss(cfg, num_classes):
         xent = CrossEntropyLabelSmooth(num_classes=num_classes)
         print(f"[make_loss] Label smoothing ON, num_classes={num_classes}")
 
+    # SupCon 可用但本 run 配置里是关闭的；保留以兼容其它配置
     supcon_criterion = None
     supcon_enabled = False
     supcon_w = 0.0
@@ -168,9 +152,9 @@ def make_loss(cfg, num_classes):
         supcon_enabled = True
         print(f"[make_loss] SupCon enabled: W={supcon_w}, T={getattr(cfg.LOSS.SUPCON, 'T', 0.07)}")
 
-    tri_src_triplet = str(getattr(getattr(cfg.LOSS, "TRIPLET", {}), "FEAT_SRC", "pre_bn")).lower()
+    tri_src_triplet  = str(getattr(getattr(cfg.LOSS, "TRIPLET", {}),  "FEAT_SRC", "pre_bn")).lower()
     tri_src_tripletx = str(getattr(getattr(cfg.LOSS, "TRIPLETX", {}), "FEAT_SRC", "pre_bn")).lower()
-    sup_src = str(getattr(getattr(cfg.LOSS, "SUPCON", {}), "FEAT_SRC", "bnneck")).lower()
+    sup_src          = str(getattr(getattr(cfg.LOSS, "SUPCON", {}),   "FEAT_SRC", "bnneck")).lower()
     print("[make_loss][init] Triplet  src:", tri_src_triplet)
     print("[make_loss][init] TripletX src:", tri_src_tripletx)
     print("[make_loss][init] SupCon   src:", sup_src)
@@ -179,6 +163,7 @@ def make_loss(cfg, num_classes):
     _warn_once_sup = {"warned": False, "model_src_noted": False}
 
     triplet = None
+    use_tx = False
     if "triplet" in str(getattr(cfg.MODEL, "METRIC_LOSS_TYPE", "")).lower() and tri_w > 0:
         use_tx = (
             TripletXLoss is not None
@@ -188,7 +173,7 @@ def make_loss(cfg, num_classes):
         if use_tx:
             triplet = TripletXLoss(
                 margin=_to_float(getattr(cfg.LOSS.TRIPLETX, "MARGIN", 0.3)),
-                normalize_feature=False,  # internal control only
+                normalize_feature=False,
                 k=int(getattr(cfg.LOSS.TRIPLETX, "K", 4)),
             )
             print("[make_loss] Using TripletX loss (no external normalization).")
@@ -198,25 +183,50 @@ def make_loss(cfg, num_classes):
 
     def loss_func(score, feat, target, camids=None, z_supcon=None, epoch=None, feat_bn=None):
         total = 0.0
-        if id_w > 0:
-            ce = xent(score, target) if xent else F.cross_entropy(score, target)
-            total += id_w * ce
 
+        # ---- CE / ID loss (baseline-safe list handling) ----
+        if id_w > 0:
+            if isinstance(score, list):
+                if xent is not None:
+                    id_list = [xent(s, target) for s in score[1:]] if len(score) > 1 else []
+                    head0   = xent(score[0], target)
+                else:
+                    id_list = [F.cross_entropy(s, target) for s in score[1:]] if len(score) > 1 else []
+                    head0   = F.cross_entropy(score[0], target)
+                ID_LOSS = 0.5 * (_safe_mean(id_list) + head0)
+            else:
+                ID_LOSS = xent(score, target) if xent else F.cross_entropy(score, target)
+            total += id_w * ID_LOSS
+
+        # ---- Prepare feature sources ----
         global_pre_bn, bnneck = _unpack_feats_for_sources(feat, feat_bn)
 
-        # Triplet / TripletX (no F.normalize)
+        # ---- Triplet / TripletX (baseline-safe list handling; no external L2) ----
         if triplet is not None and tri_w > 0:
-            tri_in = _pick_by_src_with_fallback(tri_src_tripletx, global_pre_bn, bnneck, _warn_once_tri, "Triplet")
-            TRI_LOSS = _reduce_triplet_output(triplet(tri_in, target, camids=camids, epoch=epoch))
+            if isinstance(feat, list):
+                tri_list = [_reduce_triplet_output(triplet(f, target, camids=camids, epoch=epoch))
+                            for f in (feat[1:] if len(feat) > 1 else [])]
+                tri0     = _reduce_triplet_output(triplet(feat[0], target, camids=camids, epoch=epoch))
+                TRI_LOSS = 0.5 * (_safe_mean(tri_list) + tri0)
+            else:
+                # choose correct FEAT_SRC depending on whether TripletX is used
+                tri_src = tri_src_tripletx if use_tx else tri_src_triplet
+                tri_in  = _pick_by_src_with_fallback(tri_src, global_pre_bn, bnneck, _warn_once_tri, "Triplet")
+                # call with fallbacks for implementations not accepting camids/epoch
+                try:
+                    TRI_LOSS = _reduce_triplet_output(triplet(tri_in, target, camids=camids, epoch=epoch))
+                except TypeError:
+                    try:
+                        TRI_LOSS = _reduce_triplet_output(triplet(tri_in, target, camids=camids))
+                    except TypeError:
+                        TRI_LOSS = _reduce_triplet_output(triplet(tri_in, target))
             total += tri_w * TRI_LOSS
 
-        # SupCon (no F.normalize, handled internally)
+        # ---- SupCon (kept for compatibility; disabled in your baseline run) ----
         if supcon_enabled and supcon_w > 0:
-            if z_supcon is not None:
-                z = z_supcon
-            else:
-                z = _pick_by_src_with_fallback(sup_src, global_pre_bn, bnneck, _warn_once_sup, "SupCon")
+            z = z_supcon if (z_supcon is not None) else _pick_by_src_with_fallback(sup_src, global_pre_bn, bnneck, _warn_once_sup, "SupCon")
             total += supcon_w * supcon_criterion(z, target, camids)
+
         return total
 
     return loss_func, center_criterion
