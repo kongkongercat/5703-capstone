@@ -13,7 +13,8 @@
 #   - Auto-tag log folders with date-time (YYYYMMDD_HHMM)
 # [2025-10-12 | Hang Zhang] Unify naming to:
 #   veri776_b0_baseline_<DATE_TAG>_seed<seed>_deit_{run|test}
-#   Disable in-training eval (EVAL_PERIOD=0) to avoid duplicate test dirs
+# [2025-10-18 | Hang Zhang] Make --save-every dynamic for checkpoints
+#   and sync SOLVER.EVAL_PERIOD to avoid ZeroDivisionError
 # ===========================================================
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ DEFAULT_SAVE_EVERY = 1
 def parse_args():
     parser = argparse.ArgumentParser(description="B0 Baseline Launcher")
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS, help="Total training epochs")
-    parser.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY, help="Checkpoint save frequency")
+    parser.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY, help="Checkpoint save frequency (epochs)")
     parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS, help="List of seeds")
     return parser.parse_args()
 
@@ -173,7 +174,6 @@ def pick_eval_device() -> str:
 
 # ----- Eval missing (unified naming: date first, then seed) -----
 def eval_missing_epochs_via_test_py(tag: str, config_path: str, log_root: Path):
-    # tag = f"b0_baseline_{DATE_TAG}_seed{seed}"
     run_dir  = log_root / f"veri776_{tag}_deit_run"
     test_dir = log_root / f"veri776_{tag}_deit_test"
     test_dir.mkdir(parents=True, exist_ok=True)
@@ -206,14 +206,15 @@ def eval_missing_epochs_via_test_py(tag: str, config_path: str, log_root: Path):
 
 # ----- Training runner (unified naming) -----
 def ensure_full_run(seed: int, epochs: int, save_every: int, log_root: Path) -> Optional[Dict[str, Any]]:
-    # Unify naming to match training script output:
-    # veri776_b0_baseline_<DATE_TAG>_seed<seed>_deit_{run|test}
     tag = f"b0_baseline_{DATE_TAG}_seed{seed}"
     run_dir  = log_root / f"veri776_{tag}_deit_run"
     test_dir = log_root / f"veri776_{tag}_deit_test"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[B0] Training seed={seed}, total={epochs}, save every={save_every}")
+
+    # Sync EVAL_PERIOD with save_every to avoid ZeroDivisionError inside the trainer
+    eval_every = max(1, int(save_every))
 
     cmd = [
         sys.executable, "run_modelB_deit.py",
@@ -222,10 +223,10 @@ def ensure_full_run(seed: int, epochs: int, save_every: int, log_root: Path) -> 
         "SOLVER.MAX_EPOCHS", str(epochs),
         "SOLVER.SEED", str(seed),
         "SOLVER.CHECKPOINT_PERIOD", str(save_every),
-        "SOLVER.EVAL_PERIOD", "0",  # disable in-training eval; test after training only
+        "SOLVER.EVAL_PERIOD", str(eval_every),
         "DATASETS.ROOT_DIR", DATA_ROOT,
         "OUTPUT_DIR", str(log_root),
-        "TAG", f"b0_baseline_{DATE_TAG}",  # training script will form ..._<DATE_TAG>_seed<seed>_...
+        "TAG", f"b0_baseline_{DATE_TAG}",
     ]
     print("[B0][train] Launch:", " ".join(cmd))
     subprocess.check_call(cmd)
