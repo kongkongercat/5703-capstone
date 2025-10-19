@@ -1,0 +1,29 @@
+MODEL:
+  TRANSFORMER_TYPE: 'deit_base_distilled_patch16_224_TransReID'  # ← updated
+  PRETRAIN_CHOICE: 'imagenet'
+  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
+  NAME: 'transformer'
+  STRIDE_SIZE: [12, 12]
+  SIE_CAMERA: True
+  SIE_VIEW: True
+  SIE_COE: 3.0
+  JPM: True
+  SHIFT_NUM: 8
+  RE_ARRANGE: True
+
+  METRIC_LOSS_TYPE: 'triplet'
+  NO_MARGIN: True
+  IF_LABELSMOOTH: 'off'
+  IF_WITH_CENTER: 'no'
+  ID_LOSS_WEIGHT: 1.0
+  TRIPLET_LOSS_WEIGHT: 1.0
+
+LOSS:
+  PHASED:
+    ENABLE: False
+
+  TRIPLET:
+    FEAT_SRC: 'bnneck'
+
+  SUPCON:
+    ENABLE: False
