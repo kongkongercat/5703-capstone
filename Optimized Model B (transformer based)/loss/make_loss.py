@@ -216,12 +216,19 @@ def make_loss(cfg, num_classes):
             and bool(getattr(cfg.LOSS.TRIPLETX, "ENABLE", False))
         )
         if use_tx:
+            # NEW: TripletX 内部归一化由配置控制；缺省 True（与 TripletLossX 默认一致）
+            normalize_feature = bool(getattr(cfg.LOSS.TRIPLETX, "NORM_FEAT", True))
+            k_value = int(getattr(cfg.LOSS.TRIPLETX, "K", 4))
+
             triplet = TripletXLoss(
                 margin=_to_float(getattr(cfg.LOSS.TRIPLETX, "MARGIN", 0.3)),
-                normalize_feature=False,   # ext_L2=off
-                k=int(getattr(cfg.LOSS.TRIPLETX, "K", 4)),
+                normalize_feature=normalize_feature,   # False => 关闭 TripletX 内部 L2；True => 启用 TripletX 内部 L2
+                k=k_value,
             )
-            print("[make_loss] Using TripletX loss (no external normalization).")
+            print(
+                "[make_loss] Using TripletX loss "
+                f"(normalize_feature={normalize_feature}, k={k_value}; ext_L2=off)"
+            )
         else:
             if bool(getattr(cfg.MODEL, "NO_MARGIN", False)):
                 triplet = TripletLoss()
