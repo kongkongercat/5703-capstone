@@ -1,3 +1,4 @@
+# processor/processor.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -13,6 +14,12 @@
 #   - Simplify logs (no separate "SupCon+" piece) to avoid double counting. # [NEW]
 # [2025-10-14 | Hang Zhang] Epoch-aware PK-sampler K: rebuild train_loader at phase boundaries.
 #                           from datasets import make_dataloader
+# [2025-10-19 | Team 5703]  **Make phased boundary configurable & random-sampler guard**
+#   - _tripletx_stage(epoch,cfg) reads cfg.LOSS.PHASED.TRIPLETX_END instead of hard-coded 30.
+#   - When DATALOADER.SAMPLER=='random', skip PK-K rebuild (no P×K semantics).               # [NEW]
+# [2025-10-19 | Team 5703]  **Pass BNNeck feature into loss_func & safe acc**
+#   - Forward path unpacks (score, feat, feat_bn, z_supcon) and passes feat_bn to loss_func.  # [NEW]
+#   - When score is None (e.g., SupCon-only), accuracy metric is safely set to 0.            # [NEW]
 # =============================================================================
 
 import os
@@ -98,9 +105,10 @@ def _phased_pk_enabled(cfg) -> bool:
     )
 
 
-def _tripletx_stage(epoch: int) -> bool:
-    """[NEW] TripletX active only in Stage A (epoch <= 30)."""
-    return int(epoch) <= 30
+def _tripletx_stage(epoch: int, cfg) -> bool:
+    """[NEW] TripletX active only in Stage A (epoch <= cfg.LOSS.PHASED.TRIPLETX_END)."""
+    tripletx_end = int(getattr(cfg.LOSS.PHASED, "TRIPLETX_END", 30))
+    return int(epoch) <= tripletx_end
 
 
 def _desired_pk_k(epoch: int, cfg) -> int:
@@ -114,10 +122,14 @@ def _desired_pk_k(epoch: int, cfg) -> int:
     return int(
         getattr(
             cfg.DATALOADER.PHASED,
-            "K_WHEN_TRIPLETX" if _tripletx_stage(epoch) else "K_OTHER",
-            8 if _tripletx_stage(epoch) else 4,
+            "K_WHEN_TRIPLETX" if _tripletx_stage(epoch, cfg) else "K_OTHER",
+            8 if _tripletx_stage(epoch, cfg) else 4,
         )
     )
+
+def _sampler_is_random(cfg) -> bool:
+    """[NEW] Whether SAMPLER is 'random' (SupCon-only / SSL)."""
+    return str(getattr(cfg.DATALOADER, "SAMPLER", "softmax_triplet")).lower() == "random"
 
 
 def do_train(
@@ -154,8 +166,9 @@ def do_train(
           according to the current epoch (phased schedule).                                           # [NEW]
     - PK-sampler K scheduling:
         * If enabled (LOSS.PHASED & DATALOADER.PHASED), rebuild train_loader at epoch boundaries:
-          - A-stage (epoch <= 30): K=8
-          - B/C-stage (epoch > 30): K=4
+          - A-stage (epoch <= TRIPLETX_END): K=cfg.DATALOADER.PHASED.K_WHEN_TRIPLETX
+          - B/C-stage (epoch > TRIPLETX_END): K=cfg.DATALOADER.PHASED.K_OTHER
+        * When SAMPLER=='random', skip PK-K switching (no P×K semantics).                             # [NEW]
     """
 
     logger = logging.getLogger("transreid.train")
@@ -202,23 +215,24 @@ def do_train(
     for epoch in range(start_epoch, start_epoch + epochs_this_run):
 
         # ----- Epoch-aware PK-sampler K switch (rebuild train_loader) -----           # [NEW]
-        desired_K = _desired_pk_k(epoch, cfg)
-        if desired_K != current_K:
-            logging.getLogger("transreid.train").info(
-                f"[PK-sampler] Rebuilding train_loader: NUM_INSTANCE {current_K} → {desired_K} (epoch {epoch})"
-            )
-            cfg.defrost()
-            cfg.DATALOADER.NUM_INSTANCE = desired_K
-            # Rebuild only train_loader; keep val_loader unchanged
-            (train_loader,
-             _train_loader_normal,
-             _val_loader,
-             _num_query,
-             _num_classes,
-             _camera_num,
-             _view_num) = make_dataloader(cfg)
-            cfg.freeze()
-            current_K = desired_K
+        if not _sampler_is_random(cfg):
+            desired_K = _desired_pk_k(epoch, cfg)
+            if desired_K != current_K:
+                logging.getLogger("transreid.train").info(
+                    f"[PK-sampler] Rebuilding train_loader: NUM_INSTANCE {current_K} → {desired_K} (epoch {epoch})"
+                )
+                cfg.defrost()
+                cfg.DATALOADER.NUM_INSTANCE = desired_K
+                # Rebuild only train_loader; keep val_loader unchanged
+                (train_loader,
+                 _train_loader_normal,
+                 _val_loader,
+                 _num_query,
+                 _num_classes,
+                 _camera_num,
+                 _view_num) = make_dataloader(cfg)
+                cfg.freeze()
+                current_K = desired_K
 
         start_time = time.time()
         loss_meter.reset()
@@ -272,18 +286,23 @@ def do_train(
                 # Init containers
                 score = None
                 feat = None
+                feat_bn = None
                 z_supcon = None
 
                 # Unpack by type/length safely
                 if isinstance(out, (tuple, list)):
-                    if len(out) == 3:
-                        maybe_scores, maybe_feats, z_supcon = out
-                        score, feat = maybe_scores, maybe_feats
+                    if len(out) >= 4:
+                        # (scores, global_feat or feats, feat_bn, z_supcon)
+                        score, maybe_feats, feat_bn, z_supcon = out[0], out[1], out[2], out[3]
+                        feat = maybe_feats
+                    elif len(out) == 3:
+                        score, maybe_feats, z_supcon = out
+                        feat = maybe_feats
                     elif len(out) == 2:
                         score, feat = out
                     else:
                         score = out[0]
-                        feat = out[1] if len(out) > 1 else None
+                        feat = out[1] if len(out) > 1 else out[0]
                         z_supcon = out[2] if len(out) > 2 else None
                 else:
                     score = out
@@ -297,6 +316,7 @@ def do_train(
                     camids=camids,       # TripletX/SupCon need camera ids
                     z_supcon=z_supcon,   # may be None; make_loss will fallback to feat
                     epoch=epoch,         # critical: enable phased scheduling
+                    feat_bn=feat_bn,     # BNNeck feature routing for losses that request bnneck
                 )
 
             # Backward & step with AMP
@@ -311,11 +331,13 @@ def do_train(
                 scaler.step(optimizer_center)
                 scaler.update()
 
-            # Accuracy (use first branch if multi-head)
+            # Accuracy (use first branch if multi-head); safe when score is None (SupCon-only)
             if isinstance(score, list):
                 acc = (score[0].max(1)[1] == target).float().mean()
-            else:
+            elif score is not None and hasattr(score, "max"):
                 acc = (score.max(1)[1] == target).float().mean()
+            else:
+                acc = torch.tensor(0.0, device=device)
 
             loss_meter.update(float(loss.item()), img.shape[0])
             acc_meter.update(float(acc), 1)

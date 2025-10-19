@@ -1,7 +1,7 @@
 # ==========================================
 # Model B (TransReID + DeiT + official stride)
 # B2 (Phased Loss): TripletX → Triplet across stages; SupCon still injected by the runner
-# File: deit_transreid_stride_b2_phased_loss.yml
+# File: deit_transreid_stride_phased_loss.yml
 # Based on: deit_transreid_stride_b2_supcon_tripletx.yml
 #
 # Change Log

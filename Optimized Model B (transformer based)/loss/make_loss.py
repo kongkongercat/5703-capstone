@@ -86,6 +86,11 @@
 #                           - Metric combo logs：TripletX/Triplet 一次性打印，ext_L2=off，BNNeck 缺失只在需要时警告一次
 # [2025-10-19 | liaoxingyu] **Dynamic metric combo logging on phase switch**
 #                           - 新增 metric_last 机制：当 TripletX ↔ Triplet 切换时，自动重新打印当前 Metric 组合日志
+# [2025-10-20 | Team 5703]  **All-config support without regressions**
+#                           - Keep phased gating (PHASED.ENABLE=True) to avoid affecting baseline.
+#                           - Add SupCon weight scheduling via W0/DECAY_* (linear/const/exp) under phased mode.
+#                           - Sampler-aware gating: sampler=='random' → disable Triplet/TripletX (SupCon-only).
+#                           - Preserve all previous logs/behaviors and BNNeck fallback once-warn.
 # ==========================================
 
 import torch
@@ -161,7 +166,7 @@ def _pick_by_src_with_fallback(src, global_pre_bn, bnneck_feat, once_flag, warn_
 # Factory
 # ------------------------------
 def make_loss(cfg, num_classes):
-    sampler = cfg.DATALOADER.SAMPLER
+    sampler = str(getattr(cfg.DATALOADER, "SAMPLER", "softmax_triplet")).lower()
     feat_dim = 2048
     use_gpu = torch.cuda.is_available()
     center_criterion = CenterLoss(num_classes=num_classes, feat_dim=feat_dim, use_gpu=use_gpu)
@@ -180,17 +185,18 @@ def make_loss(cfg, num_classes):
     # ---- SupCon (optional; may be disabled in baseline) ----
     supcon_criterion = None
     supcon_enabled = False
-    supcon_w = 0.0
+    supcon_w_static = _to_float(getattr(cfg.LOSS.SUPCON, "W", 0.0))  # static W
+    supcon_T = _to_float(getattr(cfg.LOSS.SUPCON, "T", 0.07))
+    sup_src = str(getattr(getattr(cfg.LOSS, "SUPCON", {}), "FEAT_SRC", "bnneck")).lower()
+
     if hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "SUPCON") and bool(getattr(cfg.LOSS.SUPCON, "ENABLE", False)):
-        supcon_criterion = SupConLoss(temperature=_to_float(getattr(cfg.LOSS.SUPCON, "T", 0.07)))
-        supcon_w = _to_float(getattr(cfg.LOSS.SUPCON, "W", 0.0))
+        supcon_criterion = SupConLoss(temperature=supcon_T)
         supcon_enabled = True
-        print(f"[make_loss] SupCon enabled: W={supcon_w}, T={getattr(cfg.LOSS.SUPCON, 'T', 0.07)}")
+        print(f"[make_loss] SupCon enabled: W={supcon_w_static}, T={getattr(cfg.LOSS.SUPCON, 'T', 0.07)}")
 
     # ---- Feature sources (defaults) ----
     tri_src_triplet  = str(getattr(getattr(cfg.LOSS, "TRIPLET", {}),  "FEAT_SRC", "pre_bn")).lower()
     tri_src_tripletx = str(getattr(getattr(cfg.LOSS, "TRIPLETX", {}), "FEAT_SRC", "pre_bn")).lower()
-    sup_src          = str(getattr(getattr(cfg.LOSS, "SUPCON", {}),   "FEAT_SRC", "bnneck")).lower()
     print("[make_loss][init] Triplet  src:", tri_src_triplet)
     print("[make_loss][init] TripletX src:", tri_src_tripletx)
     print("[make_loss][init] SupCon   src:", sup_src)
@@ -201,7 +207,7 @@ def make_loss(cfg, num_classes):
     # ---- One-time combo log states ----
     _combo_logged = {
         "metric": False,          # kept for backward compatibility; not strictly needed now
-        "metric_last": None,      # <— NEW: for dynamic re-log on switch
+        "metric_last": None,      # for dynamic re-log on switch
         "supcon_model": False,
         "supcon_cfg": False,
     }
@@ -216,13 +222,11 @@ def make_loss(cfg, num_classes):
             and bool(getattr(cfg.LOSS.TRIPLETX, "ENABLE", False))
         )
         if use_tx:
-            # NEW: TripletX 内部归一化由配置控制；缺省 True（与 TripletLossX 默认一致）
             normalize_feature = bool(getattr(cfg.LOSS.TRIPLETX, "NORM_FEAT", True))
             k_value = int(getattr(cfg.LOSS.TRIPLETX, "K", 4))
-
             triplet = TripletXLoss(
                 margin=_to_float(getattr(cfg.LOSS.TRIPLETX, "MARGIN", 0.3)),
-                normalize_feature=normalize_feature,   # False => 关闭 TripletX 内部 L2；True => 启用 TripletX 内部 L2
+                normalize_feature=normalize_feature,
                 k=k_value,
             )
             print(
@@ -236,6 +240,38 @@ def make_loss(cfg, num_classes):
             else:
                 triplet = TripletLoss(_to_float(getattr(cfg.SOLVER, "MARGIN", 0.3)))
                 print(f"[make_loss] Using standard Triplet loss (margin={getattr(cfg.SOLVER, 'MARGIN', 0.3)})")
+
+    # ---- Phased-loss switches (guarded) ----
+    phased_on = (
+        hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "PHASED")
+        and bool(getattr(cfg.LOSS.PHASED, "ENABLE", False))
+    )
+    tripletx_end = int(getattr(cfg.LOSS.PHASED, "TRIPLETX_END", 30))  # used only when phased_on
+
+    # ---- SupCon scheduling (guarded by phased flag to avoid baseline regression)
+    sup_w0     = _to_float(getattr(cfg.LOSS.SUPCON, "W0", supcon_w_static))
+    decay_type = str(getattr(cfg.LOSS.SUPCON, "DECAY_TYPE", "linear")).lower()
+    decay_st   = int(getattr(cfg.LOSS.SUPCON, "DECAY_START", 0))
+    decay_ed   = int(getattr(cfg.LOSS.SUPCON, "DECAY_END", getattr(cfg.SOLVER, "MAX_EPOCHS", 120)))
+
+    def _supcon_weight_by_epoch(epoch: int) -> float:
+        """Return effective SupCon weight at epoch (guarded by phased_on)."""
+        if not (phased_on and (epoch is not None)):
+            return supcon_w_static  # static W (backward-compatible)
+        if decay_type == "linear":
+            if epoch <= decay_st: return max(0.0, sup_w0)
+            if epoch >= decay_ed: return 0.0
+            frac = float(epoch - decay_st) / float(max(decay_ed - decay_st, 1))
+            return max(0.0, sup_w0 * (1.0 - frac))
+        elif decay_type == "const":
+            return max(0.0, sup_w0)
+        elif decay_type == "exp":
+            # 简单指数衰减（可按需替换具体公式）
+            if epoch < decay_st: return max(0.0, sup_w0)
+            import math
+            return max(0.0, sup_w0 * math.exp(-0.05 * (epoch - decay_st)))
+        # fallback
+        return max(0.0, sup_w0)
 
     # -----------------------------
     # Loss function
@@ -260,22 +296,26 @@ def make_loss(cfg, num_classes):
         # ---- Prepare feature sources ----
         global_pre_bn, bnneck = _unpack_feats_for_sources(feat, feat_bn)
 
+        # ---- Decide TripletX vs Triplet for this step (guarded phased) ----
+        phase_use_tx = use_tx
+        if phased_on and (epoch is not None) and (TripletXLoss is not None):
+            # Only switch when TripletX path is available and phased mode is on
+            phase_use_tx = (int(epoch) <= int(tripletx_end))
+
         # ---- Metric / Triplet(X) ----
-        if triplet is not None and tri_w > 0:
-            # ===== Dynamic combo log: re-print when TripletX ↔ Triplet switches =====
-            current_metric = "TripletX" if use_tx else "Triplet"
+        # Sampler-aware gating: sampler=='random' → skip metric losses (SupCon-only/SSL)
+        if (sampler != "random") and (triplet is not None) and (tri_w > 0):
+            # dynamic combo log on switch
+            current_metric = "TripletX" if phase_use_tx else "Triplet"
             if _combo_logged.get("metric_last") != current_metric:
                 if isinstance(feat, list):
-                    # model provides multiple heads; we mark source as model::list_heads
                     print(f"[make_loss][combo] [Metric] {current_metric} src=model::list_heads | ext_L2=off")
                 else:
-                    chosen_src = (tri_src_tripletx if use_tx else tri_src_triplet)
+                    chosen_src = (tri_src_tripletx if phase_use_tx else tri_src_triplet)
                     maybe_fb = " | fallback=pre_bn_if_bnneck_missing" if chosen_src == "bnneck" else ""
                     print(f"[make_loss][combo] [Metric] {current_metric} src=cfg::{chosen_src}{maybe_fb} | ext_L2=off")
                 _combo_logged["metric_last"] = current_metric
-            # =======================================================================
 
-            # core to support TripletX(camids/epoch) and baseline Triplet(no extras)
             def _call_triplet_core(f):
                 try:
                     return _reduce_triplet_output(triplet(f, target, camids=camids, epoch=epoch))
@@ -290,27 +330,29 @@ def make_loss(cfg, num_classes):
                 tri0     = _call_triplet_core(feat[0])
                 TRI_LOSS = 0.5 * (_safe_mean(tri_list) + tri0)
             else:
-                tri_src = tri_src_tripletx if use_tx else tri_src_triplet
+                tri_src = tri_src_tripletx if phase_use_tx else tri_src_triplet
                 tri_in  = _pick_by_src_with_fallback(tri_src, global_pre_bn, bnneck, _warn_once_tri, "Triplet")
                 TRI_LOSS = _call_triplet_core(tri_in)
 
             total += tri_w * TRI_LOSS
 
         # ---- SupCon ----
-        if supcon_enabled and supcon_w > 0:
-            if z_supcon is not None:
-                if not _combo_logged["supcon_model"]:
-                    print("[make_loss][combo] [SupCon] src=model::(z_supcon) | loss_routing=off | L2 in SupConLoss")
-                    _combo_logged["supcon_model"] = True
-                z = z_supcon
-            else:
-                if not _combo_logged["supcon_cfg"]:
-                    maybe_fb = " | fallback=pre_bn_if_bnneck_missing" if sup_src == "bnneck" else ""
-                    print(f"[make_loss][combo] [SupCon] src=cfg::{sup_src} | loss_routing=on{maybe_fb} | L2 in SupConLoss")
-                    _combo_logged["supcon_cfg"] = True
-                z = _pick_by_src_with_fallback(sup_src, global_pre_bn, bnneck, _warn_once_sup, "SupCon")
+        if supcon_enabled:
+            eff_w = _supcon_weight_by_epoch(epoch)
+            if eff_w > 0.0:
+                if z_supcon is not None:
+                    if not _combo_logged["supcon_model"]:
+                        print("[make_loss][combo] [SupCon] src=model::(z_supcon) | loss_routing=off | L2 in SupConLoss")
+                        _combo_logged["supcon_model"] = True
+                    z = z_supcon
+                else:
+                    if not _combo_logged["supcon_cfg"]:
+                        maybe_fb = " | fallback=pre_bn_if_bnneck_missing" if sup_src == "bnneck" else ""
+                        print(f"[make_loss][combo] [SupCon] src=cfg::{sup_src} | loss_routing=on{maybe_fb} | L2 in SupConLoss")
+                        _combo_logged["supcon_cfg"] = True
+                    z = _pick_by_src_with_fallback(sup_src, global_pre_bn, bnneck, _warn_once_sup, "SupCon")
 
-            total += supcon_w * supcon_criterion(z, target, camids)
+                total += eff_w * supcon_criterion(z, target, camids)
 
         return total
 

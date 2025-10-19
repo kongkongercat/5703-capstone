@@ -1,3 +1,4 @@
+# defaults.py
 from yacs.config import CfgNode as CN
 
 # -----------------------------------------------------------------------------
@@ -24,6 +25,9 @@ from yacs.config import CfgNode as CN
 # [2025-10-19 | Hang Zhang] **Remove dynamic CE source key**:
 #                           - Deleted LOSS.CE.FEAT_SRC; CE always uses classifier logits (score).
 #                           - Any YAML/CLI setting for CE.FEAT_SRC is no longer supported/needed.
+# [2025-10-19 | Team 5703]  **Add phased keys used by make_loss**:
+#                           - LOSS.PHASED.TRIPLETX_END (epoch boundary for TripletX→Triplet).
+#                           - LOSS.SUPCON.W0 / DECAY_TYPE / DECAY_START / DECAY_END (epoch-aware SupCon).
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
@@ -118,6 +122,11 @@ _C.LOSS.SUPCON.CAM_AWARE = False
 _C.LOSS.SUPCON.POS_RULE = "class"
 # Which feature branch to use for SupCon: ['bnneck', 'pre_bn', 'backbone']
 _C.LOSS.SUPCON.FEAT_SRC = 'bnneck'
+# Epoch-aware SupCon scheduling (used by make_loss when PHASED.ENABLE=True)
+_C.LOSS.SUPCON.W0 = 0.30
+_C.LOSS.SUPCON.DECAY_TYPE = "linear"  # ["linear","const","exp"]
+_C.LOSS.SUPCON.DECAY_START = 30
+_C.LOSS.SUPCON.DECAY_END = 60
 
 # Grid for B1 auto search
 _C.LOSS.SUPCON.SEARCH = CN()
@@ -138,6 +147,8 @@ _C.LOSS.PHASED.METRIC_SEQ   = ['tripletx', 'triplet', 'triplet']
 _C.LOSS.PHASED.W_METRIC_SEQ = [1.2, 1.0, 1.0]
 # SupCon weight spec per phase: 'const:x' or 'linear:x->y' (linear interpolation within phase)
 _C.LOSS.PHASED.W_SUP_SPEC   = ['const:0.30', 'linear:0.30->0.15', 'const:0.0']
+# Simple boundary used by current make_loss implementation
+_C.LOSS.PHASED.TRIPLETX_END = 30
 
 # -----------------------------------------------------------------------------
 # INPUT / AUGMENTATION

@@ -1,3 +1,4 @@
+# modeling/make_model.py
 # encoding: utf-8
 """
 @author:  liaoxingyu
@@ -63,6 +64,9 @@ from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 #                                       - On first forward that builds z_supcon, print:
 #                                         "[make_model][combo] [SupCon] src=model::<pre_bn|bnneck> | head=2xLinear(->128) | output=UN-normalized (L2 in SupConLoss)"
 #                                       - No behavior change; only logging for clarity.
+# [2025-10-19 | Team 5703]            **Classification head label passing fix**
+#                                       - For margin-softmax heads (arcface/cosface/amsoftmax/circle),
+#                                         always pass `label` to classifier; Linear head does not.   # [NEW]
 # =============================================================================
 
 
@@ -182,7 +186,8 @@ class Backbone(nn.Module):
 
     def forward(self, x, label=None):
         x = self.base(x)
-        global_feat = F.avg_pool2d(x, x.shape[2:4]).view(x.size(0), -1)
+        # Use the module gap (style consistency)
+        global_feat = self.gap(x).view(x.size(0), -1)
         feat = global_feat if self.neck == 'no' else self.bottleneck(global_feat)
 
         z_supcon = None
@@ -196,7 +201,11 @@ class Backbone(nn.Module):
             z_supcon = self.supcon_head(sup_in)
 
         if self.training:
-            cls_score = self.classifier(feat, label) if self.cos_layer else self.classifier(feat)
+            # Always pass label for margin-softmax heads; Linear head does not need label.     # [FIX]
+            if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
+                cls_score = self.classifier(feat, label)
+            else:
+                cls_score = self.classifier(feat)
             return cls_score, global_feat, feat, z_supcon
         else:
             return feat if self.neck_feat == 'after' else global_feat
@@ -291,7 +300,11 @@ class build_transformer(nn.Module):
             z_supcon = self.supcon_head(sup_in)
 
         if self.training:
-            cls_score = self.classifier(feat, label) if self.cos_layer else self.classifier(feat)
+            # Always pass label for margin-softmax heads; Linear head does not need label.     # [FIX]
+            if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
+                cls_score = self.classifier(feat, label)
+            else:
+                cls_score = self.classifier(feat)
             return cls_score, global_feat, feat, z_supcon
         else:
             return feat if self.neck_feat == 'after' else global_feat
@@ -371,7 +384,6 @@ class build_transformer_local(nn.Module):
         self.bottleneck_2.bias.requires_grad_(False)
         self.bottleneck_2.apply(weights_init_kaiming)
         self.bottleneck_3 = nn.BatchNorm1d(self.in_planes)
-        self.bottleneck_3.bias.requires_grad_(False)
         self.bottleneck_4 = nn.BatchNorm1d(self.in_planes)
         self.bottleneck_4.bias.requires_grad_(False)
         self.bottleneck_4.apply(weights_init_kaiming)
