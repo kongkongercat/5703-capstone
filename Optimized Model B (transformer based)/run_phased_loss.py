@@ -15,6 +15,7 @@
 #                                   provide safe defaults and CLI overrides; graceful fallback if json missing.
 # [2025-10-19 | Hang Zhang] [MOD] Baseline-first defaults: mode=baseline, config points to baseline yaml by default.
 # [2025-10-19 | Hang Zhang] [MOD] Keep original behavior intact unless user opts in via CLI.
+# [2025-10-20 | Hang Zhang] [NEW] --train-only flag (alias for --no-test); disables eval during training.
 # =============================================================================
 
 from __future__ import annotations
@@ -24,8 +25,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 
 # ---- User-configurable defaults ----
-# [MOD] default to a baseline config; phased config can still be passed via --config
-DEFAULT_CONFIG = "configs/VeRi/deit_transreid_stride_baseline.yml"    # [MOD] default baseline yaml
+DEFAULT_CONFIG = "configs/VeiRi/deit_transreid_stride_baseline.yml"  # note: will be overridden by --config
 FULL_EPOCHS    = 120
 SEEDS          = [0, 1, 2]
 
@@ -65,9 +65,12 @@ def detect_data_root() -> str:
 DATA_ROOT = detect_data_root()
 print(f"[phased_loss] Using DATASETS.ROOT_DIR={DATA_ROOT}")
 
-def _fmt(v: float) -> str: return str(v).replace(".", "p")
+def _fmt(v: float) -> str:
+    return str(v).replace(".", "p")
+
 def _re_pick(text: str, pat: str) -> float:
-    m = re.search(pat, text, re.I); return float(m.group(1)) if m else -1.0
+    m = re.search(pat, text, re.I)
+    return float(m.group(1)) if m else -1.0
 
 def parse_metrics_from_epoch_dir(epoch_dir: Path) -> Tuple[float, float, float, float]:
     sj = epoch_dir / "summary.json"
@@ -100,7 +103,8 @@ def pick_best_epoch_metrics(test_dir: Path) -> Optional[Dict[str, Any]]:
     for ep in epochs:
         ep_idx = int(ep.name.split("_")[-1])
         mAP, r1, r5, r10 = parse_metrics_from_epoch_dir(ep)
-        if mAP < 0: continue
+        if mAP < 0:
+            continue
         key = (mAP, r1)
         if (best_key is None) or (key > best_key):
             best_key = key
@@ -108,11 +112,19 @@ def pick_best_epoch_metrics(test_dir: Path) -> Optional[Dict[str, Any]]:
     return best
 
 def safe_mean(vals: List[float]) -> float:
-    valid = [v for v in vals if v >= 0]; return round(stats.mean(valid), 4) if valid else -1.0
+    valid = [v for v in vals if v >= 0]
+    return round(stats.mean(valid), 4) if valid else -1.0
+
 def safe_stdev(vals: List[float]) -> float:
-    valid = [v for v in vals if v >= 0]; return round(stats.stdev(valid), 4) if len(valid) >= 2 else 0.0
+    valid = [v for v in vals if v >= 0]
+    return round(stats.stdev(valid), 4) if len(valid) >= 2 else 0.0
+
 def parse_seeds(arg_list: List[str]) -> List[int]:
-    flat = []; [flat.append(x) for a in arg_list for x in a.split(",") if x.strip()]
+    flat: List[str] = []
+    for a in arg_list:
+        for x in a.split(","):
+            if x.strip():
+                flat.append(x)
     return [int(x) for x in flat]
 
 # -----------------------------------------------------------------------------
@@ -124,6 +136,10 @@ def build_cli() -> argparse.Namespace:
     p.add_argument("--test", dest="test", action="store_true")
     p.add_argument("--no-test", dest="test", action="store_false")
     p.set_defaults(test=True)
+
+    # train-only alias
+    p.add_argument("--train-only", dest="train_only", action="store_true",
+                   help="Train only: skip all testing/evaluation runs.")
 
     # core
     p.add_argument("--epochs", type=int, default=FULL_EPOCHS)
@@ -137,27 +153,27 @@ def build_cli() -> argparse.Namespace:
     p.add_argument("--ds-prefix", type=str, default="veri776",
                    help="Prefix for run/test dir naming")
 
-    # [MOD] toggles that used to be hard-coded
+    # toggles that used to be hard-coded
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--baseline", dest="mode", action="store_const", const="baseline",
                       help="Pure CE+Triplet baseline (no SupCon, no TripletX, no phased).")
     mode.add_argument("--phased", dest="mode", action="store_const", const="phased",
                       help="Enable phased-loss schedule (A/B/C).")
-    p.set_defaults(mode="baseline")  # [MOD] default baseline-first
+    p.set_defaults(mode="baseline")
 
     p.add_argument("--supcon", dest="supcon", action="store_true",
                    help="Enable SupCon (LOSS.SUPCON.ENABLE=True).")
     p.add_argument("--no-supcon", dest="supcon", action="store_false",
                    help="Disable SupCon.")
-    p.set_defaults(supcon=False)     # [MOD] default off
+    p.set_defaults(supcon=False)
 
     p.add_argument("--tripletx", dest="tripletx", action="store_true",
                    help="Enable TripletX (LOSS.TRIPLETX.ENABLE=True).")
     p.add_argument("--no-tripletx", dest="tripletx", action="store_false",
                    help="Disable TripletX.")
-    p.set_defaults(tripletx=False)   # [MOD] default off
+    p.set_defaults(tripletx=False)
 
-    # [MOD] SupCon params (CLI override or fallback if json missing)
+    # SupCon params (CLI override or fallback if json missing)
     p.add_argument("--T", type=float, default=None, help="SupCon temperature override.")
     p.add_argument("--W", type=float, default=None, help="SupCon weight override.")
 
@@ -172,19 +188,26 @@ def build_cli() -> argparse.Namespace:
 def _max_test_epoch(test_dir: Path) -> int:
     max_ep = 0
     for ep in test_dir.glob("epoch_*"):
-        if not ep.is_dir(): continue
-        try: idx = int(ep.name.split("_")[-1])
-        except: continue
+        if not ep.is_dir():
+            continue
+        try:
+            idx = int(ep.name.split("_")[-1])
+        except Exception:
+            continue
         for f in TEST_MARKER_FILES_DEFAULT:
-            if (ep / f).exists(): max_ep = max(max_ep, idx); break
+            if (ep / f).exists():
+                max_ep = max(max_ep, idx)
+                break
     return max_ep
 
 def _max_epoch_from_checkpoints(run_dir: Path) -> int:
     max_ep = 0
-    if not run_dir.exists(): return 0
+    if not run_dir.exists():
+        return 0
     for p in run_dir.glob("transformer_*.pth"):
         m = re.search(r"transformer_(\d+)\.pth", p.name)
-        if m: max_ep = max(max_ep, int(m.group(1)))
+        if m:
+            max_ep = max(max_ep, int(m.group(1)))
     return max_ep
 
 def eval_missing_epochs_via_test_py(tag: str, config: str, log_root: Path, ds_prefix: str):
@@ -194,12 +217,14 @@ def eval_missing_epochs_via_test_py(tag: str, config: str, log_root: Path, ds_pr
     ckpts = sorted(run_dir.glob("transformer_*.pth"),
                    key=lambda p: int(re.search(r"(\d+)", p.name).group(1)))
     if not ckpts:
-        print(f"[phased_loss][eval] No checkpoints under {run_dir}"); return
+        print(f"[phased_loss][eval] No checkpoints under {run_dir}")
+        return
     for ck in ckpts:
         ep = int(re.search(r"(\d+)", ck.name).group(1))
         out_ep = test_dir / f"epoch_{ep}"
         if any((out_ep / f).exists() for f in TEST_MARKER_FILES_DEFAULT):
-            print(f"[phased_loss][eval] Skip epoch {ep} (already tested)"); continue
+            print(f"[phased_loss][eval] Skip epoch {ep} (already tested)")
+            continue
         out_ep.mkdir(parents=True, exist_ok=True)
         cmd = [sys.executable, "test.py", "--config_file", config,
                "MODEL.DEVICE", "cuda",
@@ -227,24 +252,26 @@ def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root,
     if trained_max < epochs:
         eval_period = 0 if not test_enabled else save_every
 
-        # ---------------- Build CLI opts safely (no forced enables) ----------------  # [MOD]
-        opts = []
-        # phased schedule toggle (guarded in make_loss/processor by LOSS.PHASED.ENABLE)
+        # ---------------- Build CLI opts safely (no forced enables) ----------------
+        opts: List[str] = []
+
+        # phased schedule toggle
         if args.mode == "phased":
             opts += ["LOSS.PHASED.ENABLE", "True"]
         else:
             opts += ["LOSS.PHASED.ENABLE", "False"]
 
-        # SupCon toggle + params (only when enabled)
+        # SupCon toggle + params
         if args.supcon:
-            # enable SupCon
             opts += ["LOSS.SUPCON.ENABLE", "True"]
-            if T is not None: opts += ["LOSS.SUPCON.T", str(T)]
-            if W is not None: opts += ["LOSS.SUPCON.W", str(W)]
+            if T is not None:
+                opts += ["LOSS.SUPCON.T", str(T)]
+            if W is not None:
+                opts += ["LOSS.SUPCON.W", str(W)]
         else:
             opts += ["LOSS.SUPCON.ENABLE", "False"]
 
-        # TripletX toggle (TripletX path selection is also phase-aware in make_loss)
+        # TripletX toggle
         if args.tripletx:
             opts += ["LOSS.TRIPLETX.ENABLE", "True"]
         else:
@@ -265,7 +292,8 @@ def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root,
         ]
 
         # passthrough
-        if args.opts: opts += args.opts
+        if args.opts:
+            opts += args.opts
 
         cmd = [
             sys.executable, "run_modelB_deit.py",
@@ -277,6 +305,7 @@ def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root,
     if not test_enabled:
         print(f"[phased_loss] Seed {seed} training done (test skipped).")
         return None
+
     eval_missing_epochs_via_test_py(tag, args.config, log_root, args.ds_prefix)
     best_ep = pick_best_epoch_metrics(test_dir)
     if not best_ep:
@@ -290,12 +319,17 @@ def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root,
 # -----------------------------------------------------------------------------
 def main():
     args = build_cli()
+
+    # map --train-only to disabling test
+    if getattr(args, "train_only", False):
+        args.test = False
+
     log_root = pick_log_root(args.output_root)
     print(f"[phased_loss] Using log_root={log_root}")
     stamp = os.getenv("RUN_TAG_TL") or os.getenv("RUN_TAG_TS") or datetime.now().strftime("%Y%m%d-%H%M")
     print(f"[phased_loss] Using run timestamp: {stamp}")
 
-    # ---------------- SupCon T/W source of truth -------------------------------  # [MOD]
+    # SupCon T/W source of truth
     T, W = args.T, args.W
 
     # Read b1_supcon_best.json ONLY IF SupCon is enabled and no CLI override
@@ -323,10 +357,10 @@ def main():
             print(f"[phased_loss][info] SupCon json not found; fallback to T={T}, W={W}")
 
     seeds = parse_seeds(args.seeds)
-    seed_best = {}
+    seed_best: Dict[int, Dict[str, Any]] = {}
 
-    # ===== Auto-detect experiment name from config file =====
-    config_name = Path(args.config).stem  # e.g. "deit_transreid_stride_b2_phased_loss"
+    # Auto-detect experiment name from config file
+    config_name = Path(args.config).stem
     if "stride_" in config_name:
         exp_name = config_name.split("stride_")[-1]
     else:
@@ -334,7 +368,7 @@ def main():
     print(f"[phased_loss] Auto-detected experiment name: {exp_name}")
 
     # include mode/switches in tag base (for clarity)
-    mode_bits = []
+    mode_bits: List[str] = []
     mode_bits.append("base" if args.mode == "baseline" else "phased")
     mode_bits.append("sup" if args.supcon else "nosup")
     mode_bits.append("tx" if args.tripletx else "notx")
@@ -350,7 +384,8 @@ def main():
 
         rec = ensure_full_run_seed(T, W, s, args.epochs, args.save_every,
                                    log_root, args.test, tag_base, stamp, args=args)
-        if rec: seed_best[s] = rec
+        if rec:
+            seed_best[s] = rec
 
     if seed_best:
         summary = {
