@@ -81,6 +81,11 @@
 # [2025-10-19 | Hang Zhang]  **Remove unused helper & fix CE policy**
 #                           - Deleted unused _pick_z() helper.
 #                           - Explicit note: CE has no dynamic FEAT_SRC; always uses logits (score).
+# [2025-10-19 | liaoxingyu] **Accurate combo logs (model vs cfg sources)**
+#                           - SupCon combo logs: model::(z_supcon) vs cfg::<src>（按需附加 fallback 提示）
+#                           - Metric combo logs：TripletX/Triplet 一次性打印，ext_L2=off，BNNeck 缺失只在需要时警告一次
+# [2025-10-19 | liaoxingyu] **Dynamic metric combo logging on phase switch**
+#                           - 新增 metric_last 机制：当 TripletX ↔ Triplet 切换时，自动重新打印当前 Metric 组合日志
 # ==========================================
 
 import torch
@@ -132,15 +137,23 @@ def _unpack_feats_for_sources(feat, feat_bn):
 
 
 def _pick_by_src_with_fallback(src, global_pre_bn, bnneck_feat, once_flag, warn_tag):
-    """Return feature by FEAT_SRC with fallback warning."""
+    """
+    Return feature by FEAT_SRC with fallback warning (printed once) ONLY IF cfg picked 'bnneck'
+    but BNNeck tensor is missing from model/trainer.
+    """
     src = (src or "pre_bn").lower()
     if src == "bnneck":
         if isinstance(bnneck_feat, torch.Tensor):
             return bnneck_feat
         if not once_flag.get("warned", False):
-            print(f"[make_loss][warn] {warn_tag}: requested 'bnneck' but not provided, fallback to pre_bn.")
+            print(
+                f"[make_loss][warn] {warn_tag}: cfg requested FEAT_SRC='bnneck' but BNNeck tensor "
+                f"was not provided by model/trainer; falling back to 'pre_bn' for this batch. "
+                f"(This prints once.) Hint: pass `feat_bn` to loss_func or enable BNNeck in model."
+            )
             once_flag["warned"] = True
         return global_pre_bn
+    # src == 'pre_bn' → no warning
     return global_pre_bn
 
 
@@ -185,6 +198,14 @@ def make_loss(cfg, num_classes):
     _warn_once_tri = {"warned": False}
     _warn_once_sup = {"warned": False, "model_src_noted": False}
 
+    # ---- One-time combo log states ----
+    _combo_logged = {
+        "metric": False,          # kept for backward compatibility; not strictly needed now
+        "metric_last": None,      # <— NEW: for dynamic re-log on switch
+        "supcon_model": False,
+        "supcon_cfg": False,
+    }
+
     # ---- Metric loss selection ----
     triplet = None
     use_tx = False
@@ -197,12 +218,11 @@ def make_loss(cfg, num_classes):
         if use_tx:
             triplet = TripletXLoss(
                 margin=_to_float(getattr(cfg.LOSS.TRIPLETX, "MARGIN", 0.3)),
-                normalize_feature=False,   # no external normalization
+                normalize_feature=False,   # ext_L2=off
                 k=int(getattr(cfg.LOSS.TRIPLETX, "K", 4)),
             )
             print("[make_loss] Using TripletX loss (no external normalization).")
         else:
-            # baseline TripletLoss: (feat, target)
             if bool(getattr(cfg.MODEL, "NO_MARGIN", False)):
                 triplet = TripletLoss()
                 print("[make_loss] Using soft (no-margin) Triplet loss")
@@ -233,9 +253,22 @@ def make_loss(cfg, num_classes):
         # ---- Prepare feature sources ----
         global_pre_bn, bnneck = _unpack_feats_for_sources(feat, feat_bn)
 
-        # ---- Triplet / TripletX (baseline-safe list handling; no external L2) ----
+        # ---- Metric / Triplet(X) ----
         if triplet is not None and tri_w > 0:
-            # safe core to support TripletX(camids/epoch) and baseline Triplet(no extras)
+            # ===== Dynamic combo log: re-print when TripletX ↔ Triplet switches =====
+            current_metric = "TripletX" if use_tx else "Triplet"
+            if _combo_logged.get("metric_last") != current_metric:
+                if isinstance(feat, list):
+                    # model provides multiple heads; we mark source as model::list_heads
+                    print(f"[make_loss][combo] [Metric] {current_metric} src=model::list_heads | ext_L2=off")
+                else:
+                    chosen_src = (tri_src_tripletx if use_tx else tri_src_triplet)
+                    maybe_fb = " | fallback=pre_bn_if_bnneck_missing" if chosen_src == "bnneck" else ""
+                    print(f"[make_loss][combo] [Metric] {current_metric} src=cfg::{chosen_src}{maybe_fb} | ext_L2=off")
+                _combo_logged["metric_last"] = current_metric
+            # =======================================================================
+
+            # core to support TripletX(camids/epoch) and baseline Triplet(no extras)
             def _call_triplet_core(f):
                 try:
                     return _reduce_triplet_output(triplet(f, target, camids=camids, epoch=epoch))
@@ -256,9 +289,20 @@ def make_loss(cfg, num_classes):
 
             total += tri_w * TRI_LOSS
 
-        # ---- SupCon (kept for compatibility; often disabled in baseline) ----
+        # ---- SupCon ----
         if supcon_enabled and supcon_w > 0:
-            z = z_supcon if (z_supcon is not None) else _pick_by_src_with_fallback(sup_src, global_pre_bn, bnneck, _warn_once_sup, "SupCon")
+            if z_supcon is not None:
+                if not _combo_logged["supcon_model"]:
+                    print("[make_loss][combo] [SupCon] src=model::(z_supcon) | loss_routing=off | L2 in SupConLoss")
+                    _combo_logged["supcon_model"] = True
+                z = z_supcon
+            else:
+                if not _combo_logged["supcon_cfg"]:
+                    maybe_fb = " | fallback=pre_bn_if_bnneck_missing" if sup_src == "bnneck" else ""
+                    print(f"[make_loss][combo] [SupCon] src=cfg::{sup_src} | loss_routing=on{maybe_fb} | L2 in SupConLoss")
+                    _combo_logged["supcon_cfg"] = True
+                z = _pick_by_src_with_fallback(sup_src, global_pre_bn, bnneck, _warn_once_sup, "SupCon")
+
             total += supcon_w * supcon_criterion(z, target, camids)
 
         return total

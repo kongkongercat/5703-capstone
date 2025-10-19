@@ -1,3 +1,22 @@
+# encoding: utf-8
+"""
+@author:  liaoxingyu
+@contact: sherlockliao01@gmail.com
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import copy
+from .backbones.resnet import ResNet, Bottleneck
+from .backbones.vit_pytorch import (
+    vit_base_patch16_224_TransReID,
+    vit_small_patch16_224_TransReID,
+    deit_small_patch16_224_TransReID
+)
+from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
+
+
 # =============================================================================
 # File: make_model.py
 # Purpose: Build backbone/transformer/transformer_local models with optional
@@ -35,19 +54,16 @@
 #                                       - Added full classifier initialization for Arcface/Cosface/
 #                                         AMSoftmax/CircleLoss in Backbone to prevent AttributeError
 #                                         when COS_LAYER=True.
+# [2025-10-19 | Hang Zhang]            **Normalize-at-loss policy (SupCon)**
+#                                       - Removed F.normalize on z_supcon in all models.
+#                                       - SupCon head now outputs raw (unnormalized) embeddings.
+#                                       - L2-normalization is centralized in SupConLoss.forward().
+#                                       - Added one-time init log when SupCon head is enabled.
+# [2025-10-19 | liaoxingyu]           **Model-side SupCon source logging (once per model)**
+#                                       - On first forward that builds z_supcon, print:
+#                                         "[make_model][combo] [SupCon] src=model::<pre_bn|bnneck> | head=2xLinear(->128) | output=UN-normalized (L2 in SupConLoss)"
+#                                       - No behavior change; only logging for clarity.
 # =============================================================================
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import copy
-from .backbones.resnet import ResNet, Bottleneck
-from .backbones.vit_pytorch import (
-    vit_base_patch16_224_TransReID,
-    vit_small_patch16_224_TransReID,
-    deit_small_patch16_224_TransReID
-)
-from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 
 
 # ----------------------------- Utilities -------------------------------------
@@ -125,7 +141,7 @@ class Backbone(nn.Module):
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.num_classes = num_classes
 
-        # --- [2025-10-17] Add full classifier initialization for COS_LAYER ---
+        # --- COS_LAYER-aware classifier init ---
         self.ID_LOSS_TYPE = getattr(cfg.MODEL, "ID_LOSS_TYPE", "softmax")
         if self.ID_LOSS_TYPE == 'arcface':
             self.classifier = Arcface(self.in_planes, self.num_classes,
@@ -160,6 +176,9 @@ class Backbone(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(2048, 128)
             )
+            self._supcon_log_done = False  # once-per-model forward log
+            print("[make_model][init] SupCon head enabled (Backbone): output is UN-normalized; "
+                  "L2 normalization is handled in SupConLoss.")
 
     def forward(self, x, label=None):
         x = self.base(x)
@@ -169,7 +188,12 @@ class Backbone(nn.Module):
         z_supcon = None
         if self.training and self.supcon_enabled:
             sup_in = _pick_feat_by_src(self.supcon_feat_src, global_feat, feat)
-            z_supcon = F.normalize(self.supcon_head(sup_in), dim=1)
+            if not self._supcon_log_done:
+                print(f"[make_model][combo] [SupCon] src=model::{self.supcon_feat_src} "
+                      f"| head=2xLinear(->128) | output=UN-normalized (L2 in SupConLoss)")
+                self._supcon_log_done = True
+            # NOTE: normalization moved to SupConLoss; keep raw projection here.
+            z_supcon = self.supcon_head(sup_in)
 
         if self.training:
             cls_score = self.classifier(feat, label) if self.cos_layer else self.classifier(feat)
@@ -248,6 +272,9 @@ class build_transformer(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(2048, 128)
             )
+            self._supcon_log_done = False
+            print("[make_model][init] SupCon head enabled (Transformer): output is UN-normalized; "
+                  "L2 normalization is handled in SupConLoss.")
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
         global_feat = self.base(x, cam_label=cam_label, view_label=view_label)
@@ -256,7 +283,12 @@ class build_transformer(nn.Module):
         z_supcon = None
         if self.training and self.supcon_enabled:
             sup_in = _pick_feat_by_src(self.supcon_feat_src, global_feat, feat)
-            z_supcon = F.normalize(self.supcon_head(sup_in), dim=1)
+            if not self._supcon_log_done:
+                print(f"[make_model][combo] [SupCon] src=model::{self.supcon_feat_src} "
+                      f"| head=2xLinear(->128) | output=UN-normalized (L2 in SupConLoss)")
+                self._supcon_log_done = True
+            # NOTE: normalization moved to SupConLoss; keep raw projection here.
+            z_supcon = self.supcon_head(sup_in)
 
         if self.training:
             cls_score = self.classifier(feat, label) if self.cos_layer else self.classifier(feat)
@@ -340,7 +372,6 @@ class build_transformer_local(nn.Module):
         self.bottleneck_2.apply(weights_init_kaiming)
         self.bottleneck_3 = nn.BatchNorm1d(self.in_planes)
         self.bottleneck_3.bias.requires_grad_(False)
-        self.bottleneck_3.apply(weights_init_kaiming)
         self.bottleneck_4 = nn.BatchNorm1d(self.in_planes)
         self.bottleneck_4.bias.requires_grad_(False)
         self.bottleneck_4.apply(weights_init_kaiming)
@@ -362,6 +393,9 @@ class build_transformer_local(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(2048, 128)
             )
+            self._supcon_log_done = False
+            print("[make_model][init] SupCon head enabled (TransformerLocal): output is UN-normalized; "
+                  "L2 normalization is handled in SupConLoss.")
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
         features = self.base(x, cam_label=cam_label, view_label=view_label)
@@ -397,7 +431,12 @@ class build_transformer_local(nn.Module):
         z_supcon = None
         if self.training and self.supcon_enabled:
             sup_in = _pick_feat_by_src(self.supcon_feat_src, global_feat, feat_bn_global)
-            z_supcon = F.normalize(self.supcon_head(sup_in), dim=1)
+            if not self._supcon_log_done:
+                print(f"[make_model][combo] [SupCon] src=model::{self.supcon_feat_src} "
+                      f"| head=2xLinear(->128) | output=UN-normalized (L2 in SupConLoss)")
+                self._supcon_log_done = True
+            # NOTE: normalization moved to SupConLoss; keep raw projection here.
+            z_supcon = self.supcon_head(sup_in)
 
         if self.training:
             if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
