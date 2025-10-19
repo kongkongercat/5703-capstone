@@ -15,9 +15,9 @@
 #                                   provide safe defaults and CLI overrides; graceful fallback if json missing.
 # [2025-10-19 | Hang Zhang] [MOD] Baseline-first defaults: mode=baseline, config points to baseline yaml by default.
 # [2025-10-19 | Hang Zhang] [MOD] Keep original behavior intact unless user opts in via CLI.
-# [2025-10-20 | Hang Zhang] [NEW] --train-only flag (alias for --no-test); disables eval during training.
-# [2025-10-20 | Hang Zhang] [FIX] Train-only avoids ZeroDivisionError by setting EVAL_PERIOD to a large number
-#                                 and forcing TEST.EVAL=False.
+# [2025-10-20 | Hang Zhang] [NEW] --train-only flag (alias for --no-test).
+# [2025-10-20 | Hang Zhang] [MOD] Train-only: keep in-training eval (EVAL_PERIOD=save_every),
+#                                   skip external test but pre-create empty test dir.
 # =============================================================================
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 
 # ---- User-configurable defaults ----
-DEFAULT_CONFIG = "configs/VeRi/deit_transreid_stride_baseline.yml"  # corrected path
+DEFAULT_CONFIG = "configs/VeRi/deit_transreid_stride_baseline.yml"
 FULL_EPOCHS    = 120
 SEEDS          = [0, 1, 2]
 
@@ -141,7 +141,7 @@ def build_cli() -> argparse.Namespace:
 
     # train-only alias
     p.add_argument("--train-only", dest="train_only", action="store_true",
-                   help="Train only: skip all testing/evaluation runs.")
+                   help="Train only: skip external test.py runs (still keep in-training eval).")
 
     # core
     p.add_argument("--epochs", type=int, default=FULL_EPOCHS)
@@ -252,8 +252,8 @@ def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root,
             return best_ep
 
     if trained_max < epochs:
-        # Safe eval period: avoid modulo-by-zero when test is disabled
-        eval_period = (10**9) if not test_enabled else save_every
+        # In-training eval should follow save_every (even in train-only mode)
+        eval_period = save_every
 
         # ---------------- Build CLI opts safely (no forced enables) ----------------
         opts: List[str] = []
@@ -283,9 +283,9 @@ def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root,
         # Always supervised for this pipeline
         opts += ["MODEL.TRAINING_MODE", "supervised"]
 
-        # When test is disabled, also disable TEST.EVAL explicitly
+        # Train-only: keep in-training eval ON, but skip external test later
         if not test_enabled:
-            opts += ["TEST.EVAL", "False"]
+            opts += ["TEST.EVAL", "True"]
 
         # standard knobs
         opts += [
@@ -310,9 +310,13 @@ def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root,
         subprocess.check_call(cmd)
 
     if not test_enabled:
-        print(f"[phased_loss] Seed {seed} training done (test skipped).")
+        # Create placeholder test directory for future manual evaluation
+        test_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[phased_loss] [train-only] Created placeholder test dir: {test_dir}")
+        print(f"[phased_loss] Seed {seed} training done (external test skipped).")
         return None
 
+    # When external testing is enabled, run missing evaluations and pick best
     eval_missing_epochs_via_test_py(tag, args.config, log_root, args.ds_prefix)
     best_ep = pick_best_epoch_metrics(test_dir)
     if not best_ep:
@@ -327,7 +331,7 @@ def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root,
 def main():
     args = build_cli()
 
-    # map --train-only to disabling test
+    # map --train-only to disabling external test.py
     if getattr(args, "train_only", False):
         args.test = False
 
