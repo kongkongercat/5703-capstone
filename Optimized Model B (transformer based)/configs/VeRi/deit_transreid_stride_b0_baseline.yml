@@ -11,7 +11,7 @@ MODEL:
   NAME: 'transformer'
   NO_MARGIN: True               # Use soft-margin triplet loss
   DEVICE_ID: ('0')               # GPU device ID
-  TRANSFORMER_TYPE: 'vit_base_patch16_224_TransReID'
+  TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
   STRIDE_SIZE: [12, 12]          # Stride size for patch embedding
   SIE_CAMERA: True               # Enable SIE (camera)
   SIE_VIEW: True                 # Enable SIE (view)

@@ -16,6 +16,8 @@
 # [2025-10-19 | Hang Zhang] [MOD] Baseline-first defaults: mode=baseline, config points to baseline yaml by default.
 # [2025-10-19 | Hang Zhang] [MOD] Keep original behavior intact unless user opts in via CLI.
 # [2025-10-20 | Hang Zhang] [NEW] --train-only flag (alias for --no-test); disables eval during training.
+# [2025-10-20 | Hang Zhang] [FIX] Train-only avoids ZeroDivisionError by setting EVAL_PERIOD to a large number
+#                                 and forcing TEST.EVAL=False.
 # =============================================================================
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 
 # ---- User-configurable defaults ----
-DEFAULT_CONFIG = "configs/VeiRi/deit_transreid_stride_baseline.yml"  # note: will be overridden by --config
+DEFAULT_CONFIG = "configs/VeRi/deit_transreid_stride_baseline.yml"  # corrected path
 FULL_EPOCHS    = 120
 SEEDS          = [0, 1, 2]
 
@@ -250,7 +252,8 @@ def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root,
             return best_ep
 
     if trained_max < epochs:
-        eval_period = 0 if not test_enabled else save_every
+        # Safe eval period: avoid modulo-by-zero when test is disabled
+        eval_period = (10**9) if not test_enabled else save_every
 
         # ---------------- Build CLI opts safely (no forced enables) ----------------
         opts: List[str] = []
@@ -279,6 +282,10 @@ def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root,
 
         # Always supervised for this pipeline
         opts += ["MODEL.TRAINING_MODE", "supervised"]
+
+        # When test is disabled, also disable TEST.EVAL explicitly
+        if not test_enabled:
+            opts += ["TEST.EVAL", "False"]
 
         # standard knobs
         opts += [
