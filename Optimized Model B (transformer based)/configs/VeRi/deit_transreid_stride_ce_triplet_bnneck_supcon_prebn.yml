@@ -2,7 +2,7 @@ MODEL:
   PRETRAIN_CHOICE: 'imagenet'
   PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
   NAME: 'transformer'
-  TRANSFORMER_TYPE: 'deit_base_distilled_patch16_224_TransReID'
+  TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
   STRIDE_SIZE: [12, 12]
   SIE_CAMERA: True
   SIE_VIEW: True
