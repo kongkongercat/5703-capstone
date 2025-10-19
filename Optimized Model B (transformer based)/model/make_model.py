@@ -60,11 +60,11 @@ from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 #                                       - SupCon head now outputs raw (unnormalized) embeddings.
 #                                       - L2-normalization is centralized in SupConLoss.forward().
 #                                       - Added one-time init log when SupCon head is enabled.
-# [2025-10-19 | liaoxingyu]           **Model-side SupCon source logging (once per model)**
+# [2025-10-19 | Hang Zhang]           **Model-side SupCon source logging (once per model)**
 #                                       - On first forward that builds z_supcon, print:
 #                                         "[make_model][combo] [SupCon] src=model::<pre_bn|bnneck> | head=2xLinear(->128) | output=UN-normalized (L2 in SupConLoss)"
 #                                       - No behavior change; only logging for clarity.
-# [2025-10-19 | Team 5703]            **Classification head label passing fix**
+# [2025-10-19 | Hang Zhang]            **Classification head label passing fix**
 #                                       - For margin-softmax heads (arcface/cosface/amsoftmax/circle),
 #                                         always pass `label` to classifier; Linear head does not.   # [NEW]
 # =============================================================================
