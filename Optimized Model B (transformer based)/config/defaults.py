@@ -25,9 +25,13 @@ from yacs.config import CfgNode as CN
 # [2025-10-19 | Hang Zhang] **Remove dynamic CE source key**:
 #                           - Deleted LOSS.CE.FEAT_SRC; CE always uses classifier logits (score).
 #                           - Any YAML/CLI setting for CE.FEAT_SRC is no longer supported/needed.
-# [2025-10-19 | Team 5703]  **Add phased keys used by make_loss**:
+# [2025-10-19 | Hang Zhang]  **Add phased keys used by make_loss**:
 #                           - LOSS.PHASED.TRIPLETX_END (epoch boundary for TripletX→Triplet).
 #                           - LOSS.SUPCON.W0 / DECAY_TYPE / DECAY_START / DECAY_END (epoch-aware SupCon).
+#[2025-10-21 | Hang Zhang] Set LOSS.SUPCON.CAM_AWARE=True and POS_RULE='class' to match actual behavior;
+#                          SupConLoss already runs in camera-aware mode (same ID, different camera),
+#                          so enabling it by default prevents misleading configuration semantics.
+
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
@@ -45,7 +49,7 @@ _C.MODEL.DEVICE_ID = '0'
 
 # Backbone
 _C.MODEL.NAME = 'transformer'                           # ViT-TransReID as default
-_C.MODEL.TRANSFORMER_TYPE = 'vit_base_patch16_224_TransReID'
+_C.MODEL.TRANSFORMER_TYPE = 'deit_base_patch16_224_TransReID'
 _C.MODEL.LAST_STRIDE = 1
 _C.MODEL.STRIDE_SIZE = [12, 12]                         # official stride
 _C.MODEL.DROP_PATH = 0.1
@@ -95,7 +99,7 @@ _C.LOSS.CE = CN()
 
 # ====== Triplet (baseline) ======
 _C.LOSS.TRIPLET = CN()
-# Which feature branch to use for Triplet: ['bnneck', 'pre_bn', 'backbone']
+# Which feature branch to use for Triplet: ['bnneck', 'pre_bn']
 _C.LOSS.TRIPLET.FEAT_SRC = 'pre_bn'
 
 # ====== TripletX (enhanced triplet) ======
@@ -110,7 +114,7 @@ _C.LOSS.TRIPLETX.ALPHA = 2.0
 _C.LOSS.TRIPLETX.CROSS_CAM_POS = True
 _C.LOSS.TRIPLETX.SAME_CAM_NEG_BOOST = 1.2
 _C.LOSS.TRIPLETX.NORM_FEAT = True
-# Which feature branch to use for TripletX: ['bnneck', 'pre_bn', 'backbone']
+# Which feature branch to use for TripletX: ['bnneck', 'pre_bn']
 _C.LOSS.TRIPLETX.FEAT_SRC = 'pre_bn'
 
 # ====== SupCon (supervised contrastive) ======
@@ -118,9 +122,9 @@ _C.LOSS.SUPCON = CN()
 _C.LOSS.SUPCON.ENABLE = False
 _C.LOSS.SUPCON.W = 0.30
 _C.LOSS.SUPCON.T = 0.07
-_C.LOSS.SUPCON.CAM_AWARE = False
+_C.LOSS.SUPCON.CAM_AWARE = True
 _C.LOSS.SUPCON.POS_RULE = "class"
-# Which feature branch to use for SupCon: ['bnneck', 'pre_bn', 'backbone']
+# Which feature branch to use for SupCon: ['bnneck', 'pre_bn']
 _C.LOSS.SUPCON.FEAT_SRC = 'bnneck'
 # Epoch-aware SupCon scheduling (used by make_loss when PHASED.ENABLE=True)
 _C.LOSS.SUPCON.W0 = 0.30
