@@ -153,7 +153,7 @@ def build_cli() -> argparse.Namespace:
                    help="Checkpointing/testing interval (epochs).")
     p.add_argument("--config", type=str, default=DEFAULT_CONFIG,
                    help="Path to config YAML for run_modelB_deit.py")
-    p.add_argument("--ds-prefix", type:str, default="veri776",
+    p.add_argument("--ds-prefix", type=str, default="veri776",
                    help="Prefix for run/test dir naming")
 
     # toggles that used to be hard-coded
