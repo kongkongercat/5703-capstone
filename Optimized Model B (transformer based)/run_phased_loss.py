@@ -18,6 +18,7 @@
 # [2025-10-20 | Hang Zhang] [NEW] --train-only flag (alias for --no-test).
 # [2025-10-20 | Hang Zhang] [MOD] Train-only: keep in-training eval (EVAL_PERIOD=save_every),
 #                                   skip external test but pre-create empty test dir.
+# [2025-10-20 | Hang Zhang] [MOD-A] CLI parsing via parse_known_args; merge unknowns into --opts to avoid swallowing flags.
 # =============================================================================
 
 from __future__ import annotations
@@ -152,7 +153,7 @@ def build_cli() -> argparse.Namespace:
                    help="Checkpointing/testing interval (epochs).")
     p.add_argument("--config", type=str, default=DEFAULT_CONFIG,
                    help="Path to config YAML for run_modelB_deit.py")
-    p.add_argument("--ds-prefix", type=str, default="veri776",
+    p.add_argument("--ds-prefix", type:str, default="veri776",
                    help="Prefix for run/test dir naming")
 
     # toggles that used to be hard-coded
@@ -179,10 +180,14 @@ def build_cli() -> argparse.Namespace:
     p.add_argument("--T", type=float, default=None, help="SupCon temperature override.")
     p.add_argument("--W", type=float, default=None, help="SupCon weight override.")
 
-    # passthrough
-    p.add_argument("--opts", nargs=argparse.REMAINDER,
-                   help="Extra YACS options to pass through")
-    return p.parse_args()
+    # passthrough (do NOT swallow later flags)
+    p.add_argument("--opts", nargs="*", default=[],
+                   help="Extra YACS options to pass through (KEY VALUE pairs)")
+
+    # --- Scheme A: parse_known_args; merge unknown tail into args.opts ---
+    args, unknown = p.parse_known_args()
+    args.opts = (args.opts or []) + unknown
+    return args
 
 # -----------------------------------------------------------------------------
 # Core helpers
