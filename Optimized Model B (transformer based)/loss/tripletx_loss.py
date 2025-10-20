@@ -2,7 +2,7 @@
 # =============================================================================
 # File: tripletx_loss.py
 # Description: Enhanced Triplet Loss (TripletLossX) with 5 improvements
-#              (BNNeck+L2, top-k hard, margin schedule, camera-aware, hardness-aware)
+#              (L2, top-k hard, margin schedule, camera-aware, hardness-aware)
 #              for vehicle Re-ID on VeRi-776.
 #
 # Based on: triplet_loss.py (original baseline TripletLoss implementation)
