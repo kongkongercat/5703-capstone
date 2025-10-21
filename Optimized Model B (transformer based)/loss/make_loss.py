@@ -124,6 +124,12 @@
 #                                 "Metric(off, TripletX:on, cfg.METRIC_LOSS_TYPE!=triplet)".
 #                           - Added explicit phase-switch line: "[phase] switch A -> B | <old_metric> -> <new_metric>".
 #                           - Avoids confusion when baseline Triplet is off but TripletX is configured.
+#
+# [2025-10-21 | Hang Zhang] **FIX**: Decouple TripletX weight from baseline triplet
+#                           - Read TripletX weight from cfg.LOSS.TRIPLETX.W (tx_w), not MODEL.TRIPLET_LOSS_WEIGHT.
+#                           - Build metric branch regardless of baseline triplet weight; gate with effective weight.
+#                           - ACTIVE line & "gated-off" hints now use the correct effective weight.
+#                           - No behavior changes elsewhere.
 # ==========================================
 
 import torch
@@ -229,8 +235,9 @@ def make_loss(cfg, num_classes):
     use_gpu = torch.cuda.is_available()
     center_criterion = CenterLoss(num_classes=num_classes, feat_dim=feat_dim, use_gpu=use_gpu)
 
-    id_w = _to_float(getattr(cfg.MODEL, "ID_LOSS_WEIGHT", 1.0))
-    tri_w = _to_float(getattr(cfg.MODEL, "TRIPLET_LOSS_WEIGHT", 1.0))
+    id_w  = _to_float(getattr(cfg.MODEL, "ID_LOSS_WEIGHT", 1.0))
+    tri_w = _to_float(getattr(cfg.MODEL, "TRIPLET_LOSS_WEIGHT", 1.0))  # baseline Triplet weight
+    tx_w  = _to_float(getattr(getattr(cfg.LOSS, "TRIPLETX", {}), "W", 0.0))  # TripletX weight (FIX)
 
     # --------------------------------------------------------
     # Cross-Entropy (ID) loss
@@ -268,18 +275,18 @@ def make_loss(cfg, num_classes):
     # Init print: only show ENABLED losses to reflect actual plan
     # --------------------------------------------------------
     enabled_srcs = [f"CE={ce_src} (fixed)"]
-    if tri_w > 0:
-        if tripletx_cfg_enabled:
-            enabled_srcs.append(f"TripletX={tri_src_tripletx}")
-        elif "triplet" in str(getattr(cfg.MODEL, "METRIC_LOSS_TYPE", "")).lower():
-            enabled_srcs.append(f"Triplet={tri_src_triplet}")
+    # Show TripletX if it is enabled and has positive weight; otherwise show baseline Triplet if applicable.
+    if tripletx_cfg_enabled and tx_w > 0:
+        enabled_srcs.append(f"TripletX={tri_src_tripletx}")
+    elif tri_w > 0 and "triplet" in str(getattr(cfg.MODEL, "METRIC_LOSS_TYPE", "")).lower():
+        enabled_srcs.append(f"Triplet={tri_src_triplet}")
     if supcon_enabled:
         enabled_srcs.append(f"SupCon={sup_src}")
     print("[init][feat_src] " + " | ".join(enabled_srcs))
 
-    # If TripletX is configured but gated off by weight/config, log once to avoid confusion
-    if tripletx_cfg_enabled and (tri_w == 0.0 or not metric_cfg_triplet_mode):
-        reason = "w=0" if tri_w == 0.0 else "cfg.METRIC_LOSS_TYPE!=triplet"
+    # If TripletX is configured but gated off by weight/config, log once to avoid confusion (FIX uses tx_w)
+    if tripletx_cfg_enabled and (tx_w == 0.0 or not metric_cfg_triplet_mode):
+        reason = "w=0" if tx_w == 0.0 else "cfg.METRIC_LOSS_TYPE!=triplet"
         print(f"[make_loss][info] TripletX enabled in cfg but gated off ({reason}); Metric will be off.")
 
     # --------------------------------------------------------
@@ -309,7 +316,8 @@ def make_loss(cfg, num_classes):
     triplet = None
     use_tx = False
 
-    if metric_cfg_triplet_mode and tri_w > 0:
+    # (FIX) Build the metric branch regardless of baseline triplet weight; gating will happen later with effective weight
+    if metric_cfg_triplet_mode:
         use_tx = (TripletXLoss is not None and tripletx_cfg_enabled)
         if use_tx:
             normalize_feature = bool(getattr(cfg.LOSS.TRIPLETX, "NORM_FEAT", True))
@@ -496,20 +504,24 @@ def make_loss(cfg, num_classes):
 
         # --- Metric: Triplet or TripletX (skipped when sampler=='random') ---
         phase_use_tx = False
-        if metric_cfg_triplet_mode and tri_w > 0 and (triplet is not None):
+        metric_w_eff = 0.0  # effective metric weight for this step (FIX)
+
+        if metric_cfg_triplet_mode and (triplet is not None):
             phase_use_tx = use_tx
             if phased_on and (epoch is not None) and (TripletXLoss is not None):
                 phase_use_tx = (int(epoch) <= int(tripletx_end))
 
-            current_metric = "TripletX" if phase_use_tx else "Triplet"
-            if _combo_logged.get("metric_last") != current_metric:
+            # Decide effective weight by chosen metric kind (FIX)
+            metric_w_eff = (tx_w if phase_use_tx else tri_w)
+
+            if _combo_logged.get("metric_last") != ("TripletX" if phase_use_tx else "Triplet"):
                 chosen_src = (tri_src_tripletx if phase_use_tx else tri_src_triplet)
                 maybe_fb = " | fallback=pre_bn_if_bnneck_missing" if chosen_src == "bnneck" else ""
                 print(
-                    f"[make_loss][combo] [Metric] {current_metric} src=cfg::{chosen_src}{maybe_fb} | "
+                    f"[make_loss][combo] [Metric] {'TripletX' if phase_use_tx else 'Triplet'} src=cfg::{chosen_src}{maybe_fb} | "
                     f"ext_L2(metric)=off; CE=unaffected"
                 )
-                _combo_logged["metric_last"] = current_metric
+                _combo_logged["metric_last"] = ("TripletX" if phase_use_tx else "Triplet")
 
             def _call_triplet_core(f):
                 try:
@@ -520,16 +532,17 @@ def make_loss(cfg, num_classes):
                     except TypeError:
                         return _reduce_triplet_output(triplet(f, target))
 
-            if isinstance(feat, list):
-                tri_list = [_call_triplet_core(f) for f in (feat[1:] if len(feat) > 1 else [])]
-                tri0 = _call_triplet_core(feat[0])
-                TRI_LOSS = 0.5 * (_safe_mean(tri_list) + tri0)
-            else:
-                tri_src = (tri_src_tripletx if phase_use_tx else tri_src_triplet)
-                tri_in = _pick_by_src_with_fallback(tri_src, global_pre_bn, bnneck, _warn_once_tri, "Triplet")
-                TRI_LOSS = _call_triplet_core(tri_in)
+            if metric_w_eff > 0.0:  # gate by effective weight (FIX)
+                if isinstance(feat, list):
+                    tri_list = [_call_triplet_core(f) for f in (feat[1:] if len(feat) > 1 else [])]
+                    tri0 = _call_triplet_core(feat[0])
+                    TRI_LOSS = 0.5 * (_safe_mean(tri_list) + tri0)
+                else:
+                    tri_src = (tri_src_tripletx if phase_use_tx else tri_src_triplet)
+                    tri_in = _pick_by_src_with_fallback(tri_src, global_pre_bn, bnneck, _warn_once_tri, "Triplet")
+                    TRI_LOSS = _call_triplet_core(tri_in)
 
-            total += tri_w * TRI_LOSS
+                total += metric_w_eff * TRI_LOSS
 
         # --- SupCon (if enabled and effective weight > 0) ---
         if supcon_enabled and eff_w > 0.0:
@@ -549,7 +562,7 @@ def make_loss(cfg, num_classes):
         # --- Log ACTIVE combo snapshot at the end if changed ---
         metric_kind = "None"
         metric_src_used = "-"
-        if (sampler != "random") and (triplet is not None) and (tri_w > 0):
+        if (sampler != "random") and (triplet is not None) and (metric_w_eff > 0.0):  # (FIX) use effective weight
             metric_kind = "TripletX" if phase_use_tx else "Triplet"
             metric_src_used = (tri_src_tripletx if phase_use_tx else tri_src_triplet)
 
@@ -561,7 +574,7 @@ def make_loss(cfg, num_classes):
             id_on=(id_w > 0),
             metric_kind=metric_kind,
             metric_src=metric_src_used,
-            metric_w=tri_w,
+            metric_w=metric_w_eff,            # (FIX) pass effective weight to logger
             sup_on=sup_on,
             sup_src_desc=sup_src_desc,
             sup_w_eff=eff_w if sup_on else 0.0,
