@@ -19,6 +19,10 @@
 # [2025-10-20 | Hang Zhang] [MOD] Train-only: keep in-training eval (EVAL_PERIOD=save_every),
 #                                   skip external test but pre-create empty test dir.
 # [2025-10-20 | Hang Zhang] [MOD-A] CLI parsing via parse_known_args; merge unknowns into --opts to avoid swallowing flags.
+# [2025-10-21 | Hang Zhang] [MOD-B] Respect YAML by default:
+#                                   (1) Tri-state toggles: --supcon/--no-supcon/None; --tripletx/--no-tripletx/None; --phased/--baseline/None
+#                                   (2) Only write YACS keys when a toggle is explicitly set; otherwise do NOT touch YAML
+#                                   (3) Tag bits reflect tri-state: 'yaml' when not overridden by CLI
 # =============================================================================
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 
 # ---- User-configurable defaults ----
-DEFAULT_CONFIG = "configs/VeRi/deit_transreid_stride_baseline.yml"
+DEFAULT_CONFIG = "configs/VeiRi/deit_transreid_stride_baseline.yml"  # keep your baseline path if needed
 FULL_EPOCHS    = 120
 SEEDS          = [0, 1, 2]
 
@@ -156,25 +160,26 @@ def build_cli() -> argparse.Namespace:
     p.add_argument("--ds-prefix", type=str, default="veri776",
                    help="Prefix for run/test dir naming")
 
-    # toggles that used to be hard-coded
+    # --- Tri-state mode toggles (None=respect YAML; 'baseline' or 'phased' explicitly override) ---
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--baseline", dest="mode", action="store_const", const="baseline",
-                      help="Pure CE+Triplet baseline (no SupCon, no TripletX, no phased).")
+                      help="Force pure CE+Triplet baseline (disable phased).")
     mode.add_argument("--phased", dest="mode", action="store_const", const="phased",
                       help="Enable phased-loss schedule (A/B/C).")
-    p.set_defaults(mode="baseline")
+    p.set_defaults(mode=None)  # None => do not touch YAML
 
+    # --- Tri-state for SupCon/TripletX (None=respect YAML) ---
     p.add_argument("--supcon", dest="supcon", action="store_true",
                    help="Enable SupCon (LOSS.SUPCON.ENABLE=True).")
     p.add_argument("--no-supcon", dest="supcon", action="store_false",
-                   help="Disable SupCon.")
-    p.set_defaults(supcon=False)
+                   help="Disable SupCon (LOSS.SUPCON.ENABLE=False).")
+    p.set_defaults(supcon=None)  # None => do not write key
 
     p.add_argument("--tripletx", dest="tripletx", action="store_true",
                    help="Enable TripletX (LOSS.TRIPLETX.ENABLE=True).")
     p.add_argument("--no-tripletx", dest="tripletx", action="store_false",
-                   help="Disable TripletX.")
-    p.set_defaults(tripletx=False)
+                   help="Disable TripletX (LOSS.TRIPLETX.ENABLE=False).")
+    p.set_defaults(tripletx=None)  # None => do not write key
 
     # SupCon params (CLI override or fallback if json missing)
     p.add_argument("--T", type=float, default=None, help="SupCon temperature override.")
@@ -260,29 +265,28 @@ def ensure_full_run_seed(T, W, seed, epochs, save_every, log_root,
         # In-training eval should follow save_every (even in train-only mode)
         eval_period = save_every
 
-        # ---------------- Build CLI opts safely (no forced enables) ----------------
+        # ---------------- Build CLI opts safely (Respect YAML by default) ----------------
         opts: List[str] = []
 
-        # phased schedule toggle
-        if args.mode == "phased":
-            opts += ["LOSS.PHASED.ENABLE", "True"]
-        else:
-            opts += ["LOSS.PHASED.ENABLE", "False"]
+        # phased schedule toggle: only write when explicitly set
+        if args.mode is not None:
+            opts += ["LOSS.PHASED.ENABLE", "True" if args.mode == "phased" else "False"]
 
-        # SupCon toggle + params
-        if args.supcon:
+        # SupCon toggle + params: only write when explicitly set
+        if args.supcon is True:
             opts += ["LOSS.SUPCON.ENABLE", "True"]
             if T is not None:
                 opts += ["LOSS.SUPCON.T", str(T)]
             if W is not None:
                 opts += ["LOSS.SUPCON.W", str(W)]
-        else:
+        elif args.supcon is False:
             opts += ["LOSS.SUPCON.ENABLE", "False"]
+        # None => do nothing, fully respect YAML
 
-        # TripletX toggle
-        if args.tripletx:
+        # TripletX toggle: only write when explicitly set
+        if args.tripletx is True:
             opts += ["LOSS.TRIPLETX.ENABLE", "True"]
-        else:
+        elif args.tripletx is False:
             opts += ["LOSS.TRIPLETX.ENABLE", "False"]
 
         # Always supervised for this pipeline
@@ -348,8 +352,8 @@ def main():
     # SupCon T/W source of truth
     T, W = args.T, args.W
 
-    # Read b1_supcon_best.json ONLY IF SupCon is enabled and no CLI override
-    if args.supcon and (T is None or W is None):
+    # Read b1_supcon_best.json ONLY IF SupCon is explicitly enabled and no CLI override
+    if args.supcon is True and (T is None or W is None):
         drive_root = Path(os.getenv(
             "MODEL_B_DRIVE_ROOT",
             "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)"
@@ -383,17 +387,27 @@ def main():
         exp_name = config_name
     print(f"[phased_loss] Auto-detected experiment name: {exp_name}")
 
-    # include mode/switches in tag base (for clarity)
+    # include mode/switches in tag base (for clarity) — reflect tri-state with 'yaml'
+    def _bit_from_mode():
+        if args.mode == "phased": return "phased"
+        if args.mode == "baseline": return "baseline"
+        return "yaml"
+
+    def _bit_from_tri(v: Optional[bool], pos: str):
+        if v is True: return pos
+        if v is False: return f"no{pos}"
+        return "yaml"
+
     mode_bits: List[str] = []
-    mode_bits.append("base" if args.mode == "baseline" else "phased")
-    mode_bits.append("sup" if args.supcon else "nosup")
-    mode_bits.append("tx" if args.tripletx else "notx")
+    mode_bits.append(_bit_from_mode())
+    mode_bits.append(_bit_from_tri(args.supcon, "sup"))
+    mode_bits.append(_bit_from_tri(args.tripletx, "tx"))
     mode_suffix = "_".join(mode_bits)
 
     for s in seeds:
         if args.tag:
             tag_base = args.tag
-        elif args.supcon and (T is not None) and (W is not None):
+        elif args.supcon is True and (T is not None) and (W is not None):
             tag_base = f"{exp_name}_{mode_suffix}_T{_fmt(T)}_W{_fmt(W)}_seed{s}"
         else:
             tag_base = f"{exp_name}_{mode_suffix}_seed{s}"
