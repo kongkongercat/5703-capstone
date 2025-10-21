@@ -66,11 +66,11 @@ LOSS:
   TRIPLET:
     FEAT_SRC: 'pre_bn'                               # Feature source for triplet
 
-  # TripletX branch (enabled; no-L2; top-k = 8)
+  # TripletX branch (enabled; L2; top-k = 8)
   TRIPLETX:
     ENABLE: True                                     # Enable TripletX loss
     FEAT_SRC: pre_bn                                 # Use features before BN
-    NORM_FEAT: True                                 # Disable L2 normalization (no-L2)
+    NORM_FEAT: True                                  #L2 normalization (L2)
     MARGIN: 0.30                                     # TripletX margin
     SOFT_WARMUP: True                                # Use soft-margin warmup
     WARMUP_EPOCHS: 10                                # Warmup epochs
