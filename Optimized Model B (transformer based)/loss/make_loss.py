@@ -116,6 +116,14 @@
 # [2025-10-20 | Hang Zhang] ACTIVE combo snapshot
 #                           - Print a concise "[combo][ACTIVE][<phase>] ..." line only when the active set changes.
 #                           - Includes ID/Metric/SupCon on-off, weights, and routing sources.
+#
+# [2025-10-21 | Hang Zhang] Clarified Metric logging vs TripletX (no behavior change)
+#                           - If TRIPLETX.ENABLE=True but Metric is gated off by weight/config:
+#                               * Print one-time info: TripletX in cfg but gated (w=0 or METRIC_LOSS_TYPE!=triplet).
+#                               * ACTIVE line shows "Metric(off, TripletX:on, w=0)" or
+#                                 "Metric(off, TripletX:on, cfg.METRIC_LOSS_TYPE!=triplet)".
+#                           - Added explicit phase-switch line: "[phase] switch A -> B | <old_metric> -> <new_metric>".
+#                           - Avoids confusion when baseline Triplet is off but TripletX is configured.
 # ==========================================
 
 import torch
@@ -252,18 +260,27 @@ def make_loss(cfg, num_classes):
     tri_src_triplet = str(getattr(getattr(cfg.LOSS, "TRIPLET", {}), "FEAT_SRC", "pre_bn")).lower()
     tri_src_tripletx = str(getattr(getattr(cfg.LOSS, "TRIPLETX", {}), "FEAT_SRC", "pre_bn")).lower()
 
+    # NEW: detect cfg TripletX enable for logging clarity
+    tripletx_cfg_enabled = bool(getattr(getattr(cfg.LOSS, "TRIPLETX", {}), "ENABLE", False))
+    metric_cfg_triplet_mode = ("triplet" in str(getattr(cfg.MODEL, "METRIC_LOSS_TYPE", "")).lower())
+
     # --------------------------------------------------------
     # Init print: only show ENABLED losses to reflect actual plan
     # --------------------------------------------------------
     enabled_srcs = [f"CE={ce_src} (fixed)"]
     if tri_w > 0:
-        if hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "TRIPLETX") and bool(getattr(cfg.LOSS.TRIPLETX, "ENABLE", False)):
+        if tripletx_cfg_enabled:
             enabled_srcs.append(f"TripletX={tri_src_tripletx}")
         elif "triplet" in str(getattr(cfg.MODEL, "METRIC_LOSS_TYPE", "")).lower():
             enabled_srcs.append(f"Triplet={tri_src_triplet}")
     if supcon_enabled:
         enabled_srcs.append(f"SupCon={sup_src}")
     print("[init][feat_src] " + " | ".join(enabled_srcs))
+
+    # If TripletX is configured but gated off by weight/config, log once to avoid confusion
+    if tripletx_cfg_enabled and (tri_w == 0.0 or not metric_cfg_triplet_mode):
+        reason = "w=0" if tri_w == 0.0 else "cfg.METRIC_LOSS_TYPE!=triplet"
+        print(f"[make_loss][info] TripletX enabled in cfg but gated off ({reason}); Metric will be off.")
 
     # --------------------------------------------------------
     # Warn-once state for missing bnneck fallback
@@ -279,10 +296,10 @@ def make_loss(cfg, num_classes):
         "supcon_model": False, # printed once when using model::z_supcon
         "supcon_cfg": False,   # printed once when using cfg::<src>
         "id_once": False,      # printed once for CE
-        # NEW: SupCon weight snapshot and phase tag
+        # SupCon weight snapshot and phase tag
         "sup_w_last": None,
         "phase_last": None,
-        # NEW: last active combo signature
+        # last active combo signature
         "active_last": None,
     }
 
@@ -292,13 +309,8 @@ def make_loss(cfg, num_classes):
     triplet = None
     use_tx = False
 
-    if "triplet" in str(getattr(cfg.MODEL, "METRIC_LOSS_TYPE", "")).lower() and tri_w > 0:
-        use_tx = (
-            TripletXLoss is not None
-            and hasattr(cfg, "LOSS")
-            and hasattr(cfg.LOSS, "TRIPLETX")
-            and bool(getattr(cfg.LOSS.TRIPLETX, "ENABLE", False))
-        )
+    if metric_cfg_triplet_mode and tri_w > 0:
+        use_tx = (TripletXLoss is not None and tripletx_cfg_enabled)
         if use_tx:
             normalize_feature = bool(getattr(cfg.LOSS.TRIPLETX, "NORM_FEAT", True))
             k_value = int(getattr(cfg.LOSS.TRIPLETX, "K", 4))
@@ -365,6 +377,9 @@ def make_loss(cfg, num_classes):
             return "B"
         return "C"
 
+    # --------------------------------------------------------
+    # ACTIVE combo logger (clarified metric off reasons + phase switch line)
+    # --------------------------------------------------------
     def _log_active_combo_if_changed(
         phase_tag: str,
         id_on: bool,
@@ -375,25 +390,51 @@ def make_loss(cfg, num_classes):
         sup_src_desc: str,
         sup_w_eff: float,
         label_smoothing_on: bool,
+        *,
+        tripletx_cfg_enabled: bool,
+        metric_cfg_triplet_mode: bool,
     ):
-        """Print compact ACTIVE combo only when the signature changes."""
+        """Print compact ACTIVE combo only when the signature changes.
+        Also clarify metric state during phased switches (TripletX/Triplet/off with reasons)."""
+
+        # Construct clearer Metric text
+        if metric_kind == "None":
+            if tripletx_cfg_enabled and not metric_cfg_triplet_mode:
+                metric_text = "Metric(off, TripletX:on, cfg.METRIC_LOSS_TYPE!=triplet)"
+            elif tripletx_cfg_enabled and metric_w == 0.0:
+                metric_text = "Metric(off, TripletX:on, w=0)"
+            else:
+                metric_text = "Metric(off)"
+        else:
+            metric_text = f"Metric={metric_kind}[w={metric_w:.3f}, src={metric_src}]"
+
         sig = (
             phase_tag,
             ("ID", round(float(id_w), 6), bool(label_smoothing_on)) if id_on else None,
-            ("M", metric_kind, round(float(metric_w), 6), metric_src) if metric_kind != "None" else None,
+            metric_text,
             ("S", round(float(sup_w_eff), 6), sup_src_desc) if sup_on else None,
         )
-        if _combo_logged["active_last"] != sig:
+
+        last_sig = _combo_logged["active_last"]
+        last_phase = _combo_logged.get("phase_last", None)
+
+        if last_sig != sig or last_phase != phase_tag:
+            # (A) ACTIVE snapshot
             parts = [f"[combo][ACTIVE][{phase_tag}]"]
             parts.append(f"ID(w={id_w:.3f}, sm={'on' if label_smoothing_on else 'off'})" if id_on else "ID(off)")
-            parts.append(
-                f"Metric={metric_kind}[w={metric_w:.3f}, src={metric_src}]" if metric_kind != "None" else "Metric(off)"
-            )
-            parts.append(
-                f"SupCon[w={sup_w_eff:.3f}, src={sup_src_desc}]" if sup_on else "SupCon(off)"
-            )
+            parts.append(metric_text)
+            parts.append(f"SupCon[w={sup_w_eff:.3f}, src={sup_src_desc}]" if sup_on else "SupCon(off)")
             print(" ".join(parts))
+
+            # (B) Phase switch line with explicit metric change
+            if last_phase is not None and last_phase != phase_tag:
+                last_metric_text = "-"
+                if isinstance(last_sig, tuple) and len(last_sig) >= 3:
+                    last_metric_text = last_sig[2] if isinstance(last_sig[2], str) else "-"
+                print(f"[phase] switch {last_phase} -> {phase_tag} | {last_metric_text} -> {metric_text}")
+
             _combo_logged["active_last"] = sig
+            _combo_logged["phase_last"] = phase_tag
 
     # ========================================================
     # Loss function closure
@@ -434,6 +475,7 @@ def make_loss(cfg, num_classes):
         if supcon_enabled:
             last_w = _combo_logged["sup_w_last"]
             last_phase = _combo_logged["phase_last"]
+
             if last_w is None:
                 print(f"[make_loss][sup] phase={phase} | effW={eff_w_r:.6f}")
             else:
@@ -443,12 +485,18 @@ def make_loss(cfg, num_classes):
                     print(f"[make_loss][sup] phase={phase} | SupCon re-enabled (effW 0 -> {eff_w_r:.6f})")
                 elif (last_phase != phase):
                     print(f"[make_loss][sup] phase switch {last_phase} -> {phase} | effW={eff_w_r:.6f}")
+
             _combo_logged["sup_w_last"] = eff_w_r
             _combo_logged["phase_last"] = phase
+        else:
+            # Ensure phase_last is initialized even if SupCon is disabled,
+            # so ACTIVE switch can still print "[phase] switch ...".
+            if _combo_logged["phase_last"] is None:
+                _combo_logged["phase_last"] = phase
 
         # --- Metric: Triplet or TripletX (skipped when sampler=='random') ---
         phase_use_tx = False
-        if "triplet" in str(getattr(cfg.MODEL, "METRIC_LOSS_TYPE", "")).lower() and tri_w > 0 and (triplet is not None):
+        if metric_cfg_triplet_mode and tri_w > 0 and (triplet is not None):
             phase_use_tx = use_tx
             if phased_on and (epoch is not None) and (TripletXLoss is not None):
                 phase_use_tx = (int(epoch) <= int(tripletx_end))
@@ -518,6 +566,8 @@ def make_loss(cfg, num_classes):
             sup_src_desc=sup_src_desc,
             sup_w_eff=eff_w if sup_on else 0.0,
             label_smoothing_on=(xent is not None),
+            tripletx_cfg_enabled=tripletx_cfg_enabled,
+            metric_cfg_triplet_mode=metric_cfg_triplet_mode,
         )
 
         return total
