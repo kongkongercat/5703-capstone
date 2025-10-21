@@ -22,7 +22,9 @@
 # [2025-10-21 | Hang Zhang] [MOD-B] Respect YAML by default:
 #                                   (1) Tri-state toggles: --supcon/--no-supcon/None; --tripletx/--no-tripletx/None; --phased/--baseline/None
 #                                   (2) Only write YACS keys when a toggle is explicitly set; otherwise do NOT touch YAML
-#                                   (3) Tag bits reflect tri-state: 'yaml' when not overridden by CLI
+#                                   (3) Tag bits reflect tri-state.
+# [2025-10-21 | Hang Zhang] [MOD-C] Remove 'yaml' tokens from tag generation; when a switch is None, emit nothing.
+#                                   Also collapse duplicate underscores and keep names clean/backward-compatible.
 # =============================================================================
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 
 # ---- User-configurable defaults ----
-DEFAULT_CONFIG = "configs/VeiRi/deit_transreid_stride_baseline.yml"  # keep your baseline path if needed
+DEFAULT_CONFIG = "configs/VeRi/deit_transreid_stride_baseline.yml"  # baseline yaml path
 FULL_EPOCHS    = 120
 SEEDS          = [0, 1, 2]
 
@@ -189,7 +191,7 @@ def build_cli() -> argparse.Namespace:
     p.add_argument("--opts", nargs="*", default=[],
                    help="Extra YACS options to pass through (KEY VALUE pairs)")
 
-    # --- Scheme A: parse_known_args; merge unknown tail into args.opts ---
+    # --- Scheme A: parse_known_args; merge unknown tail into --opts ---
     args, unknown = p.parse_known_args()
     args.opts = (args.opts or []) + unknown
     return args
@@ -387,30 +389,41 @@ def main():
         exp_name = config_name
     print(f"[phased_loss] Auto-detected experiment name: {exp_name}")
 
-    # include mode/switches in tag base (for clarity) — reflect tri-state with 'yaml'
-    def _bit_from_mode():
-        if args.mode == "phased": return "phased"
+    # -------- Tag bits (no 'yaml' tokens; silence when respecting YAML) --------
+    def _bit_from_mode() -> str:
+        if args.mode == "phased":   return "phased"
         if args.mode == "baseline": return "baseline"
-        return "yaml"
+        return ""  # respect YAML silently
 
-    def _bit_from_tri(v: Optional[bool], pos: str):
-        if v is True: return pos
-        if v is False: return f"no{pos}"
-        return "yaml"
+    def _bit_from_tri(v: Optional[bool], pos: str) -> str:
+        if v is True:  return pos        # e.g., "sup", "tx"
+        if v is False: return f"no{pos}" # e.g., "nosup", "notx"
+        return ""  # respect YAML silently
 
-    mode_bits: List[str] = []
-    mode_bits.append(_bit_from_mode())
-    mode_bits.append(_bit_from_tri(args.supcon, "sup"))
-    mode_bits.append(_bit_from_tri(args.tripletx, "tx"))
+    mode_bits: List[str] = [
+        _bit_from_mode(),
+        _bit_from_tri(args.supcon, "sup"),
+        _bit_from_tri(args.tripletx, "tx"),
+    ]
+    mode_bits = [b for b in mode_bits if b]  # drop empties
     mode_suffix = "_".join(mode_bits)
+
+    def _collapse_underscores(s: str) -> str:
+        s = re.sub(r"_+", "_", s)
+        s = re.sub(r"^_|_$", "", s)
+        return s
 
     for s in seeds:
         if args.tag:
             tag_base = args.tag
         elif args.supcon is True and (T is not None) and (W is not None):
-            tag_base = f"{exp_name}_{mode_suffix}_T{_fmt(T)}_W{_fmt(W)}_seed{s}"
+            tag_core = exp_name if not mode_suffix else f"{exp_name}_{mode_suffix}"
+            tag_core = _collapse_underscores(tag_core)
+            tag_base = f"{tag_core}_T{_fmt(T)}_W{_fmt(W)}_seed{s}"
         else:
-            tag_base = f"{exp_name}_{mode_suffix}_seed{s}"
+            tag_core = exp_name if not mode_suffix else f"{exp_name}_{mode_suffix}"
+            tag_core = _collapse_underscores(tag_core)
+            tag_base = f"{tag_core}_seed{s}"
 
         rec = ensure_full_run_seed(T, W, s, args.epochs, args.save_every,
                                    log_root, args.test, tag_base, stamp, args=args)
