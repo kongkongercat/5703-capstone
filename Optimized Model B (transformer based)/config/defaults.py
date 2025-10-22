@@ -225,11 +225,18 @@ _C.SOLVER.CENTER_LR = 0.5
 _C.SOLVER.CENTER_LOSS_WEIGHT = 0.0005
 _C.SOLVER.SEED = 1234
 
+# ====== Brightness gating (dynamic dark-image handling) ======
+_C.LOSS.BRIGHTNESS = CN()
+_C.LOSS.BRIGHTNESS.ENABLE = False   # turn on in YAML when needed
+_C.LOSS.BRIGHTNESS.THRESH = 0.35    # mean RGB threshold in [0,1]
+_C.LOSS.BRIGHTNESS.K = 0.08         # extra weight or gating factor (your usage)
+
 # -----------------------------------------------------------------------------
 # TEST / EVALUATION
 # -----------------------------------------------------------------------------
 _C.TEST = CN()
 _C.TEST.IMS_PER_BATCH = 256
+
 _C.TEST.RE_RANKING = False
 _C.TEST.WEIGHT = ""
 _C.TEST.NECK_FEAT = 'before'
