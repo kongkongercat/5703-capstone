@@ -14,12 +14,22 @@
 #   - Simplify logs (no separate "SupCon+" piece) to avoid double counting. # [NEW]
 # [2025-10-14 | Hang Zhang] Epoch-aware PK-sampler K: rebuild train_loader at phase boundaries.
 #                           from datasets import make_dataloader
-# [2025-10-19 | Team 5703]  **Make phased boundary configurable & random-sampler guard**
+# [2025-10-19 | Hang Zhang]  **Make phased boundary configurable & random-sampler guard**
 #   - _tripletx_stage(epoch,cfg) reads cfg.LOSS.PHASED.TRIPLETX_END instead of hard-coded 30.
 #   - When DATALOADER.SAMPLER=='random', skip PK-K rebuild (no P×K semantics).               # [NEW]
-# [2025-10-19 | Team 5703]  **Pass BNNeck feature into loss_func & safe acc**
+# [2025-10-19 | Hang Zhang]  **Pass BNNeck feature into loss_func & safe acc**
 #   - Forward path unpacks (score, feat, feat_bn, z_supcon) and passes feat_bn to loss_func.  # [NEW]
 #   - When score is None (e.g., SupCon-only), accuracy metric is safely set to 0.            # [NEW]
+# [2025-10-22 | Hang Zhang] **Brightness-aware training (minimal change)**                   # [NEW]
+#   - Compute per-batch `dark_mask` and `dark_weight` in trainer (no Dataset/Collate change).# [NEW]
+#   - Pass `dark_mask` / `dark_weight` to loss_func(...) as OPTIONAL kwargs.                 # [NEW]
+#   - Keep loss composition inside make_loss; trainer remains thin.                          # [NEW]
+# [2025-10-23 | Hang Zhang]  **Fix brightness domain**                                        # [NEW]
+#   - Before BT.709 brightness, denormalize images using cfg.INPUT.PIXEL_MEAN/STD            # [NEW]
+#     to ~[0,1] domain; threshold 0.35 is now consistent with image domain.                  # [NEW]
+# [2025-10-23 | Hang Zhang]  **Brightness toggle via cfg**                                    # [NEW]
+#   - Guard brightness-aware training by cfg.LOSS.BRIGHTNESS.ENABLE (default False).          # [NEW]
+#   - Threshold/softness configurable via THRESH (default 0.35), K (default 0.08).            # [NEW]
 # =============================================================================
 
 import os
@@ -130,6 +140,13 @@ def _desired_pk_k(epoch: int, cfg) -> int:
 def _sampler_is_random(cfg) -> bool:
     """[NEW] Whether SAMPLER is 'random' (SupCon-only / SSL)."""
     return str(getattr(cfg.DATALOADER, "SAMPLER", "softmax_triplet")).lower() == "random"
+
+def _brightness_enabled(cfg) -> bool:
+    """Return True if brightness-aware training is enabled by config."""
+    try:
+        return bool(getattr(getattr(cfg.LOSS, "BRIGHTNESS", object()), "ENABLE", False))
+    except Exception:
+        return False
 
 
 def do_train(
@@ -308,15 +325,39 @@ def do_train(
                     score = out
                     feat = out  # best-effort fallback
 
-                # === The ONLY loss call (includes SupCon & phased weights) ===               # [NEW]
+                # ========================= BRIGHTNESS (FIXED: denorm first) ====================
+                # Compute per-image brightness in ~[0,1] domain by denormalizing with
+                # cfg.INPUT.PIXEL_MEAN/STD, then derive dark_mask and a soft weight.
+                dark_mask = None
+                dark_weight = None
+                if _brightness_enabled(cfg):
+                    with torch.no_grad():
+                        mean = torch.as_tensor(cfg.INPUT.PIXEL_MEAN, dtype=img.dtype, device=img.device).view(1, 3, 1, 1)
+                        std  = torch.as_tensor(cfg.INPUT.PIXEL_STD,  dtype=img.dtype, device=img.device).view(1, 3, 1, 1)
+                        img01 = (img * std + mean).clamp(0, 1)
+
+                        r, g, b = img01[:, 0], img01[:, 1], img01[:, 2]
+                        y = 0.2126 * r + 0.7152 * g + 0.0722 * b   # (N,H,W)
+                        _brightness = y.mean(dim=(1, 2))           # (N,)
+
+                    _THRESH = float(getattr(getattr(cfg.LOSS, "BRIGHTNESS", object()), "THRESH", 0.35))
+                    _K = float(getattr(getattr(cfg.LOSS, "BRIGHTNESS", object()), "K", 0.08))
+                    dark_mask = (_brightness < _THRESH)            # (N,) bool
+                    dark_weight = torch.sigmoid((_THRESH - _brightness) / max(_K, 1e-6)).detach()  # (N,) 0..1
+                # ==============================================================================
+
+                # === The ONLY loss call (includes SupCon & phased weights) ===                 # [NEW]
                 loss = loss_func(
                     score,
                     feat,
                     target,
-                    camids=camids,       # TripletX/SupCon need camera ids
-                    z_supcon=z_supcon,   # may be None; make_loss will fallback to feat
-                    epoch=epoch,         # critical: enable phased scheduling
-                    feat_bn=feat_bn,     # BNNeck feature routing for losses that request bnneck
+                    camids=camids,        # TripletX/SupCon need camera ids
+                    z_supcon=z_supcon,    # may be None; make_loss will fallback to feat
+                    epoch=epoch,          # critical: enable phased scheduling
+                    feat_bn=feat_bn,      # BNNeck feature routing for losses that request bnneck
+                    # Brightness-aware OPTIONAL hints (consumed in make_loss if supported)
+                    dark_mask=dark_mask,
+                    dark_weight=dark_weight,
                 )
 
             # Backward & step with AMP
@@ -352,7 +393,7 @@ def do_train(
                 except Exception:
                     lr_val = 0.0
 
-                # Unified log (SupCon already included inside total loss).                    # [CHG]
+                # Unified log (SupCon already included inside total loss).
                 logging.getLogger("transreid.train").info(
                     "Epoch[{}] Iter[{}/{}] Loss: {:.3f}, Acc: {:.3f}, LR: {:.2e}".format(
                         epoch, (n_iter + 1), len(train_loader),
