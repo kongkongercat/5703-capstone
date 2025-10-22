@@ -1,0 +1,26 @@
+LOSS:
+  PHASED:
+    ENABLE: False          # Disable epoch-phased switching (A/B/C)
+
+  TRIPLET:
+    FEAT_SRC: 'pre_bn'     # Feature source for Triplet on normal subset
+
+  TRIPLETX:
+    ENABLE: true           # Enable TripletX for the dark subset
+    W: 1.2                 # Loss weight for TripletX (dark subset)
+    FEAT_SRC: 'pre_bn'     # Feature source for TripletX
+
+  SUPCON:
+    ENABLE: true           # Enable SupCon (applies to full batch; dark gets a mild boost)
+    # Choose ONE of the following weighting schemes:
+    W: 0.30                # Static weight (simple)
+    # Or use decay scheduling instead of W:
+    # W0: 0.30
+    # DECAY_TYPE: linear
+    # DECAY_START: 30
+    # DECAY_END: 60        # If missing, code falls back to SOLVER.MAX_EPOCHS
+
+  BRIGHTNESS:
+    ENABLE: true           # Turn on brightness-aware training (split by subset)
+    THRESH: 0.35           # BT.709 brightness threshold after de-normalization
+    K: 0.08                # Smoothing factor for soft dark weighting
