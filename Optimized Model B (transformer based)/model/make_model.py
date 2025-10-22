@@ -36,7 +36,7 @@ from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 #     (z_supcon=None if SupCon disabled)
 #
 # Training-time returns (transformer_local):
-#   - always return 4 items: (scores, feats, feat_bn_global, z_supcon)
+#   - always return 4 items: (scores, feats, feat_bn_global_or_list, z_supcon)
 #
 # Test-time behavior is unchanged (controlled by cfg.TEST.NECK_FEAT).
 #
@@ -67,6 +67,13 @@ from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 # [2025-10-19 | Hang Zhang]            **Classification head label passing fix**
 #                                       - For margin-softmax heads (arcface/cosface/amsoftmax/circle),
 #                                         always pass `label` to classifier; Linear head does not.   # [NEW]
+# [2025-10-21 | Hang Zhang]      add self.bottleneck_3.bias.requires_grad_(False), self.bottleneck_3.apply(weights_init_kaiming)
+# [2025-10-22 | Hang Zhang]      **Option-B (BNNeck parity)**
+#                                 - For build_transformer_local (JPM=True), training forward now returns
+#                                   feat_bn as a list: [feat_bn_global, local_bn1, local_bn2, local_bn3, local_bn4].
+#                                 - Backbone/build_transformer keep a single BNNeck tensor for feat_bn.
+#                                 - Enables Triplet/TripletX to aggregate "global + 4×local BNNeck"
+#                                   mirroring the pre_bn path (structure parity).
 # =============================================================================
 
 
@@ -384,6 +391,8 @@ class build_transformer_local(nn.Module):
         self.bottleneck_2.bias.requires_grad_(False)
         self.bottleneck_2.apply(weights_init_kaiming)
         self.bottleneck_3 = nn.BatchNorm1d(self.in_planes)
+        self.bottleneck_3.bias.requires_grad_(False)
+        self.bottleneck_3.apply(weights_init_kaiming)
         self.bottleneck_4 = nn.BatchNorm1d(self.in_planes)
         self.bottleneck_4.bias.requires_grad_(False)
         self.bottleneck_4.apply(weights_init_kaiming)
@@ -464,8 +473,14 @@ class build_transformer_local(nn.Module):
                     self.classifier_4(local_feat_4_bn)
                 ]
 
+            # pre-BN features (kept unchanged)
             feats = [global_feat, local_feat_1, local_feat_2, local_feat_3, local_feat_4]
-            return scores, feats, feat_bn_global, z_supcon
+
+            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            # [2025-10-22] Option-B: return BNNeck list for local model
+            feats_bn = [feat_bn_global, local_feat_1_bn, local_feat_2_bn, local_feat_3_bn, local_feat_4_bn]
+            return scores, feats, feats_bn, z_supcon
+            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         else:
             if self.neck_feat == 'after':
                 return torch.cat(
