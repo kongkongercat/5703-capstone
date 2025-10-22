@@ -136,6 +136,11 @@
 #
 # [2025-10-23 | Hang Zhang] **FIX**: Read SUPCON.DECAY_END with fallback to SOLVER.MAX_EPOCHS
 #                           - decay_ed = cfg.LOSS.SUPCON.DECAY_END if set else cfg.SOLVER.MAX_EPOCHS.
+#
+# [2025-10-23 | Hang Zhang] **FIX**: PK-uniformity guard for brightness split
+#                           - In brightness split, compute Triplet/TripletX per subset only when each subset
+#                             retains PK-uniformity (each ID has equal count and >=2). Otherwise fallback to
+#                             legacy single-path (phase-based) to avoid hard_example_mining reshape errors.
 # ==========================================
 
 import torch
@@ -543,6 +548,24 @@ def make_loss(cfg, num_classes):
                         except TypeError:
                             return _reduce_triplet_output(tripletx_obj(feats, tgt))
 
+                # ---- NEW: PK-uniformity checker (per-subset) ----
+                def _pk_uniform(labels_subset: torch.Tensor) -> bool:
+                    """
+                    Return True only if:
+                      - there are at least 2 samples total;
+                      - every ID count is >=2;
+                      - all IDs have the SAME count (uniform K), preserving P×K semantics.
+                    This guarantees hard_example_mining can safely `view(N, -1)`.
+                    """
+                    if labels_subset.numel() < 2:
+                        return False
+                    uniq, counts = torch.unique(labels_subset, return_counts=True)
+                    if counts.numel() == 0:
+                        return False
+                    min_c = counts.min().item()
+                    max_c = counts.max().item()
+                    return (min_c >= 2) and (min_c == max_c)
+
                 # Select sources per metric kind
                 tri_in_norm = _pick_by_src_with_fallback(tri_src_triplet,  global_pre_bn, bnneck, _warn_once_tri, "Triplet")
                 tri_in_dark = _pick_by_src_with_fallback(tri_src_tripletx, global_pre_bn, bnneck, _warn_once_tri, "TripletX")
@@ -550,26 +573,43 @@ def make_loss(cfg, num_classes):
                 L_tri_norm = torch.tensor(0.0, device=global_pre_bn.device)
                 L_trix_dark = torch.tensor(0.0, device=global_pre_bn.device)
 
-                ok_norm = idx_norm.numel() >= 2 and (tri_w > 0.0) and (triplet_plain is not None)
-                ok_dark = idx_dark.numel() >= 2 and (tx_w > 0.0) and (tripletx_obj is not None)
+                ok_norm = (
+                    idx_norm.numel() >= 2 and
+                    (tri_w > 0.0) and
+                    (triplet_plain is not None)
+                )
+                ok_dark = (
+                    idx_dark.numel() >= 2 and
+                    (tx_w > 0.0) and
+                    (tripletx_obj is not None)
+                )
+
+                # ---- NEW: enforce PK-uniformity per subset ----
+                if ok_norm:
+                    tgt_n = target[idx_norm]
+                    ok_norm = _pk_uniform(tgt_n)
+                if ok_dark:
+                    tgt_d = target[idx_dark]
+                    ok_dark = _pk_uniform(tgt_d)
 
                 if ok_norm:
                     feats_n = tri_in_norm[idx_norm] if tri_in_norm.dim() > 1 else tri_in_norm
                     tgt_n = target[idx_norm]
                     L_tri_norm = _call_triplet_plain(feats_n, tgt_n)
+                    did_split = True
 
                 if ok_dark:
                     feats_d = tri_in_dark[idx_dark] if tri_in_dark.dim() > 1 else tri_in_dark
                     tgt_d = target[idx_dark]
                     cams_d = camids[idx_dark] if camids is not None else None
                     L_trix_dark = _call_tripletx(feats_d, tgt_d, cams_d, epoch)
+                    did_split = True
 
-                if ok_norm or ok_dark:
+                if did_split:
                     total += (tri_w * L_tri_norm) + (tx_w * L_trix_dark)
                     metric_w_eff_for_log = (tri_w if ok_norm else 0.0) + (tx_w if ok_dark else 0.0)
                     # mark split mode for logging
                     phase_use_tx = False
-                    did_split = True
 
             if not did_split and (sampler != "random"):
                 # Legacy single-path (unchanged): phase-based metric
