@@ -22,7 +22,7 @@
 #                           Added sampler='random' branch for B3 (SSL pretraining).
 #                           Made triplet optional; added camids/epoch passthrough for TripletX.
 #
-# [2025-10-11 | Hang Zhang] Compatibility fix (Plan B):
+# [2025-10-11 | Meng Fanyi] Compatibility fix (Plan B):
 #                           - Conditionally pass camids/epoch only when TRIPLETX.ENABLE=True.
 #                           - Keep plain TripletLoss two-arg call in B0.
 #                           - Robust handling for tuple/single return from metric loss.
@@ -141,6 +141,11 @@
 #                           - In brightness split, compute Triplet/TripletX per subset only when each subset
 #                             retains PK-uniformity (each ID has equal count and >=2). Otherwise fallback to
 #                             legacy single-path (phase-based) to avoid hard_example_mining reshape errors.
+#
+# [2025-10-23 | Hang Zhang] Single-path fallback policy under brightness OFF / split fallback
+#                           - In single-path branch (did_split==False), prefer baseline Triplet
+#                             when PHASED.ENABLE=False. Only use TripletX in phased Stage-A.
+#                             Brightness split and phased scheduling remain unchanged.
 # ==========================================
 
 import torch
@@ -322,7 +327,7 @@ def make_loss(cfg, num_classes):
     # --------------------------------------------------------
     triplet = None
     use_tx = False
-    # [NEW] Build both variants for split-by-subset; keep original 'triplet' for legacy path
+    # Build both for dynamic selection
     triplet_plain = None  # TripletLoss
     tripletx_obj = None   # TripletXLoss
 
@@ -349,7 +354,6 @@ def make_loss(cfg, num_classes):
             if not use_tx:
                 triplet = triplet_plain
                 print(f"[make_loss] Using standard Triplet loss (margin={getattr(cfg.SOLVER, 'MARGIN', 0.3)})")
-        # For legacy path keep 'triplet' pointing to current phase choice (TripletX or Triplet)
         if use_tx:
             triplet = tripletx_obj
 
@@ -460,9 +464,9 @@ def make_loss(cfg, num_classes):
     # ========================================================
     # Loss function closure
     # ========================================================
-    # [NEW] Accept brightness hints. When provided:
-    #       - Metric is split: normal->Triplet, dark->TripletX
-    #       - SupCon is boosted on dark subset
+    # Accept brightness hints. When provided:
+    #   - Metric is split: normal->Triplet, dark->TripletX
+    #   - SupCon is boosted on dark subset
     def loss_func(score, feat, target, camids=None, z_supcon=None, epoch=None, feat_bn=None,
                   dark_mask=None, dark_weight=None):
         """Compute total loss = ID + Metric + SupCon (gated by weights/enables)."""
@@ -488,7 +492,6 @@ def make_loss(cfg, num_classes):
             else:
                 ID_LOSS = xent(score, target) if xent else F.cross_entropy(score, target)
             total += id_w * ID_LOSS
-            # (Optional) per-sample dark weighting for CE could be added here if your CE supports reduction='none'
 
         # --- Prepare features ---
         global_pre_bn, bnneck = _unpack_feats_for_sources(feat, feat_bn)
@@ -521,11 +524,6 @@ def make_loss(cfg, num_classes):
         metric_w_eff_for_log = 0.0  # for logger
 
         if metric_cfg_triplet_mode and ((triplet_plain is not None) or (tripletx_obj is not None)):
-            # Default legacy: choose by phase (single metric)
-            phase_use_tx = (TripletXLoss is not None and tripletx_cfg_enabled)
-            if phased_on and (epoch is not None) and (TripletXLoss is not None):
-                phase_use_tx = (int(epoch) <= int(tripletx_end))
-
             # === Split-by-subset when dark_mask is provided ===
             did_split = False
             if isinstance(dark_mask, torch.Tensor) and (sampler != "random"):
@@ -548,15 +546,8 @@ def make_loss(cfg, num_classes):
                         except TypeError:
                             return _reduce_triplet_output(tripletx_obj(feats, tgt))
 
-                # ---- NEW: PK-uniformity checker (per-subset) ----
+                # ---- PK-uniformity checker (per-subset) ----
                 def _pk_uniform(labels_subset: torch.Tensor) -> bool:
-                    """
-                    Return True only if:
-                      - there are at least 2 samples total;
-                      - every ID count is >=2;
-                      - all IDs have the SAME count (uniform K), preserving P×K semantics.
-                    This guarantees hard_example_mining can safely `view(N, -1)`.
-                    """
                     if labels_subset.numel() < 2:
                         return False
                     uniq, counts = torch.unique(labels_subset, return_counts=True)
@@ -584,7 +575,6 @@ def make_loss(cfg, num_classes):
                     (tripletx_obj is not None)
                 )
 
-                # ---- NEW: enforce PK-uniformity per subset ----
                 if ok_norm:
                     tgt_n = target[idx_norm]
                     ok_norm = _pk_uniform(tgt_n)
@@ -608,21 +598,34 @@ def make_loss(cfg, num_classes):
                 if did_split:
                     total += (tri_w * L_tri_norm) + (tx_w * L_trix_dark)
                     metric_w_eff_for_log = (tri_w if ok_norm else 0.0) + (tx_w if ok_dark else 0.0)
-                    # mark split mode for logging
-                    phase_use_tx = False
-
+                    phase_use_tx = False  # logged as Split
+            # === Single-path (fallback / brightness OFF / split disabled) ===
             if not did_split and (sampler != "random"):
-                # Legacy single-path (unchanged): phase-based metric
+                # Only use TripletX in phased Stage-A; otherwise prefer Triplet.
+                if phased_on and (epoch is not None) and (TripletXLoss is not None) and tripletx_cfg_enabled:
+                    phase_use_tx = (int(epoch) <= int(tripletx_end))
+                else:
+                    phase_use_tx = False  # Triplet-first
+
                 metric_w_eff = (tx_w if phase_use_tx else tri_w)
-                if metric_w_eff > 0.0 and (triplet is not None):
-                    def _call_triplet_core(f):
+
+                # Runtime selector to call the correct loss object/signature
+                def _call_triplet_core(f):
+                    if phase_use_tx and (tripletx_obj is not None) and (tx_w > 0.0):
                         try:
-                            return _reduce_triplet_output(triplet(f, target, camids=camids, epoch=epoch))
+                            return _reduce_triplet_output(tripletx_obj(f, target, camids=camids, epoch=epoch))
                         except TypeError:
                             try:
-                                return _reduce_triplet_output(triplet(f, target, camids=camids))
+                                return _reduce_triplet_output(tripletx_obj(f, target, camids=camids))
                             except TypeError:
-                                return _reduce_triplet_output(triplet(f, target))
+                                return _reduce_triplet_output(tripletx_obj(f, target))
+                    else:
+                        try:
+                            return _reduce_triplet_output(triplet_plain(f, target))
+                        except TypeError:
+                            return _reduce_triplet_output(triplet_plain(f, target))
+
+                if metric_w_eff > 0.0 and ((triplet_plain is not None) or (tripletx_obj is not None)):
                     if isinstance(feat, list):
                         tri_list = [_call_triplet_core(f) for f in (feat[1:] if len(feat) > 1 else [])]
                         tri0 = _call_triplet_core(feat[0])
@@ -677,7 +680,7 @@ def make_loss(cfg, num_classes):
             if isinstance(dark_mask, torch.Tensor):
                 metric_kind = "Split"  # Triplet(normal) + TripletX(dark)
                 metric_src_used = f"Tri:{tri_src_triplet}|TX:{tri_src_tripletx}"
-            elif (triplet is not None) and (metric_w_eff_for_log > 0.0):
+            elif metric_w_eff_for_log > 0.0:
                 metric_kind = "TripletX" if phase_use_tx else "Triplet"
                 metric_src_used = (tri_src_tripletx if phase_use_tx else tri_src_triplet)
 
