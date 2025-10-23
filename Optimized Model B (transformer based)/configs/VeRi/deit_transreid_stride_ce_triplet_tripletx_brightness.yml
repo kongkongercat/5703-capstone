@@ -1,0 +1,25 @@
+LOSS:
+  PHASED:
+    ENABLE: False          # Disable epoch-phased switching (A/B/C)
+
+  TRIPLET:
+    FEAT_SRC: 'pre_bn'     # Feature source for Triplet on normal subset
+
+  TRIPLETX:
+    ENABLE: true           # Enable TripletX for the dark subset
+    W: 1.2                 # Loss weight for TripletX (dark subset)
+    FEAT_SRC: 'pre_bn'     # Feature source for TripletX
+    NORM_FEAT: True                                  #L2 normalization (L2)
+    MARGIN: 0.30                                     # TripletX margin
+    SOFT_WARMUP: True                                # Use soft-margin warmup
+    WARMUP_EPOCHS: 10                                # Warmup epochs
+    K: 8                                             # Top-k hard mining
+    ALPHA: 2.0                                       # Hardness-aware weighting
+    CROSS_CAM_POS: True                              # Allow cross-camera positives
+    SAME_CAM_NEG_BOOST: 1.2                          # Boost same-camera negatives
+
+
+  BRIGHTNESS:
+    ENABLE: true           # Turn on brightness-aware training (split by subset)
+    THRESH: 0.35           # BT.709 brightness threshold after de-normalization
+    K: 0.08                # Smoothing factor for soft dark weighting
