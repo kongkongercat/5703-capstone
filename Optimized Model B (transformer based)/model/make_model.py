@@ -1,4 +1,4 @@
-# modeling/make_model.py
+# model/make_model.py
 # encoding: utf-8
 """
 @author:  liaoxingyu
