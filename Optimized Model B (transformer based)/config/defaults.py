@@ -231,6 +231,11 @@ _C.LOSS.BRIGHTNESS.ENABLE = False   # turn on in YAML when needed
 _C.LOSS.BRIGHTNESS.THRESH = 0.35    # mean RGB threshold in [0,1]
 _C.LOSS.BRIGHTNESS.K = 0.08         # extra weight or gating factor (your usage)
 
+# ---- CLIP fusion (minimal) ----
+_C.MODEL.USE_CLIP = False
+_C.MODEL.CLIP_BACKBONE = "ViT-B-16"
+_C.MODEL.CLIP_PRETRAIN = "laion2b_s34b_b88k"
+
 # -----------------------------------------------------------------------------
 # TEST / EVALUATION
 # -----------------------------------------------------------------------------

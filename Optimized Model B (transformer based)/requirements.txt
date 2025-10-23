@@ -3,3 +3,11 @@ torchvision
 timm
 yacs
 opencv-python
+
+# --- for CLIP (open-clip) ---
+open-clip-torch
+ftfy
+regex
+tqdm
+Pillow
+# sentencepiece

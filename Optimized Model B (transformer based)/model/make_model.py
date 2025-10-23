@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
+import open_clip  # [2025-10-23] CLIP visual encoder
 from .backbones.resnet import ResNet, Bottleneck
 from .backbones.vit_pytorch import (
     vit_base_patch16_224_TransReID,
@@ -74,6 +75,11 @@ from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 #                                 - Backbone/build_transformer keep a single BNNeck tensor for feat_bn.
 #                                 - Enables Triplet/TripletX to aggregate "global + 4×local BNNeck"
 #                                   mirroring the pre_bn path (structure parity).
+# [2025-10-23 | Hang Zhang]      **CLIP fusion (minimal, JPM=True)**
+#                                 - Added optional frozen CLIP visual encoder to build_transformer_local.
+#                                 - Fused CLIP only into GLOBAL pre-BN (concat+Linear); 4 local branches unchanged.
+#                                 - Controlled by MODEL.USE_CLIP, with MODEL.CLIP_BACKBONE / CLIP_PRETRAIN (optional).
+#                                 - Disabled -> exact parity with previous behavior (bitwise-compatible paths).
 # =============================================================================
 
 
@@ -401,6 +407,24 @@ class build_transformer_local(nn.Module):
         self.shift_num = cfg.MODEL.SHIFT_NUM
         self.divide_length = cfg.MODEL.DEVIDE_LENGTH
 
+        # ---------------- CLIP (optional, minimal) ----------------
+        self.use_clip = getattr(cfg.MODEL, "USE_CLIP", False)
+        if self.use_clip:
+            clip_backbone = getattr(cfg.MODEL, "CLIP_BACKBONE", "ViT-B-16")
+            clip_pretrain = getattr(cfg.MODEL, "CLIP_PRETRAIN", "laion2b_s34b_b88k")
+            self.clip_model, _, _ = open_clip.create_model_and_transforms(
+                clip_backbone, pretrained=clip_pretrain
+            )
+            for p in self.clip_model.parameters():
+                p.requires_grad = False
+            self.clip_model.eval()
+            # Fuse [global_feat ; clip_feat] -> in_planes (base=768, small=384)
+            self.fuse_proj_global = nn.Linear(
+                self.in_planes + self.clip_model.visual.output_dim,
+                self.in_planes
+            )
+            print("[make_model][init] CLIP fusion enabled (TransformerLocal): global pre-BN only; locals unchanged.")
+
         # SupCon head
         self.supcon_enabled = (
             hasattr(cfg, "LOSS")
@@ -419,10 +443,13 @@ class build_transformer_local(nn.Module):
                   "L2 normalization is handled in SupConLoss.")
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
+        # keep a copy of input image for CLIP encode_image (x is later reused for tokens)
+        x_img = x
+
         features = self.base(x, cam_label=cam_label, view_label=view_label)
 
         b1_feat = self.b1(features)
-        global_feat = b1_feat[:, 0]
+        global_feat = b1_feat[:, 0]  # CLS token
 
         feature_length = features.size(1) - 1
         patch_length = feature_length // self.divide_length
@@ -443,20 +470,30 @@ class build_transformer_local(nn.Module):
         local_feat_3 = extract_local(patch_length * 2, patch_length * 3)
         local_feat_4 = extract_local(patch_length * 3, patch_length * 4)
 
-        feat_bn_global = self.bottleneck(global_feat)
+        # ---------------- CLIP fusion for GLOBAL pre-BN only ----------------
+        if getattr(self, "use_clip", False):
+            with torch.no_grad():
+                # Minimal-change: reuse current x_img; CLIP is frozen so this is acceptable.
+                feat_clip = self.clip_model.encode_image(x_img)  # [B, D_clip]
+            pre_bn_global = self.fuse_proj_global(torch.cat([global_feat, feat_clip], dim=1))
+        else:
+            pre_bn_global = global_feat
+
+        feat_bn_global = self.bottleneck(pre_bn_global)
         local_feat_1_bn = self.bottleneck_1(local_feat_1)
         local_feat_2_bn = self.bottleneck_2(local_feat_2)
         local_feat_3_bn = self.bottleneck_3(local_feat_3)
         local_feat_4_bn = self.bottleneck_4(local_feat_4)
 
+        # ---------------- SupCon input selection (respect FEAT_SRC) ----------------
         z_supcon = None
         if self.training and self.supcon_enabled:
-            sup_in = _pick_feat_by_src(self.supcon_feat_src, global_feat, feat_bn_global)
+            # If FEAT_SRC == 'bnneck' use fused BN; else use fused pre-BN
+            sup_in = feat_bn_global if self.supcon_feat_src == "bnneck" else pre_bn_global
             if not self._supcon_log_done:
                 print(f"[make_model][combo] [SupCon] src=model::{self.supcon_feat_src} "
                       f"| head=2xLinear(->128) | output=UN-normalized (L2 in SupConLoss)")
                 self._supcon_log_done = True
-            # NOTE: normalization moved to SupConLoss; keep raw projection here.
             z_supcon = self.supcon_head(sup_in)
 
         if self.training:
@@ -473,24 +510,24 @@ class build_transformer_local(nn.Module):
                     self.classifier_4(local_feat_4_bn)
                 ]
 
-            # pre-BN features (kept unchanged)
-            feats = [global_feat, local_feat_1, local_feat_2, local_feat_3, local_feat_4]
+            # pre-BN features: global uses fused pre-BN; locals unchanged
+            feats = [pre_bn_global, local_feat_1, local_feat_2, local_feat_3, local_feat_4]
 
-            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-            # [2025-10-22] Option-B: return BNNeck list for local model
+            # BNNeck list (Option-B parity)
             feats_bn = [feat_bn_global, local_feat_1_bn, local_feat_2_bn, local_feat_3_bn, local_feat_4_bn]
             return scores, feats, feats_bn, z_supcon
-            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         else:
             if self.neck_feat == 'after':
+                # Return fused BN for global, locals BN (scaled)
                 return torch.cat(
                     [feat_bn_global,
                      local_feat_1_bn / 4, local_feat_2_bn / 4, local_feat_3_bn / 4, local_feat_4_bn / 4],
                     dim=1
                 )
             else:
+                # Return fused pre-BN for global, locals pre-BN (scaled)
                 return torch.cat(
-                    [global_feat,
+                    [pre_bn_global,
                      local_feat_1 / 4, local_feat_2 / 4, local_feat_3 / 4, local_feat_4 / 4],
                     dim=1
                 )
