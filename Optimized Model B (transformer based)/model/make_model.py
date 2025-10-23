@@ -17,6 +17,7 @@ from .backbones.vit_pytorch import (
     deit_small_patch16_224_TransReID
 )
 from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
+from transformers import CLIPModel
 
 
 # =============================================================================
@@ -416,9 +417,12 @@ class build_transformer_local(nn.Module):
         # ---------------- TinyCLIP + AFEM integration ----------------
         self.use_clip = getattr(cfg.MODEL, "USE_CLIP", False)
         if self.use_clip:
-            clip_backbone = "TinyCLIP-ViT-B-16"
-            clip_pretrain = "laion2b_yfcc_s11b"
-            self.clip_model = open_clip.create_model(clip_backbone, pretrained=clip_pretrain)
+            # Local TinyCLIP model path
+            local_tinyclip_path = "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/pretrained/TinyCLIP-ViT-61M-32-Text-29M-LAION400M"
+
+            # Load TinyCLIP model using Hugging Face Transformers
+            print(f"[make_model][init] Loading TinyCLIP from local path: {local_tinyclip_path}")
+            self.clip_model = CLIPModel.from_pretrained(local_tinyclip_path).vision_model
 
             # Fixed input 320×320
             self.clip_input_size = (320, 320)

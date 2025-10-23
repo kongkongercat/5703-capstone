@@ -231,10 +231,15 @@ _C.LOSS.BRIGHTNESS.ENABLE = False   # turn on in YAML when needed
 _C.LOSS.BRIGHTNESS.THRESH = 0.35    # mean RGB threshold in [0,1]
 _C.LOSS.BRIGHTNESS.K = 0.08         # extra weight or gating factor (your usage)
 
-# ---- CLIP fusion (minimal) ----
-_C.MODEL.USE_CLIP = False                           # enable TinyCLIP + AFEM fusion in build_transformer_local
-_C.MODEL.CLIP_BACKBONE = "TinyCLIP-ViT-B-16"        # open_clip.create_model(model, pretrained)
-_C.MODEL.CLIP_PRETRAIN = "laion2b_yfcc_s11b"        # pretrained tag (no image_size arg)
+
+# ---- CLIP (HF TinyCLIP local) ----
+_C.MODEL.USE_CLIP = True
+_C.MODEL.CLIP_IMPL = "hf"   # ["hf", "open_clip"]
+_C.MODEL.CLIP_HF_ID = "laion-ai/TinyCLIP-ViT-61M-32-Text-29M"  
+_C.MODEL.CLIP_LOCAL_PATH = "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/pretrained/TinyCLIP-ViT-61M-32-Text-29M-LAION400M"
+_C.MODEL.CLIP_INPUT_SIZE = (320, 320)
+
+
 
 # -----------------------------------------------------------------------------
 # TEST / EVALUATION
