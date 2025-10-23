@@ -550,7 +550,12 @@ class build_transformer_local(nn.Module):
                         x_clip, size=self.clip_input_size, mode="bicubic", align_corners=False
                     )
                 # Use projection output (image_embeds)
-                out = self.clip_model(pixel_values=x_clip, return_dict=True)
+                out = self.clip_model(
+                    pixel_values=x_clip,
+                    return_dict=True,
+                    interpolate_pos_encoding=True   
+                )
+
                 feat_clip = out.image_embeds  # [B, projection_dim]
 
             # Align dtype before fusion (safe with AMP/bfloat16)
