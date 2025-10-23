@@ -475,7 +475,7 @@ class build_transformer_local(nn.Module):
             for p in self.clip_model.parameters():
                 p.requires_grad = True
 
-            self.clip_output_dim = getattr(self.clip_model.visual, "output_dim", 768)
+            self.clip_output_dim = getattr(self.clip_model, "output_dim", 768)
             self.fuse_proj_global = nn.Linear(self.in_planes + self.clip_output_dim, self.in_planes)
             self.afem = AFEM(dim=self.clip_output_dim, groups=32)
             self.sem_refine_proj = nn.Linear(self.clip_output_dim, self.in_planes)
