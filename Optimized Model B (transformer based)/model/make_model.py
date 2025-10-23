@@ -422,29 +422,34 @@ class build_transformer_local(nn.Module):
             local_tinyclip_path = cfg.MODEL.CLIP_LOCAL_PATH
             print(f"[make_model][init] Loading TinyCLIP: {local_tinyclip_path}")
 
-            # === 2. Try loading TinyCLIP ===
             try:
                 if local_tinyclip_path.endswith(".pt"):
-                    # ----- (A) OpenCLIP .pt -----
+                    # ----- (A) OpenCLIP .pt (safe float32 loading) -----
                     import open_clip
-                    print(f"[make_model][init] Loading TinyCLIP via open_clip: {local_tinyclip_path}")
-                    clip_model, _, _ = open_clip.create_model_and_transforms(
-                        model_name="ViT-B-16",  # TinyCLIP based on ViT-B/16
-                        pretrained=local_tinyclip_path
-                    )
-
-                    # ---- auto convert dtype ----
                     import torch
-                    first_param = next(iter(clip_model.parameters()))
-                    if first_param.dtype == torch.float16:
-                        print("[make_model][TinyCLIP] Detected float16 weights, converting to float32 for stability...")
-                        clip_model = clip_model.float()
+
+                    print(f"[make_model][init] Loading TinyCLIP via open_clip (safe float32 mode): {local_tinyclip_path}")
+
+                    # (1) Create model structure only, without loading weights
+                    clip_model = open_clip.create_model("ViT-B-16", pretrained=None)
+                    clip_model = clip_model.float()  # Ensure all params & buffers are float32
+
+                    # (2) Manually load weights and convert any HalfTensor to Float32
+                    state_dict = torch.load(local_tinyclip_path, map_location="cpu")
+                    converted = 0
+                    for k, v in state_dict.items():
+                        if isinstance(v, torch.HalfTensor):
+                            state_dict[k] = v.float()
+                            converted += 1
+                    msg = clip_model.load_state_dict(state_dict, strict=False)
+                    print(f"[make_model][TinyCLIP] Weights loaded (Half→Float32, converted {converted} tensors).")
+                    print(f"[make_model][TinyCLIP] Missing keys: {len(msg.missing_keys)}, Unexpected keys: {len(msg.unexpected_keys)}")
 
                     self.clip_model = clip_model.visual
-                    print("[make_model][TinyCLIP] Successfully loaded and converted to float32.")
+                    print("[make_model][TinyCLIP] Successfully loaded in safe float32 mode.")
 
                 else:
-                    # ----- (B) Transformers -----
+                    # ----- (B) Transformers checkpoint -----
                     from transformers import CLIPModel, CLIPConfig
                     print(f"[make_model][init] Loading TinyCLIP via transformers: {local_tinyclip_path}")
                     config = CLIPConfig.from_pretrained(local_tinyclip_path, local_files_only=True)
@@ -453,20 +458,8 @@ class build_transformer_local(nn.Module):
                     print("[make_model][TinyCLIP] Loaded via transformers successfully.")
 
             except Exception as e:
-                print(f"[make_model][error] Failed to load TinyCLIP: {e}")
-                print("[make_model][warn] Retrying with float32 fallback...")
-                try:
-                    import open_clip
-                    clip_model, _, _ = open_clip.create_model_and_transforms(
-                        model_name="ViT-B-16",
-                        pretrained=local_tinyclip_path
-                    )
-                    clip_model = clip_model.float()
-                    self.clip_model = clip_model.visual
-                    print("[make_model][TinyCLIP] Loaded successfully after float32 retry.")
-                except Exception as e2:
-                    print(f"[make_model][fatal] TinyCLIP loading failed again: {e2}")
-                    self.clip_model = None
+                print(f"[make_model][fatal] TinyCLIP loading failed: {e}")
+                self.clip_model = None
 
 
             # Fixed input 320×320
