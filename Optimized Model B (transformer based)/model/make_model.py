@@ -460,10 +460,43 @@ class build_transformer_local(nn.Module):
             except Exception as e:
                 print(f"[make_model][fatal] TinyCLIP loading failed: {e}")
                 self.clip_model = None
-
-
-            # Fixed input 320×320
+            
+            
+            # === Fixed input (320×320 or 256×256) ===
             self.clip_input_size = (320, 320)
+
+            # === Resize positional embedding for CLIP visual encoder ===
+            def _resize_clip_pos_embed(clip_visual, new_grid_hw):
+                """
+                Resize positional embedding from pretrained TinyCLIP (usually 14×14+1 for 224)
+                to match new patch grid (e.g., 20×20+1 for 320).
+                """
+                # [1, L, C] → separate [CLS] token and grid
+                pe = clip_visual.positional_embedding
+                cls, grid = pe[:, :1, :], pe[:, 1:, :]
+                L, C = grid.shape[1], grid.shape[2]
+
+                # old grid (usually 14×14)
+                old_h = old_w = int(L ** 0.5)
+                grid = grid.reshape(1, old_h, old_w, C).permute(0, 3, 1, 2)  # [1, C, H, W]
+
+                # interpolate to new grid size (e.g., 20×20 for 320×320)
+                grid = torch.nn.functional.interpolate(
+                    grid, size=new_grid_hw, mode="bicubic", align_corners=False
+                )
+
+                # reshape back and concatenate with cls token
+                grid = grid.permute(0, 2, 3, 1).reshape(1, new_grid_hw[0] * new_grid_hw[1], C)
+                clip_visual.positional_embedding = torch.cat([cls, grid], dim=1)
+
+            # === compute new grid size ===
+            patch = 16
+            new_h = self.clip_input_size[0] // patch
+            new_w = self.clip_input_size[1] // patch
+
+            # === apply resize ===
+            _resize_clip_pos_embed(self.clip_model, (new_h, new_w))
+
 
             # Disable text branch
             if hasattr(self.clip_model, "transformer"):
