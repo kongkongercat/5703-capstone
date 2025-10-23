@@ -80,6 +80,11 @@ from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 #                                 - Fused CLIP only into GLOBAL pre-BN (concat+Linear); 4 local branches unchanged.
 #                                 - Controlled by MODEL.USE_CLIP, with MODEL.CLIP_BACKBONE / CLIP_PRETRAIN (optional).
 #                                 - Disabled -> exact parity with previous behavior (bitwise-compatible paths).
+# [2025-10-23 | Hang Zhang]      **CLIP pos-embed size fix (197 -> 257)**
+#                                 - Initialize CLIP with image_size=256 so positional embedding is
+#                                   auto-interpolated to 16*16+1=257 tokens.
+#                                 - In forward(), convert ImageNet-normalized tensor to CLIP stats
+#                                   before encode_image (no resizing). Fixes RuntimeError: 257 vs 197.
 # =============================================================================
 
 
@@ -412,18 +417,33 @@ class build_transformer_local(nn.Module):
         if self.use_clip:
             clip_backbone = getattr(cfg.MODEL, "CLIP_BACKBONE", "ViT-B-16")
             clip_pretrain = getattr(cfg.MODEL, "CLIP_PRETRAIN", "laion2b_s34b_b88k")
+
+            # Key: image_size=256 -> auto-interpolate CLIP positional embedding to 16*16+1=257
             self.clip_model, _, _ = open_clip.create_model_and_transforms(
-                clip_backbone, pretrained=clip_pretrain
+                clip_backbone, pretrained=clip_pretrain, image_size=256
             )
             for p in self.clip_model.parameters():
                 p.requires_grad = False
             self.clip_model.eval()
+
             # Fuse [global_feat ; clip_feat] -> in_planes (base=768, small=384)
             self.fuse_proj_global = nn.Linear(
                 self.in_planes + self.clip_model.visual.output_dim,
                 self.in_planes
             )
-            print("[make_model][init] CLIP fusion enabled (TransformerLocal): global pre-BN only; locals unchanged.")
+
+            # Cache ImageNet and CLIP normalization stats as buffers (move with .to(device))
+            im_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+            im_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+            clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
+            clip_std  = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+            self.register_buffer("imnet_mean", im_mean, persistent=False)
+            self.register_buffer("imnet_std",  im_std,  persistent=False)
+            self.register_buffer("clip_mean",  clip_mean, persistent=False)
+            self.register_buffer("clip_std",   clip_std,  persistent=False)
+
+            print("[make_model][init] CLIP fusion enabled (TransformerLocal, image_size=256): "
+                  "global pre-BN only; locals unchanged.")
 
         # SupCon head
         self.supcon_enabled = (
@@ -473,8 +493,13 @@ class build_transformer_local(nn.Module):
         # ---------------- CLIP fusion for GLOBAL pre-BN only ----------------
         if getattr(self, "use_clip", False):
             with torch.no_grad():
-                # Minimal-change: reuse current x_img; CLIP is frozen so this is acceptable.
-                feat_clip = self.clip_model.encode_image(x_img)  # [B, D_clip]
+                # x_img is ImageNet-normalized at 256x256.
+                # 1) de-normalize to [0,1] with ImageNet stats
+                x_denorm = x_img * self.imnet_std + self.imnet_mean
+                # 2) normalize with CLIP stats (no resizing; CLIP initialized at 256)
+                x_clip = (x_denorm - self.clip_mean) / self.clip_std
+                x_clip = x_clip.float()  # safer around AMP
+                feat_clip = self.clip_model.encode_image(x_clip)  # [B, D_clip]
             pre_bn_global = self.fuse_proj_global(torch.cat([global_feat, feat_clip], dim=1))
         else:
             pre_bn_global = global_feat
