@@ -455,13 +455,17 @@ class build_transformer_local(nn.Module):
             self.clip_model = hf_clip  # keep full model for image_embeds
             self.clip_impl = "hf"
 
-            # (2) Configurable input size (fallback to processor default)
+            # (2) Allow runtime interpolation for arbitrary input sizes
+            #     HF CLIP will interpolate position embeddings on-the-fly.
+            self.clip_model.config.vision_config.interpolate_pos_encoding = True
+
+            # (3) Configurable input size (fallback to processor default)
             default_h = self.hf_processor.size.get("shortest_edge", None)
             if default_h is None:
                 default_h = self.hf_processor.size.get("height", 224)
             self.clip_input_size = tuple(getattr(cfg.MODEL, "CLIP_INPUT_SIZE", (default_h, default_h)))
 
-            # (3) Norm buffers: ImageNet -> CLIP
+            # (4) Norm buffers: ImageNet -> CLIP
             im_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
             im_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
             clip_mean = torch.tensor(self.hf_processor.image_mean).view(1, 3, 1, 1)
@@ -471,21 +475,21 @@ class build_transformer_local(nn.Module):
             self.register_buffer("clip_mean",  clip_mean, persistent=False)
             self.register_buffer("clip_std",   clip_std,  persistent=False)
 
-            # (4) Resize position embedding if using non-pretrain resolution
-            try:
-                _hf_resize_pos_embed(self.clip_model.vision_model, self.clip_input_size)
-            except Exception as e:
-                print(f"[TinyCLIP][HF] pos-embed resize skipped: {e}")
+            # (5) Do NOT rewrite weights; rely on runtime interpolation instead
+            # try:
+            #     _hf_resize_pos_embed(self.clip_model.vision_model, self.clip_input_size)
+            # except Exception as e:
+            #     print(f"[TinyCLIP][HF] pos-embed resize skipped: {e}")
 
-            # (5) ε-level fine-tuning toggle
+            # (6) ε-level fine-tuning toggle
             self.clip_finetune = bool(getattr(cfg.MODEL, "CLIP_FINETUNE", True))
             for p in self.clip_model.parameters():
                 p.requires_grad = self.clip_finetune
 
-            # (6) Determine output dim from projection head (image_embeds dim)
+            # (7) Determine output dim from projection head (image_embeds dim)
             self.clip_output_dim = int(getattr(self.clip_model.config, "projection_dim", 768))
 
-            # (7) Fusion heads
+            # (8) Fusion heads
             self.fuse_proj_global = nn.Linear(self.in_planes + self.clip_output_dim, self.in_planes)
             self.afem = AFEM(dim=self.clip_output_dim, groups=32)
             self.sem_refine_proj = nn.Linear(self.clip_output_dim, self.in_planes)
@@ -545,7 +549,7 @@ class build_transformer_local(nn.Module):
                     x_clip = F.interpolate(
                         x_clip, size=self.clip_input_size, mode="bicubic", align_corners=False
                     )
-                # Use projection output (image_embeds, typically 768)
+                # Use projection output (image_embeds)
                 out = self.clip_model(pixel_values=x_clip, return_dict=True)
                 feat_clip = out.image_embeds  # [B, projection_dim]
 
