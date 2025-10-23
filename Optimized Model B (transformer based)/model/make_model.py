@@ -415,20 +415,36 @@ class build_transformer_local(nn.Module):
         self.shift_num = cfg.MODEL.SHIFT_NUM
         self.divide_length = cfg.MODEL.DEVIDE_LENGTH
 
-        # ---------------- TinyCLIP + AFEM integration ----------------          
+        # ---------------- TinyCLIP + AFEM integration ----------------
         self.use_clip = getattr(cfg.MODEL, "USE_CLIP", False)
         if self.use_clip:
             # === 1. Local TinyCLIP path ===
             local_tinyclip_path = cfg.MODEL.CLIP_LOCAL_PATH
+            print(f"[make_model][init] Loading TinyCLIP: {local_tinyclip_path}")
 
-            print(f"[make_model][init] Loading TinyCLIP from local path: {local_tinyclip_path}")
+            # === 2. Try loading TinyCLIP ===
+            try:
+                if local_tinyclip_path.endswith(".pt"):
+                    # ----- (A) OpenCLIP .pt  -----
+                    import open_clip
+                    print(f"[make_model][init] Loading TinyCLIP via open_clip: {local_tinyclip_path}")
+                    clip_model, _, _ = open_clip.create_model_and_transforms(
+                        model_name="ViT-B-16",  # TinyCLIP based on ViT-B/16
+                        pretrained=local_tinyclip_path
+                    )
+                    self.clip_model = clip_model.visual
 
-            # === 2. Load TinyCLIP config and model explicitly (force local path) ===
-            config = CLIPConfig.from_pretrained(local_tinyclip_path, local_files_only=True)
-            clip_model_full = CLIPModel.from_pretrained(local_tinyclip_path, config=config, local_files_only=True)
+                else:
+                    # ----- (B) Transformers  -----
+                    from transformers import CLIPModel, CLIPConfig
+                    print(f"[make_model][init] Loading TinyCLIP via transformers: {local_tinyclip_path}")
+                    config = CLIPConfig.from_pretrained(local_tinyclip_path, local_files_only=True)
+                    clip_model_full = CLIPModel.from_pretrained(local_tinyclip_path, config=config, local_files_only=True)
+                    self.clip_model = clip_model_full.vision_model
 
-            # === 3. Extract vision encoder only ===
-            self.clip_model = clip_model_full.vision_model    
+            except Exception as e:
+                print(f"[make_model][error] Failed to load TinyCLIP: {e}")
+                self.clip_model = None
 
             # Fixed input 320×320
             self.clip_input_size = (320, 320)
