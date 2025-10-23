@@ -425,32 +425,49 @@ class build_transformer_local(nn.Module):
             # === 2. Try loading TinyCLIP ===
             try:
                 if local_tinyclip_path.endswith(".pt"):
-                    # ----- (A) OpenCLIP .pt  -----
+                    # ----- (A) OpenCLIP .pt -----
                     import open_clip
                     print(f"[make_model][init] Loading TinyCLIP via open_clip: {local_tinyclip_path}")
                     clip_model, _, _ = open_clip.create_model_and_transforms(
                         model_name="ViT-B-16",  # TinyCLIP based on ViT-B/16
                         pretrained=local_tinyclip_path
                     )
-                   
+
+                    # ---- auto convert dtype ----
+                    import torch
                     first_param = next(iter(clip_model.parameters()))
                     if first_param.dtype == torch.float16:
                         print("[make_model][TinyCLIP] Detected float16 weights, converting to float32 for stability...")
                         clip_model = clip_model.float()
 
                     self.clip_model = clip_model.visual
+                    print("[make_model][TinyCLIP] Successfully loaded and converted to float32.")
 
                 else:
-                    # ----- (B) Transformers  -----
+                    # ----- (B) Transformers -----
                     from transformers import CLIPModel, CLIPConfig
                     print(f"[make_model][init] Loading TinyCLIP via transformers: {local_tinyclip_path}")
                     config = CLIPConfig.from_pretrained(local_tinyclip_path, local_files_only=True)
                     clip_model_full = CLIPModel.from_pretrained(local_tinyclip_path, config=config, local_files_only=True)
                     self.clip_model = clip_model_full.vision_model
+                    print("[make_model][TinyCLIP] Loaded via transformers successfully.")
 
             except Exception as e:
                 print(f"[make_model][error] Failed to load TinyCLIP: {e}")
-                self.clip_model = None
+                print("[make_model][warn] Retrying with float32 fallback...")
+                try:
+                    import open_clip
+                    clip_model, _, _ = open_clip.create_model_and_transforms(
+                        model_name="ViT-B-16",
+                        pretrained=local_tinyclip_path
+                    )
+                    clip_model = clip_model.float()
+                    self.clip_model = clip_model.visual
+                    print("[make_model][TinyCLIP] Loaded successfully after float32 retry.")
+                except Exception as e2:
+                    print(f"[make_model][fatal] TinyCLIP loading failed again: {e2}")
+                    self.clip_model = None
+
 
             # Fixed input 320×320
             self.clip_input_size = (320, 320)
