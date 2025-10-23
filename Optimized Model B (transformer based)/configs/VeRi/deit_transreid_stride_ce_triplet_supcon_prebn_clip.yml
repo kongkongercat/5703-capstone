@@ -19,8 +19,6 @@ MODEL:
   TRIPLET_LOSS_WEIGHT: 1.0
   
   USE_CLIP: True
-  CLIP_BACKBONE: "ViT-B-16"
-  CLIP_PRETRAIN: "laion2b_s34b_b88k"
 
 
 LOSS:

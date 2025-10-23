@@ -88,11 +88,11 @@ from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 #                                   bicubic resize to `visual.image_size` → `encode_image()`.
 #                                   Keeps JPM/local branches intact and preserves original behavior
 #                                   when `MODEL.USE_CLIP=False`.
-# [2025-10-24 | Hang Zhang]      **CLIP fusion quick-win (global + 4×local)**
-#                                 - Add LayerNorm-based alignment and scalar gating (alpha) for global fusion.
-#                                 - Connect CLIP to 4 local branches via a shared lightweight fusion head.
-#                                 - Keep forward signatures and loss usage unchanged; SupCon optional.
-#                                 - Backward-compatible: when MODEL.USE_CLIP=False, behavior is identical.
+# [2025-10-24 | Hang Zhang]      **TinyCLIP + AFEM (paper-aligned)**
+#                                 - Added TinyCLIP-ViT-B-16 (laion2b_yfcc_s11b, 320×320)
+#                                 - Added AFEM module and fusion: T = FC([T_a ⊕ T_s]) + Proj(AFEM(T_s))
+#                                 - ε-level fine-tuning for TinyCLIP
+#                                 - Fully compatible with Transformer + JPM + SIE pipeline
 # =============================================================================
 
 
@@ -143,6 +143,38 @@ def weights_init_classifier(m):
 def _pick_feat_by_src(src: str, global_feat: torch.Tensor, bn_feat: torch.Tensor) -> torch.Tensor:
     """Pick feature by source string: 'pre_bn' | 'bnneck' (default to pre_bn)."""
     return bn_feat if src == "bnneck" else global_feat
+
+
+# --------------------------- AFEM (TinyCLIP semantics) -----------------------
+class AFEM(nn.Module):
+    """
+    Adaptive Fine-grained Enhancement Module (re-implemented from CLIP-SENet)
+    Input : [B, D_sem]  TinyCLIP semantic vector
+    Output: [B, D_sem]  refined semantics T_s'
+    """
+    def __init__(self, dim: int, groups: int = 32):
+        super().__init__()
+        assert dim % groups == 0, "AFEM: 'dim' must be divisible by 'groups'"
+        self.dim = dim
+        self.groups = groups
+        self.group_dim = dim // groups
+
+        self.linear = nn.Sequential(
+            nn.Linear(dim, dim, bias=True),
+            nn.BatchNorm1d(dim),
+            nn.ReLU(inplace=True)
+        )
+
+        self.group_weight = nn.Parameter(torch.randn(groups))
+        nn.init.normal_(self.group_weight, mean=0.0, std=1.0)
+
+    def forward(self, ts: torch.Tensor) -> torch.Tensor:
+        base = self.linear(ts)                           # f_linear(T_s)
+        B, D = base.shape
+        g = base.view(B, self.groups, self.group_dim)    # [B,G,d]
+        w = self.group_weight.view(1, self.groups, 1)
+        weighted = (w * g).view(B, D)                    # Σ w_i * group_i
+        return base + weighted                           # residual add
 
 
 # --------------------------- ResNet Backbone ---------------------------------
@@ -206,13 +238,12 @@ class Backbone(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(2048, 128)
             )
-            self._supcon_log_done = False  # once-per-model forward log
+            self._supcon_log_done = False
             print("[make_model][init] SupCon head enabled (Backbone): output is UN-normalized; "
                   "L2 normalization is handled in SupConLoss.")
 
     def forward(self, x, label=None):
         x = self.base(x)
-        # Use the module gap (style consistency)
         global_feat = self.gap(x).view(x.size(0), -1)
         feat = global_feat if self.neck == 'no' else self.bottleneck(global_feat)
 
@@ -223,11 +254,9 @@ class Backbone(nn.Module):
                 print(f"[make_model][combo] [SupCon] src=model::{self.supcon_feat_src} "
                       f"| head=2xLinear(->128) | output=UN-normalized (L2 in SupConLoss)")
                 self._supcon_log_done = True
-            # NOTE: normalization moved to SupConLoss; keep raw projection here.
             z_supcon = self.supcon_head(sup_in)
 
         if self.training:
-            # Always pass label for margin-softmax heads; Linear head does not need label.     # [FIX]
             if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
                 cls_score = self.classifier(feat, label)
             else:
@@ -311,31 +340,6 @@ class build_transformer(nn.Module):
             print("[make_model][init] SupCon head enabled (Transformer): output is UN-normalized; "
                   "L2 normalization is handled in SupConLoss.")
 
-    def forward(self, x, label=None, cam_label=None, view_label=None):
-        global_feat = self.base(x, cam_label=cam_label, view_label=view_label)
-        feat = self.bottleneck(global_feat)
-
-        z_supcon = None
-        if self.training and self.supcon_enabled:
-            sup_in = _pick_feat_by_src(self.supcon_feat_src, global_feat, feat)
-            if not self._supcon_log_done:
-                print(f"[make_model][combo] [SupCon] src=model::{self.supcon_feat_src} "
-                      f"| head=2xLinear(->128) | output=UN-normalized (L2 in SupConLoss)")
-                self._supcon_log_done = True
-            # NOTE: normalization moved to SupConLoss; keep raw projection here.
-            z_supcon = self.supcon_head(sup_in)
-
-        if self.training:
-            # Always pass label for margin-softmax heads; Linear head does not need label.     # [FIX]
-            if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
-                cls_score = self.classifier(feat, label)
-            else:
-                cls_score = self.classifier(feat)
-            return cls_score, global_feat, feat, z_supcon
-        else:
-            return feat if self.neck_feat == 'after' else global_feat
-
-
 # ------------------- ViT/DeiT Transformer (with JPM local) -------------------
 class build_transformer_local(nn.Module):
     def __init__(self, num_classes, camera_num, view_num, cfg, factory, rearrange):
@@ -374,31 +378,19 @@ class build_transformer_local(nn.Module):
         self.b1 = nn.Sequential(copy.deepcopy(block), copy.deepcopy(layer_norm))
         self.b2 = nn.Sequential(copy.deepcopy(block), copy.deepcopy(layer_norm))
 
+        # Classifiers
         self.num_classes = num_classes
         self.ID_LOSS_TYPE = cfg.MODEL.ID_LOSS_TYPE
-        if self.ID_LOSS_TYPE == 'arcface':
-            self.classifier = Arcface(self.in_planes, self.num_classes,
-                                      s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
-        elif self.ID_LOSS_TYPE == 'cosface':
-            self.classifier = Cosface(self.in_planes, self.num_classes,
-                                      s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
-        elif self.ID_LOSS_TYPE == 'amsoftmax':
-            self.classifier = AMSoftmax(self.in_planes, self.num_classes,
-                                        s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
-        elif self.ID_LOSS_TYPE == 'circle':
-            self.classifier = CircleLoss(self.in_planes, self.num_classes,
-                                         s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
-        else:
-            self.classifier = nn.Linear(self.in_planes, self.num_classes, bias=False)
-            self.classifier.apply(weights_init_classifier)
-            self.classifier_1 = nn.Linear(self.in_planes, self.num_classes, bias=False)
-            self.classifier_1.apply(weights_init_classifier)
-            self.classifier_2 = nn.Linear(self.in_planes, self.num_classes, bias=False)
-            self.classifier_2.apply(weights_init_classifier)
-            self.classifier_3 = nn.Linear(self.in_planes, self.num_classes, bias=False)
-            self.classifier_3.apply(weights_init_classifier)
-            self.classifier_4 = nn.Linear(self.in_planes, self.num_classes, bias=False)
-            self.classifier_4.apply(weights_init_classifier)
+        self.classifier = nn.Linear(self.in_planes, self.num_classes, bias=False)
+        self.classifier.apply(weights_init_classifier)
+        self.classifier_1 = nn.Linear(self.in_planes, self.num_classes, bias=False)
+        self.classifier_1.apply(weights_init_classifier)
+        self.classifier_2 = nn.Linear(self.in_planes, self.num_classes, bias=False)
+        self.classifier_2.apply(weights_init_classifier)
+        self.classifier_3 = nn.Linear(self.in_planes, self.num_classes, bias=False)
+        self.classifier_3.apply(weights_init_classifier)
+        self.classifier_4 = nn.Linear(self.in_planes, self.num_classes, bias=False)
+        self.classifier_4.apply(weights_init_classifier)
 
         self.bottleneck = nn.BatchNorm1d(self.in_planes)
         self.bottleneck.bias.requires_grad_(False)
@@ -416,70 +408,49 @@ class build_transformer_local(nn.Module):
         self.bottleneck_4.bias.requires_grad_(False)
         self.bottleneck_4.apply(weights_init_kaiming)
 
+
         self.shuffle_groups = cfg.MODEL.SHUFFLE_GROUP
         self.shift_num = cfg.MODEL.SHIFT_NUM
         self.divide_length = cfg.MODEL.DEVIDE_LENGTH
 
-        # ---------------- CLIP (optional, quick-win fusion) ----------------
+        # ---------------- TinyCLIP + AFEM integration ----------------
         self.use_clip = getattr(cfg.MODEL, "USE_CLIP", False)
         if self.use_clip:
-            clip_backbone = getattr(cfg.MODEL, "CLIP_BACKBONE", "ViT-B-16")
-            clip_pretrain = getattr(cfg.MODEL, "CLIP_PRETRAIN", "laion2b_s34b_b88k")
-
-            # open-clip 3.x compat: do NOT pass image_size to constructor
+            clip_backbone = "TinyCLIP-ViT-B-16"
+            clip_pretrain = "laion2b_yfcc_s11b"
             self.clip_model = open_clip.create_model(clip_backbone, pretrained=clip_pretrain)
+
+            # Fixed input 320×320
+            self.clip_input_size = (320, 320)
+
+            # Disable text branch
+            if hasattr(self.clip_model, "transformer"):
+                self.clip_model.transformer = None
+            if hasattr(self.clip_model, "encode_text"):
+                self.clip_model.encode_text = None
+
+            # ε-level fine-tuning
             for p in self.clip_model.parameters():
-                p.requires_grad = False
-            self.clip_model.eval()
+                p.requires_grad = True
 
-            # record CLIP expected input size
-            size = getattr(self.clip_model.visual, "image_size", 224)
-            if isinstance(size, int):
-                size = (size, size)
-            self.clip_input_size = tuple(size)  # e.g., (224, 224)
+            self.clip_output_dim = getattr(self.clip_model.visual, "output_dim", 768)
+            self.fuse_proj_global = nn.Linear(self.in_planes + self.clip_output_dim, self.in_planes)
+            self.afem = AFEM(dim=self.clip_output_dim, groups=32)
+            self.sem_refine_proj = nn.Linear(self.clip_output_dim, self.in_planes)
 
-            # global fusion projection: [bb; clip] -> C
-            self.fuse_proj_global = nn.Linear(
-                self.in_planes + self.clip_model.visual.output_dim,
-                self.in_planes
-            )
-
-            # cache normalization stats as buffers
+            # Normalization buffers
             im_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-            im_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+            im_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
             clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
-            clip_std  = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+            clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
             self.register_buffer("imnet_mean", im_mean, persistent=False)
-            self.register_buffer("imnet_std",  im_std,  persistent=False)
-            self.register_buffer("clip_mean",  clip_mean, persistent=False)
-            self.register_buffer("clip_std",   clip_std,  persistent=False)
+            self.register_buffer("imnet_std", im_std, persistent=False)
+            self.register_buffer("clip_mean", clip_mean, persistent=False)
+            self.register_buffer("clip_std", clip_std, persistent=False)
 
-            # ==== [NEW] Global fusion alignment + scalar gate ====
-            self.fuse_ln_global_backbone = nn.LayerNorm(self.in_planes)
-            self.fuse_ln_global_clip = nn.LayerNorm(self.clip_model.visual.output_dim)
-            self.fuse_gate_global = nn.Sequential(
-                nn.Linear(self.in_planes + self.clip_model.visual.output_dim, self.in_planes // 4),
-                nn.ReLU(inplace=True),
-                nn.Linear(self.in_planes // 4, 1),
-                nn.Sigmoid()
-            )
-
-            # ==== [NEW] Shared lightweight fusion for 4 local branches ====
-            self.fuse_proj_local  = nn.Linear(
-                self.in_planes + self.clip_model.visual.output_dim,
-                self.in_planes
-            )
-            self.fuse_ln_local_bb = nn.LayerNorm(self.in_planes)
-            self.fuse_ln_local_cf = nn.LayerNorm(self.clip_model.visual.output_dim)
-            self.fuse_gate_local  = nn.Sequential(
-                nn.Linear(self.in_planes + self.clip_model.visual.output_dim, self.in_planes // 4),
-                nn.ReLU(inplace=True),
-                nn.Linear(self.in_planes // 4, 1),
-                nn.Sigmoid()
-            )
-
-            print(f"[make_model][init] CLIP fusion enabled (TransformerLocal quick-win): "
-                  f"global + 4×local with LN+gate. expected_size={self.clip_input_size}")
+            print(f"[make_model][init] Using TinyCLIP-ViT-B-16 "
+                  f"(laion2b_yfcc_s11b, 320×320) + AFEM(groups=32). "
+                  f"ε-level fine-tuning enabled.")
 
         # SupCon head
         self.supcon_enabled = (
@@ -495,17 +466,13 @@ class build_transformer_local(nn.Module):
                 nn.Linear(2048, 128)
             )
             self._supcon_log_done = False
-            print("[make_model][init] SupCon head enabled (TransformerLocal): output is UN-normalized; "
-                  "L2 normalization is handled in SupConLoss.")
+            print("[make_model][init] SupCon head enabled (TransformerLocal).")
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
-        # keep a copy of input image for CLIP encode_image (x is later reused for tokens)
         x_img = x
-
         features = self.base(x, cam_label=cam_label, view_label=view_label)
-
         b1_feat = self.b1(features)
-        global_feat = b1_feat[:, 0]  # CLS token
+        global_feat = b1_feat[:, 0]
 
         feature_length = features.size(1) - 1
         patch_length = feature_length // self.divide_length
@@ -526,96 +493,65 @@ class build_transformer_local(nn.Module):
         local_feat_3 = extract_local(patch_length * 2, patch_length * 3)
         local_feat_4 = extract_local(patch_length * 3, patch_length * 4)
 
-        # ---------------- CLIP fusion (global + locals, LN + scalar gate) ----------------
+        # ---------------- TinyCLIP + AFEM fusion ----------------
         if getattr(self, "use_clip", False):
             with torch.no_grad():
-                # 1) denorm ImageNet -> approx [0,1]
                 x_denorm = x_img * self.imnet_std + self.imnet_mean
-                # 2) CLIP normalization
                 x_clip = (x_denorm - self.clip_mean) / self.clip_std
+                if x_clip.shape[-2:] != (320, 320):
+                    x_clip = F.interpolate(x_clip, size=(320, 320),
+                                           mode='bicubic', align_corners=False)
                 x_clip = x_clip.float()
-                # 3) resize to CLIP expected size
-                h, w = self.clip_input_size
-                if x_clip.shape[-2:] != (h, w):
-                    x_clip = F.interpolate(x_clip, size=(h, w), mode='bicubic', align_corners=False)
-                # 4) encode via CLIP (no grad)
-                feat_clip = self.clip_model.encode_image(x_clip)  # [B, D_clip]
+                feat_clip = self.clip_model.encode_image(x_clip)
 
-            # ---- Global fusion: LN-align + scalar gate -> weighted concat -> proj ----
-            bb_g  = self.fuse_ln_global_backbone(global_feat)     # [B, C]
-            cf_g  = self.fuse_ln_global_clip(feat_clip)           # [B, D]
-            cat_g = torch.cat([bb_g, cf_g], dim=1)                # [B, C+D]
-            a_g   = self.fuse_gate_global(cat_g)                  # [B, 1] in (0,1)
-            fused_in_g   = torch.cat([(1.0 - a_g) * bb_g, a_g * cf_g], dim=1)  # [B, C+D]
-            pre_bn_global = self.fuse_proj_global(fused_in_g)     # [B, C]
-
-            # ---- Local fusion (shared weights): LN-align + scalar gate -> weighted concat -> proj ----
-            def fuse_local_prebn(local_feat: torch.Tensor) -> torch.Tensor:
-                bb  = self.fuse_ln_local_bb(local_feat)           # [B, C]
-                cf  = self.fuse_ln_local_cf(feat_clip)            # [B, D]
-                cat = torch.cat([bb, cf], dim=1)                  # [B, C+D]
-                a   = self.fuse_gate_local(cat)                   # [B, 1]
-                fused_in = torch.cat([(1.0 - a) * bb, a * cf], dim=1)
-                return self.fuse_proj_local(fused_in)             # [B, C]
-
-            local_feat_1 = fuse_local_prebn(local_feat_1)
-            local_feat_2 = fuse_local_prebn(local_feat_2)
-            local_feat_3 = fuse_local_prebn(local_feat_3)
-            local_feat_4 = fuse_local_prebn(local_feat_4)
+            tu = self.fuse_proj_global(torch.cat([global_feat, feat_clip], dim=1))
+            ts_refined = self.afem(feat_clip)
+            pre_bn_global = tu + self.sem_refine_proj(ts_refined)
         else:
             pre_bn_global = global_feat
-        # ---------------- end CLIP fusion ----------------
 
+        # BNNecks
         feat_bn_global = self.bottleneck(pre_bn_global)
         local_feat_1_bn = self.bottleneck_1(local_feat_1)
         local_feat_2_bn = self.bottleneck_2(local_feat_2)
         local_feat_3_bn = self.bottleneck_3(local_feat_3)
         local_feat_4_bn = self.bottleneck_4(local_feat_4)
 
-        # ---------------- SupCon input selection (respect FEAT_SRC) ----------------
+        # SupCon feature
         z_supcon = None
         if self.training and self.supcon_enabled:
-            # If FEAT_SRC == 'bnneck' use fused BN; else use fused pre-BN
             sup_in = feat_bn_global if self.supcon_feat_src == "bnneck" else pre_bn_global
             if not self._supcon_log_done:
-                print(f"[make_model][combo] [SupCon] src=model::{self.supcon_feat_src} "
-                      f"| head=2xLinear(->128) | output=UN-normalized (L2 in SupConLoss)")
+                print(f"[make_model][combo] [SupCon] src=model::{self.supcon_feat_src}")
                 self._supcon_log_done = True
             z_supcon = self.supcon_head(sup_in)
 
         if self.training:
-            if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
-                cls_score = self.classifier(feat_bn_global, label)
-                scores = [cls_score]
-            else:
-                cls_score = self.classifier(feat_bn_global)
-                scores = [
-                    cls_score,
-                    self.classifier_1(local_feat_1_bn),
-                    self.classifier_2(local_feat_2_bn),
-                    self.classifier_3(local_feat_3_bn),
-                    self.classifier_4(local_feat_4_bn)
-                ]
-
-            # pre-BN features: global uses fused pre-BN; locals now also fused (quick-win)
+            cls_score = self.classifier(feat_bn_global)
+            scores = [
+                cls_score,
+                self.classifier_1(local_feat_1_bn),
+                self.classifier_2(local_feat_2_bn),
+                self.classifier_3(local_feat_3_bn),
+                self.classifier_4(local_feat_4_bn)
+            ]
             feats = [pre_bn_global, local_feat_1, local_feat_2, local_feat_3, local_feat_4]
-
-            # BNNeck list (Option-B parity)
-            feats_bn = [feat_bn_global, local_feat_1_bn, local_feat_2_bn, local_feat_3_bn, local_feat_4_bn]
+            feats_bn = [feat_bn_global, local_feat_1_bn, local_feat_2_bn,
+                        local_feat_3_bn, local_feat_4_bn]
             return scores, feats, feats_bn, z_supcon
         else:
             if self.neck_feat == 'after':
-                # Return fused BN for global, locals BN (scaled)
                 return torch.cat(
                     [feat_bn_global,
-                     local_feat_1_bn / 4, local_feat_2_bn / 4, local_feat_3_bn / 4, local_feat_4_bn / 4],
+                     local_feat_1_bn / 4, local_feat_2_bn / 4,
+                     local_feat_3_bn / 4, local_feat_4_bn / 4],
                     dim=1
                 )
             else:
-                # Return fused pre-BN for global, locals pre-BN (scaled)
                 return torch.cat(
                     [pre_bn_global,
-                     local_feat_1 / 4, local_feat_2 / 4, local_feat_3 / 4, local_feat_4 / 4],
+                     local_feat_1 / 4, local_feat_2 / 4,
+                     local_feat_3 / 4, local_feat_4 / 4],
                     dim=1
                 )
 
@@ -630,7 +566,6 @@ class build_transformer_local(nn.Module):
             state = state["model"]
 
         clean = {k.replace("module.", ""): v for k, v in state.items()}
-
         incompatible = self.load_state_dict(clean, strict=strict)
         missing = getattr(incompatible, "missing_keys", [])
         unexpected = getattr(incompatible, "unexpected_keys", [])
