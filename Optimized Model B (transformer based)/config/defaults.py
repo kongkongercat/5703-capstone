@@ -234,10 +234,12 @@ _C.LOSS.BRIGHTNESS.K = 0.08         # extra weight or gating factor (your usage)
 
 # ---- CLIP (HF TinyCLIP local) ----
 _C.MODEL.USE_CLIP = True
-_C.MODEL.CLIP_IMPL = "open_clip"  # ["hf", "open_clip"]
-_C.MODEL.CLIP_HF_ID = "laion-ai/TinyCLIP-ViT-61M-32-Text-29M"
-_C.MODEL.CLIP_LOCAL_PATH = "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/pretrained/TinyCLIP-ViT-61M-32-Text-29M-LAION400M.pt"
-_C.MODEL.CLIP_INPUT_SIZE = (320, 320)
+_C.MODEL.CLIP_HF_ID =  "wkcn/TinyCLIP-ViT-61M-32-Text-29M-LAION400M"
+_C.MODEL.CLIP_LOCAL_PATH = ""
+_C.MODEL.CLIP_INPUT_SIZE = (256, 256)
+_C.MODEL.CLIP_FINETUNE=True
+
+
 
 # -----------------------------------------------------------------------------
 # TEST / EVALUATION

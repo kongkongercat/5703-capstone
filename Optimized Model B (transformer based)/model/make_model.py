@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
-import open_clip  # [2025-10-23] CLIP visual encoder
+
 from .backbones.resnet import ResNet, Bottleneck
 from .backbones.vit_pytorch import (
     vit_base_patch16_224_TransReID,
@@ -17,7 +17,9 @@ from .backbones.vit_pytorch import (
     deit_small_patch16_224_TransReID
 )
 from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
-from transformers import CLIPModel, CLIPConfig  # kept for compatibility (not used in current .pt path)
+
+# HF TinyCLIP (vision + projection) for image embeddings
+from transformers import CLIPModel, CLIPImageProcessor  # HF-only path
 
 
 # =============================================================================
@@ -38,7 +40,7 @@ from transformers import CLIPModel, CLIPConfig  # kept for compatibility (not us
 #     (z_supcon=None if SupCon disabled)
 #
 # Training-time returns (transformer_local):
-#   - always return 4 items: (scores, feats, feat_bn_global_or_list, z_supcon)
+#   - always return 4 items: (scores, feats, feat_bn_list_or_tensor, z_supcon)
 #
 # Test-time behavior is unchanged (controlled by cfg.TEST.NECK_FEAT).
 #
@@ -65,10 +67,9 @@ from transformers import CLIPModel, CLIPConfig  # kept for compatibility (not us
 # [2025-10-19 | Hang Zhang]           **Model-side SupCon source logging (once per model)**
 #                                       - On first forward that builds z_supcon, print:
 #                                         "[make_model][combo] [SupCon] src=model::<pre_bn|bnneck> | head=2xLinear(->128) | output=UN-normalized (L2 in SupConLoss)"
-#                                       - No behavior change; only logging for clarity.
 # [2025-10-19 | Hang Zhang]            **Classification head label passing fix**
 #                                       - For margin-softmax heads (arcface/cosface/amsoftmax/circle),
-#                                         always pass `label` to classifier; Linear head does not.   # [NEW]
+#                                         always pass `label` to classifier; Linear head does not.
 # [2025-10-21 | Hang Zhang]      add self.bottleneck_3.bias.requires_grad_(False), self.bottleneck_3.apply(weights_init_kaiming)
 # [2025-10-22 | Hang Zhang]      **Option-B (BNNeck parity)**
 #                                 - For build_transformer_local (JPM=True), training forward now returns
@@ -76,30 +77,12 @@ from transformers import CLIPModel, CLIPConfig  # kept for compatibility (not us
 #                                 - Backbone/build_transformer keep a single BNNeck tensor for feat_bn.
 #                                 - Enables Triplet/TripletX to aggregate "global + 4×local BNNeck"
 #                                   mirroring the pre_bn path (structure parity).
-# [2025-10-23 | Hang Zhang]      **CLIP fusion (minimal, JPM=True)**
-#                                 - Added optional frozen CLIP visual encoder to build_transformer_local.
-#                                 - Fused CLIP only into GLOBAL pre-BN (concat+Linear); 4 local branches unchanged.
-#                                 - Controlled by MODEL.USE_CLIP, with MODEL.CLIP_BACKBONE / CLIP_PRETRAIN (optional).
-#                                 - Disabled -> exact parity with previous behavior (bitwise-compatible paths).
-# [2025-10-23 | Hang Zhang]      **CLIP init compat (open-clip 3.x)**
-#                                 - Stop passing `image_size` to CLIP constructor; use `create_model(...)`
-#                                   and read `visual.image_size` as the expected input resolution.
-# [2025-10-23 | Hang Zhang]      **CLIP input resize in forward**
-#                                 - In forward(), de-normalize (ImageNet) → normalize (CLIP) →
-#                                   bicubic resize to `visual.image_size` → `encode_image()`.
-#                                   Keeps JPM/local branches intact and preserves original behavior
-#                                   when `MODEL.USE_CLIP=False`.
-# [2025-10-24 | Hang Zhang]      **TinyCLIP + AFEM (paper-aligned)**
-#                                 - Added TinyCLIP-ViT-B-32 (laion2b_yfcc_s11b, 320×320)
-#                                 - Added AFEM module and fusion: T = FC([T_a ⊕ T_s]) + Proj(AFEM(T_s))
-#                                 - ε-level fine-tuning for TinyCLIP
-#                                 - Fully compatible with Transformer + JPM + SIE pipeline
-# [2025-10-24 | Hang Zhang]      **FIX & STABILIZE (this revision)**
-#                                 - Support open_clip .pt checkpoint with DDP prefix ('module.') removal.
-#                                 - Force half→float conversion on load; use ViT-B/32 backbone for TinyCLIP-61M-32.
-#                                 - Replace pos-embed resize with a unified HF/open_clip-safe function (2D/3D aware).
-#                                 - Make CLIP input size configurable (default 256×256) instead of hard-coded 320×320.
-#                                 - Align dtype before fusion to avoid AMP precision mismatch.
+# [2025-10-24 | Hang Zhang]      **TinyCLIP + AFEM (HF-only)**
+#                                 - Switched to HuggingFace CLIPModel (vision + projection).
+#                                 - Fuses `image_embeds` (projection_dim=768) with global Transformer feat.
+#                                 - Position embedding resize for arbitrary CLIP_INPUT_SIZE.
+#                                 - AFEM module for semantic refinement prior to projection.
+#                                 - Optional ε-level fine-tuning toggled by cfg.MODEL.CLIP_FINETUNE.
 # =============================================================================
 
 
@@ -152,42 +135,25 @@ def _pick_feat_by_src(src: str, global_feat: torch.Tensor, bn_feat: torch.Tensor
     return bn_feat if src == "bnneck" else global_feat
 
 
-# --------- Positional embedding resize (HF/open_clip unified, 2D/3D aware) ----------
-def _get_clip_pos_embed_and_patch(clip_visual, impl: str):
+# --------- HF TinyCLIP positional embedding resize (Vision tower only) -------
+def _hf_get_pos_embed(clip_vision):
     """
-    Return (pos_embed[B=1,N,C], patch_size:int) in a unified way.
-    For open_clip, positional_embedding is often [N,C]; we normalize to [1,N,C].
-    Patch size is inferred from conv1 stride for ViT models (ViT-B/32 -> 32).
+    Returns (pos_embed[1,N,C], patch_size:int) for HF CLIP vision tower.
     """
-    if impl == "hf":
-        pe = clip_visual.embeddings.position_embedding.weight  # [1,N,C] or [N,C]
-        if pe.dim() == 2:
-            pe = pe.unsqueeze(0)
-        patch = int(clip_visual.config.patch_size)
-    else:
-        pe = clip_visual.positional_embedding  # [N,C] or [1,N,C]
-        if pe.dim() == 2:
-            pe = pe.unsqueeze(0)
-        patch = getattr(clip_visual, "patch_size", None)
-        if patch is None and hasattr(clip_visual, "conv1"):
-            s = getattr(clip_visual.conv1, "stride", None)
-            if isinstance(s, tuple):
-                patch = s[0]
-        if patch is None:
-            # Fallback: infer by grid; typical B/32: 224→7×7, 256→8×8, 320→10×10
-            N = pe.shape[1]
-            gh = int((N - 1) ** 0.5)
-            patch = 32 if gh in (7, 8, 10, 12) else 16
-    return pe, int(patch)
+    pe = clip_vision.embeddings.position_embedding.weight  # [1,N,C] or [N,C]
+    if pe.dim() == 2:
+        pe = pe.unsqueeze(0)
+    patch = int(clip_vision.config.patch_size)
+    return pe, patch
 
 
 @torch.no_grad()
-def _resize_clip_pos_embed(clip_visual, new_hw, impl: str):
+def _hf_resize_pos_embed(clip_vision, new_hw):
     """
-    Resize ViT positional embeddings from pretrain resolution to new_hw=(H,W).
-    Works for both HF and open_clip (handles [N,C] vs [1,N,C]).
+    Resize ViT positional embeddings to fit new_hw=(H,W).
+    Works only for HF CLIP vision tower; keeps Parameter identity.
     """
-    pe, patch = _get_clip_pos_embed_and_patch(clip_visual, impl)  # [1,N,C]
+    pe, patch = _hf_get_pos_embed(clip_vision)  # [1,N,C]
     _, N, C = pe.shape
     cls_tok, grid = pe[:, :1, :], pe[:, 1:, :]
     gh = gw = int((N - 1) ** 0.5)
@@ -198,13 +164,9 @@ def _resize_clip_pos_embed(clip_visual, new_hw, impl: str):
     new_gh, new_gw = new_h // patch, new_w // patch
     grid = F.interpolate(grid, size=(new_gh, new_gw), mode="bicubic", align_corners=False)
     grid = grid.permute(0, 2, 3, 1).reshape(1, new_gh * new_gw, C)
-    pe_new = torch.cat([cls_tok, grid], dim=1)  # [1,1+newN,C]
+    pe_new = torch.cat([cls_tok, grid], dim=1)
 
-    # Write back preserving Parameter
-    if impl == "hf":
-        tgt = clip_visual.embeddings.position_embedding.weight
-    else:
-        tgt = clip_visual.positional_embedding
+    tgt = clip_vision.embeddings.position_embedding.weight
     if tgt.dim() == 2:
         tgt.data.copy_(pe_new.squeeze(0))
     else:
@@ -214,7 +176,7 @@ def _resize_clip_pos_embed(clip_visual, new_hw, impl: str):
 # --------------------------- AFEM (TinyCLIP semantics) -----------------------
 class AFEM(nn.Module):
     """
-    Adaptive Fine-grained Enhancement Module (re-implemented from CLIP-SENet)
+    Adaptive Fine-grained Enhancement Module for CLIP semantics.
     Input : [B, D_sem]  TinyCLIP semantic vector
     Output: [B, D_sem]  refined semantics T_s'
     """
@@ -406,6 +368,7 @@ class build_transformer(nn.Module):
             print("[make_model][init] SupCon head enabled (Transformer): output is UN-normalized; "
                   "L2 normalization is handled in SupConLoss.")
 
+
 # ------------------- ViT/DeiT Transformer (with JPM local) -------------------
 class build_transformer_local(nn.Module):
     def __init__(self, num_classes, camera_num, view_num, cfg, factory, rearrange):
@@ -478,71 +441,57 @@ class build_transformer_local(nn.Module):
         self.shift_num = cfg.MODEL.SHIFT_NUM
         self.divide_length = cfg.MODEL.DEVIDE_LENGTH
 
-        # ---------------- TinyCLIP + AFEM integration (open_clip .pt) ----------------
+        # ---------------- TinyCLIP + AFEM integration (HF-only) ----------------
         self.use_clip = getattr(cfg.MODEL, "USE_CLIP", False)
         if self.use_clip:
-            import os
-            pt_path = getattr(cfg.MODEL, "CLIP_LOCAL_PATH", "")
-            assert pt_path and pt_path.endswith(".pt"), "CLIP_LOCAL_PATH must point to a .pt file (open_clip checkpoint)"
-            print(f"[make_model][init] Loading TinyCLIP via open_clip (fp32): {pt_path}")
+            hf_id = getattr(cfg.MODEL, "CLIP_HF_ID", "wkcn/TinyCLIP-ViT-61M-32-Text-29M-LAION400M")
+            local_path = getattr(cfg.MODEL, "CLIP_LOCAL_PATH", "").strip()
+            model_id_or_path = local_path if local_path else hf_id
+            print(f"[make_model][init] Loading TinyCLIP (HF) from: {model_id_or_path}")
 
-            # (1) Create ViT-B/32 visual backbone (best match for TinyCLIP-61M-32)
-            clip_model = open_clip.create_model("ViT-B-32", pretrained=None).float()
+            # (1) Processor & full CLIP model (vision + projection)
+            self.hf_processor = CLIPImageProcessor.from_pretrained(model_id_or_path, use_fast=True)
+            hf_clip = CLIPModel.from_pretrained(model_id_or_path)
+            self.clip_model = hf_clip  # keep full model for image_embeds
+            self.clip_impl = "hf"
 
-            # (2) Unpack state_dict, strip 'module.' (DDP), and convert half→float
-            sd_raw = torch.load(pt_path, map_location="cpu")
-            sd = sd_raw.get("state_dict", sd_raw)
-            new_sd, converted = {}, 0
-            for k, v in sd.items():
-                k2 = k.replace("module.", "")
-                if isinstance(v, torch.HalfTensor):
-                    v = v.float()
-                    converted += 1
-                new_sd[k2] = v
-            msg = clip_model.load_state_dict(new_sd, strict=False)
-            print(f"[TinyCLIP] loaded. half→float converted={converted}, missing={len(msg.missing_keys)}, unexpected={len(msg.unexpected_keys)}")
+            # (2) Configurable input size (fallback to processor default)
+            default_h = self.hf_processor.size.get("shortest_edge", None)
+            if default_h is None:
+                default_h = self.hf_processor.size.get("height", 224)
+            self.clip_input_size = tuple(getattr(cfg.MODEL, "CLIP_INPUT_SIZE", (default_h, default_h)))
 
-            # (3) Use visual tower only
-            self.clip_model = getattr(clip_model, "visual", clip_model)
-            self.clip_impl = "open_clip"
-
-            # (4) Configurable CLIP input size; default to 256×256 for stability
-            self.clip_input_size = tuple(getattr(cfg.MODEL, "CLIP_INPUT_SIZE", (256, 256)))
-
-            # (5) Resize positional embeddings to the target resolution
-            _resize_clip_pos_embed(self.clip_model, self.clip_input_size, self.clip_impl)
-
-            # (6) ε-level fine-tuning (set to False to freeze)
-            for p in self.clip_model.parameters():
-                p.requires_grad = True
-
-            # (7) Derive output dim (robust fallback)
-            self.clip_output_dim = getattr(self.clip_model, "output_dim", None)
-            if self.clip_output_dim is None:
-                proj = getattr(self.clip_model, "proj", None)
-                if isinstance(proj, torch.Tensor):
-                    self.clip_output_dim = proj.shape[1]
-                elif hasattr(self.clip_model, "width"):
-                    self.clip_output_dim = int(self.clip_model.width)
-                else:
-                    self.clip_output_dim = 768  # safe default
-
-            # (8) Fusion heads
-            self.fuse_proj_global = nn.Linear(self.in_planes + self.clip_output_dim, self.in_planes)
-            self.afem = AFEM(dim=self.clip_output_dim, groups=32)
-            self.sem_refine_proj = nn.Linear(self.clip_output_dim, self.in_planes)
-
-            # (9) Normalization buffers: ImageNet -> CLIP
+            # (3) Norm buffers: ImageNet -> CLIP
             im_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
             im_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-            clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
-            clip_std  = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+            clip_mean = torch.tensor(self.hf_processor.image_mean).view(1, 3, 1, 1)
+            clip_std  = torch.tensor(self.hf_processor.image_std).view(1, 3, 1, 1)
             self.register_buffer("imnet_mean", im_mean, persistent=False)
             self.register_buffer("imnet_std",  im_std,  persistent=False)
             self.register_buffer("clip_mean",  clip_mean, persistent=False)
             self.register_buffer("clip_std",   clip_std,  persistent=False)
 
-            print(f"[make_model][init] TinyCLIP (open_clip, ViT-B/32) ready. input={self.clip_input_size}, AFEM(groups=32).")
+            # (4) Resize position embedding if using non-pretrain resolution
+            try:
+                _hf_resize_pos_embed(self.clip_model.vision_model, self.clip_input_size)
+            except Exception as e:
+                print(f"[TinyCLIP][HF] pos-embed resize skipped: {e}")
+
+            # (5) ε-level fine-tuning toggle
+            self.clip_finetune = bool(getattr(cfg.MODEL, "CLIP_FINETUNE", True))
+            for p in self.clip_model.parameters():
+                p.requires_grad = self.clip_finetune
+
+            # (6) Determine output dim from projection head (image_embeds dim)
+            self.clip_output_dim = int(getattr(self.clip_model.config, "projection_dim", 768))
+
+            # (7) Fusion heads
+            self.fuse_proj_global = nn.Linear(self.in_planes + self.clip_output_dim, self.in_planes)
+            self.afem = AFEM(dim=self.clip_output_dim, groups=32)
+            self.sem_refine_proj = nn.Linear(self.clip_output_dim, self.in_planes)
+
+            print(f"[make_model][init] TinyCLIP (HF) ready. input={self.clip_input_size}, "
+                  f"proj_dim={self.clip_output_dim}, AFEM(groups=32), finetune={self.clip_finetune}.")
 
         # SupCon head
         self.supcon_enabled = (
@@ -585,20 +534,22 @@ class build_transformer_local(nn.Module):
         local_feat_3 = extract_local(patch_length * 2, patch_length * 3)
         local_feat_4 = extract_local(patch_length * 3, patch_length * 4)
 
-        # ---------------- TinyCLIP + AFEM fusion ----------------
+        # ---------------- TinyCLIP + AFEM fusion (HF-only) ----------------
         if getattr(self, "use_clip", False):
-            with torch.no_grad():
-                # De-normalize ImageNet -> normalize to CLIP, then resize to configured size
+            # Enable/disable grad according to finetune flag
+            with torch.set_grad_enabled(getattr(self, "clip_finetune", True)):
+                # De-normalize from ImageNet -> normalize to CLIP, then resize
                 x_denorm = x_img * self.imnet_std + self.imnet_mean
                 x_clip = (x_denorm - self.clip_mean) / self.clip_std
                 if x_clip.shape[-2:] != self.clip_input_size:
                     x_clip = F.interpolate(
-                        x_clip, size=self.clip_input_size, mode='bicubic', align_corners=False
+                        x_clip, size=self.clip_input_size, mode="bicubic", align_corners=False
                     )
-                x_clip = x_clip.float()
-                feat_clip = self.clip_model(x_clip)
+                # Use projection output (image_embeds, typically 768)
+                out = self.clip_model(pixel_values=x_clip, return_dict=True)
+                feat_clip = out.image_embeds  # [B, projection_dim]
 
-            # Align dtype before fusion (important with AMP/bfloat16)
+            # Align dtype before fusion (safe with AMP/bfloat16)
             feat_clip = feat_clip.to(global_feat.dtype)
 
             # Global fusion: concat + FC, plus AFEM-refined semantics residual
