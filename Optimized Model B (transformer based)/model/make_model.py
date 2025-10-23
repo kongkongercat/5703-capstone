@@ -17,7 +17,8 @@ from .backbones.vit_pytorch import (
     deit_small_patch16_224_TransReID
 )
 from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
-from transformers import CLIPModel
+from transformers import CLIPModel, CLIPConfig
+
 
 
 # =============================================================================
