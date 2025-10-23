@@ -414,15 +414,18 @@ class build_transformer_local(nn.Module):
         self.shift_num = cfg.MODEL.SHIFT_NUM
         self.divide_length = cfg.MODEL.DEVIDE_LENGTH
 
-        # ---------------- TinyCLIP + AFEM integration ----------------
+        # ---------------- TinyCLIP + AFEM integration ----------------          
         self.use_clip = getattr(cfg.MODEL, "USE_CLIP", False)
         if self.use_clip:
-            # Local TinyCLIP model path
+            # === 1. Local TinyCLIP weight path ===
             local_tinyclip_path = "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/pretrained/TinyCLIP-ViT-61M-32-Text-29M-LAION400M"
 
-            # Load TinyCLIP model using Hugging Face Transformers
+            # === 2. Load TinyCLIP model from local directory (using transformers) ===
             print(f"[make_model][init] Loading TinyCLIP from local path: {local_tinyclip_path}")
-            self.clip_model = CLIPModel.from_pretrained(local_tinyclip_path).vision_model
+            self.clip_model = CLIPModel.from_pretrained(
+                pretrained_model_name_or_path=local_tinyclip_path,
+                local_files_only=True
+            ).vision_model    
 
             # Fixed input 320×320
             self.clip_input_size = (320, 320)
