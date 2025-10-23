@@ -17,8 +17,7 @@ from .backbones.vit_pytorch import (
     deit_small_patch16_224_TransReID
 )
 from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
-from transformers import CLIPModel, CLIPConfig
-
+from transformers import CLIPModel, CLIPConfig  # kept for compatibility (not used in current .pt path)
 
 
 # =============================================================================
@@ -95,6 +94,12 @@ from transformers import CLIPModel, CLIPConfig
 #                                 - Added AFEM module and fusion: T = FC([T_a ⊕ T_s]) + Proj(AFEM(T_s))
 #                                 - ε-level fine-tuning for TinyCLIP
 #                                 - Fully compatible with Transformer + JPM + SIE pipeline
+# [2025-10-24 | Hang Zhang]      **FIX & STABILIZE (this revision)**
+#                                 - Support open_clip .pt checkpoint with DDP prefix ('module.') removal.
+#                                 - Force half→float conversion on load; use ViT-B/32 backbone for TinyCLIP-61M-32.
+#                                 - Replace pos-embed resize with a unified HF/open_clip-safe function (2D/3D aware).
+#                                 - Make CLIP input size configurable (default 256×256) instead of hard-coded 320×320.
+#                                 - Align dtype before fusion to avoid AMP precision mismatch.
 # =============================================================================
 
 
@@ -143,8 +148,67 @@ def weights_init_classifier(m):
 
 
 def _pick_feat_by_src(src: str, global_feat: torch.Tensor, bn_feat: torch.Tensor) -> torch.Tensor:
-    """Pick feature by source string: 'pre_bn' | 'bnneck' (default to pre_bn)."""
+    """Choose feature by name: 'pre_bn' or 'bnneck' (default to pre_bn)."""
     return bn_feat if src == "bnneck" else global_feat
+
+
+# --------- Positional embedding resize (HF/open_clip unified, 2D/3D aware) ----------
+def _get_clip_pos_embed_and_patch(clip_visual, impl: str):
+    """
+    Return (pos_embed[B=1,N,C], patch_size:int) in a unified way.
+    For open_clip, positional_embedding is often [N,C]; we normalize to [1,N,C].
+    Patch size is inferred from conv1 stride for ViT models (ViT-B/32 -> 32).
+    """
+    if impl == "hf":
+        pe = clip_visual.embeddings.position_embedding.weight  # [1,N,C] or [N,C]
+        if pe.dim() == 2:
+            pe = pe.unsqueeze(0)
+        patch = int(clip_visual.config.patch_size)
+    else:
+        pe = clip_visual.positional_embedding  # [N,C] or [1,N,C]
+        if pe.dim() == 2:
+            pe = pe.unsqueeze(0)
+        patch = getattr(clip_visual, "patch_size", None)
+        if patch is None and hasattr(clip_visual, "conv1"):
+            s = getattr(clip_visual.conv1, "stride", None)
+            if isinstance(s, tuple):
+                patch = s[0]
+        if patch is None:
+            # Fallback: infer by grid; typical B/32: 224→7×7, 256→8×8, 320→10×10
+            N = pe.shape[1]
+            gh = int((N - 1) ** 0.5)
+            patch = 32 if gh in (7, 8, 10, 12) else 16
+    return pe, int(patch)
+
+
+@torch.no_grad()
+def _resize_clip_pos_embed(clip_visual, new_hw, impl: str):
+    """
+    Resize ViT positional embeddings from pretrain resolution to new_hw=(H,W).
+    Works for both HF and open_clip (handles [N,C] vs [1,N,C]).
+    """
+    pe, patch = _get_clip_pos_embed_and_patch(clip_visual, impl)  # [1,N,C]
+    _, N, C = pe.shape
+    cls_tok, grid = pe[:, :1, :], pe[:, 1:, :]
+    gh = gw = int((N - 1) ** 0.5)
+    assert gh * gw == (N - 1), f"Non-square grid: N-1={N-1}"
+    grid = grid.reshape(1, gh, gw, C).permute(0, 3, 1, 2)  # [1,C,gh,gw]
+
+    new_h, new_w = new_hw
+    new_gh, new_gw = new_h // patch, new_w // patch
+    grid = F.interpolate(grid, size=(new_gh, new_gw), mode="bicubic", align_corners=False)
+    grid = grid.permute(0, 2, 3, 1).reshape(1, new_gh * new_gw, C)
+    pe_new = torch.cat([cls_tok, grid], dim=1)  # [1,1+newN,C]
+
+    # Write back preserving Parameter
+    if impl == "hf":
+        tgt = clip_visual.embeddings.position_embedding.weight
+    else:
+        tgt = clip_visual.positional_embedding
+    if tgt.dim() == 2:
+        tgt.data.copy_(pe_new.squeeze(0))
+    else:
+        tgt.data.copy_(pe_new)
 
 
 # --------------------------- AFEM (TinyCLIP semantics) -----------------------
@@ -410,122 +474,75 @@ class build_transformer_local(nn.Module):
         self.bottleneck_4.bias.requires_grad_(False)
         self.bottleneck_4.apply(weights_init_kaiming)
 
-
         self.shuffle_groups = cfg.MODEL.SHUFFLE_GROUP
         self.shift_num = cfg.MODEL.SHIFT_NUM
         self.divide_length = cfg.MODEL.DEVIDE_LENGTH
 
-        # ---------------- TinyCLIP + AFEM integration ----------------
+        # ---------------- TinyCLIP + AFEM integration (open_clip .pt) ----------------
         self.use_clip = getattr(cfg.MODEL, "USE_CLIP", False)
         if self.use_clip:
-            # === 1. Local TinyCLIP path ===
-            local_tinyclip_path = cfg.MODEL.CLIP_LOCAL_PATH
-            print(f"[make_model][init] Loading TinyCLIP: {local_tinyclip_path}")
+            import os
+            pt_path = getattr(cfg.MODEL, "CLIP_LOCAL_PATH", "")
+            assert pt_path and pt_path.endswith(".pt"), "CLIP_LOCAL_PATH must point to a .pt file (open_clip checkpoint)"
+            print(f"[make_model][init] Loading TinyCLIP via open_clip (fp32): {pt_path}")
 
-            try:
-                if local_tinyclip_path.endswith(".pt"):
-                    # ----- (A) OpenCLIP .pt (safe float32 loading) -----
-                    import open_clip
-                    import torch
+            # (1) Create ViT-B/32 visual backbone (best match for TinyCLIP-61M-32)
+            clip_model = open_clip.create_model("ViT-B-32", pretrained=None).float()
 
-                    print(f"[make_model][init] Loading TinyCLIP via open_clip (safe float32 mode): {local_tinyclip_path}")
+            # (2) Unpack state_dict, strip 'module.' (DDP), and convert half→float
+            sd_raw = torch.load(pt_path, map_location="cpu")
+            sd = sd_raw.get("state_dict", sd_raw)
+            new_sd, converted = {}, 0
+            for k, v in sd.items():
+                k2 = k.replace("module.", "")
+                if isinstance(v, torch.HalfTensor):
+                    v = v.float()
+                    converted += 1
+                new_sd[k2] = v
+            msg = clip_model.load_state_dict(new_sd, strict=False)
+            print(f"[TinyCLIP] loaded. half→float converted={converted}, missing={len(msg.missing_keys)}, unexpected={len(msg.unexpected_keys)}")
 
-                    # (1) Create model structure only, without loading weights
-                    clip_model = open_clip.create_model("ViT-B-32", pretrained=None)
-                    clip_model = clip_model.float()  # Ensure all params & buffers are float32
+            # (3) Use visual tower only
+            self.clip_model = getattr(clip_model, "visual", clip_model)
+            self.clip_impl = "open_clip"
 
-                    # (2) Manually load weights and convert any HalfTensor to Float32
-                    state_dict = torch.load(local_tinyclip_path, map_location="cpu")
-                    converted = 0
-                    for k, v in state_dict.items():
-                        if isinstance(v, torch.HalfTensor):
-                            state_dict[k] = v.float()
-                            converted += 1
-                    msg = clip_model.load_state_dict(state_dict, strict=False)
-                    print(f"[make_model][TinyCLIP] Weights loaded (Half→Float32, converted {converted} tensors).")
-                    print(f"[make_model][TinyCLIP] Missing keys: {len(msg.missing_keys)}, Unexpected keys: {len(msg.unexpected_keys)}")
+            # (4) Configurable CLIP input size; default to 256×256 for stability
+            self.clip_input_size = tuple(getattr(cfg.MODEL, "CLIP_INPUT_SIZE", (256, 256)))
 
-                    self.clip_model = clip_model.visual
-                    print("[make_model][TinyCLIP] Successfully loaded in safe float32 mode.")
+            # (5) Resize positional embeddings to the target resolution
+            _resize_clip_pos_embed(self.clip_model, self.clip_input_size, self.clip_impl)
 
-                else:
-                    # ----- (B) Transformers checkpoint -----
-                    from transformers import CLIPModel, CLIPConfig
-                    print(f"[make_model][init] Loading TinyCLIP via transformers: {local_tinyclip_path}")
-                    config = CLIPConfig.from_pretrained(local_tinyclip_path, local_files_only=True)
-                    clip_model_full = CLIPModel.from_pretrained(local_tinyclip_path, config=config, local_files_only=True)
-                    self.clip_model = clip_model_full.vision_model
-                    print("[make_model][TinyCLIP] Loaded via transformers successfully.")
-
-            except Exception as e:
-                print(f"[make_model][fatal] TinyCLIP loading failed: {e}")
-                self.clip_model = None
-            
-            
-            # === Fixed input (320×320 or 256×256) ===
-            self.clip_input_size = (320, 320)
-
-            # === Resize positional embedding for CLIP visual encoder ===
-            def _resize_clip_pos_embed(clip_visual, new_grid_hw):
-                """
-                Resize positional embedding from pretrained TinyCLIP (usually 14×14+1 for 224)
-                to match new patch grid (e.g., 20×20+1 for 320).
-                """
-                # [1, L, C] → separate [CLS] token and grid
-                pe = clip_visual.positional_embedding
-                cls, grid = pe[:, :1, :], pe[:, 1:, :]
-                L, C = grid.shape[1], grid.shape[2]
-
-                # old grid (usually 14×14)
-                old_h = old_w = int(L ** 0.5)
-                grid = grid.reshape(1, old_h, old_w, C).permute(0, 3, 1, 2)  # [1, C, H, W]
-
-                # interpolate to new grid size (e.g., 20×20 for 320×320)
-                grid = torch.nn.functional.interpolate(
-                    grid, size=new_grid_hw, mode="bicubic", align_corners=False
-                )
-
-                # reshape back and concatenate with cls token
-                grid = grid.permute(0, 2, 3, 1).reshape(1, new_grid_hw[0] * new_grid_hw[1], C)
-                clip_visual.positional_embedding = torch.cat([cls, grid], dim=1)
-
-            # === compute new grid size ===
-            patch = 16
-            new_h = self.clip_input_size[0] // patch
-            new_w = self.clip_input_size[1] // patch
-
-            # === apply resize ===
-            _resize_clip_pos_embed(self.clip_model, (new_h, new_w))
-
-
-            # Disable text branch
-            if hasattr(self.clip_model, "transformer"):
-                self.clip_model.transformer = None
-            if hasattr(self.clip_model, "encode_text"):
-                self.clip_model.encode_text = None
-
-            # ε-level fine-tuning
+            # (6) ε-level fine-tuning (set to False to freeze)
             for p in self.clip_model.parameters():
                 p.requires_grad = True
 
-            self.clip_output_dim = getattr(self.clip_model, "output_dim", 768)
+            # (7) Derive output dim (robust fallback)
+            self.clip_output_dim = getattr(self.clip_model, "output_dim", None)
+            if self.clip_output_dim is None:
+                proj = getattr(self.clip_model, "proj", None)
+                if isinstance(proj, torch.Tensor):
+                    self.clip_output_dim = proj.shape[1]
+                elif hasattr(self.clip_model, "width"):
+                    self.clip_output_dim = int(self.clip_model.width)
+                else:
+                    self.clip_output_dim = 768  # safe default
+
+            # (8) Fusion heads
             self.fuse_proj_global = nn.Linear(self.in_planes + self.clip_output_dim, self.in_planes)
             self.afem = AFEM(dim=self.clip_output_dim, groups=32)
             self.sem_refine_proj = nn.Linear(self.clip_output_dim, self.in_planes)
 
-            # Normalization buffers
+            # (9) Normalization buffers: ImageNet -> CLIP
             im_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-            im_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+            im_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
             clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
-            clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+            clip_std  = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
             self.register_buffer("imnet_mean", im_mean, persistent=False)
-            self.register_buffer("imnet_std", im_std, persistent=False)
-            self.register_buffer("clip_mean", clip_mean, persistent=False)
-            self.register_buffer("clip_std", clip_std, persistent=False)
+            self.register_buffer("imnet_std",  im_std,  persistent=False)
+            self.register_buffer("clip_mean",  clip_mean, persistent=False)
+            self.register_buffer("clip_std",   clip_std,  persistent=False)
 
-            print(f"[make_model][init] Using TinyCLIP-ViT-B-32 "
-                  f"(laion2b_yfcc_s11b, 320×320) + AFEM(groups=32). "
-                  f"ε-level fine-tuning enabled.")
+            print(f"[make_model][init] TinyCLIP (open_clip, ViT-B/32) ready. input={self.clip_input_size}, AFEM(groups=32).")
 
         # SupCon head
         self.supcon_enabled = (
@@ -571,14 +588,20 @@ class build_transformer_local(nn.Module):
         # ---------------- TinyCLIP + AFEM fusion ----------------
         if getattr(self, "use_clip", False):
             with torch.no_grad():
+                # De-normalize ImageNet -> normalize to CLIP, then resize to configured size
                 x_denorm = x_img * self.imnet_std + self.imnet_mean
                 x_clip = (x_denorm - self.clip_mean) / self.clip_std
-                if x_clip.shape[-2:] != (320, 320):
-                    x_clip = F.interpolate(x_clip, size=(320, 320),
-                                           mode='bicubic', align_corners=False)
+                if x_clip.shape[-2:] != self.clip_input_size:
+                    x_clip = F.interpolate(
+                        x_clip, size=self.clip_input_size, mode='bicubic', align_corners=False
+                    )
                 x_clip = x_clip.float()
                 feat_clip = self.clip_model(x_clip)
 
+            # Align dtype before fusion (important with AMP/bfloat16)
+            feat_clip = feat_clip.to(global_feat.dtype)
+
+            # Global fusion: concat + FC, plus AFEM-refined semantics residual
             tu = self.fuse_proj_global(torch.cat([global_feat, feat_clip], dim=1))
             ts_refined = self.afem(feat_clip)
             pre_bn_global = tu + self.sem_refine_proj(ts_refined)
