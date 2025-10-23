@@ -417,15 +417,17 @@ class build_transformer_local(nn.Module):
         # ---------------- TinyCLIP + AFEM integration ----------------          
         self.use_clip = getattr(cfg.MODEL, "USE_CLIP", False)
         if self.use_clip:
-            # === 1. Local TinyCLIP weight path ===
-            local_tinyclip_path = "/content/drive/MyDrive/5703(hzha0521)/Optimized Model B (transformer based)/pretrained/TinyCLIP-ViT-61M-32-Text-29M-LAION400M"
+            # === 1. Local TinyCLIP path ===
+            local_tinyclip_path = cfg.MODEL.CLIP_LOCAL_PATH
 
-            # === 2. Load TinyCLIP model from local directory (using transformers) ===
             print(f"[make_model][init] Loading TinyCLIP from local path: {local_tinyclip_path}")
-            self.clip_model = CLIPModel.from_pretrained(
-                pretrained_model_name_or_path=local_tinyclip_path,
-                local_files_only=True
-            ).vision_model    
+
+            # === 2. Load TinyCLIP config and model explicitly (force local path) ===
+            config = CLIPConfig.from_pretrained(local_tinyclip_path, local_files_only=True)
+            clip_model_full = CLIPModel.from_pretrained(local_tinyclip_path, config=config, local_files_only=True)
+
+            # === 3. Extract vision encoder only ===
+            self.clip_model = clip_model_full.vision_model    
 
             # Fixed input 320×320
             self.clip_input_size = (320, 320)
