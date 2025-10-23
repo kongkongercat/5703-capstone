@@ -88,6 +88,11 @@ from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 #                                   bicubic resize to `visual.image_size` → `encode_image()`.
 #                                   Keeps JPM/local branches intact and preserves original behavior
 #                                   when `MODEL.USE_CLIP=False`.
+# [2025-10-24 | Hang Zhang]      **CLIP fusion quick-win (global + 4×local)**
+#                                 - Add LayerNorm-based alignment and scalar gating (alpha) for global fusion.
+#                                 - Connect CLIP to 4 local branches via a shared lightweight fusion head.
+#                                 - Keep forward signatures and loss usage unchanged; SupCon optional.
+#                                 - Backward-compatible: when MODEL.USE_CLIP=False, behavior is identical.
 # =============================================================================
 
 
@@ -415,31 +420,31 @@ class build_transformer_local(nn.Module):
         self.shift_num = cfg.MODEL.SHIFT_NUM
         self.divide_length = cfg.MODEL.DEVIDE_LENGTH
 
-        # ---------------- CLIP (optional, minimal) ----------------
+        # ---------------- CLIP (optional, quick-win fusion) ----------------
         self.use_clip = getattr(cfg.MODEL, "USE_CLIP", False)
         if self.use_clip:
             clip_backbone = getattr(cfg.MODEL, "CLIP_BACKBONE", "ViT-B-16")
             clip_pretrain = getattr(cfg.MODEL, "CLIP_PRETRAIN", "laion2b_s34b_b88k")
 
-            # ✅ open-clip 3.x 兼容：不要把 image_size 传进模型构造
+            # open-clip 3.x compat: do NOT pass image_size to constructor
             self.clip_model = open_clip.create_model(clip_backbone, pretrained=clip_pretrain)
             for p in self.clip_model.parameters():
                 p.requires_grad = False
             self.clip_model.eval()
 
-            # Record CLIP expected input size (int or (H, W))
+            # record CLIP expected input size
             size = getattr(self.clip_model.visual, "image_size", 224)
             if isinstance(size, int):
                 size = (size, size)
-            self.clip_input_size = tuple(size)  # e.g., (224, 224) for ViT-B/16
+            self.clip_input_size = tuple(size)  # e.g., (224, 224)
 
-            # Fuse [global_feat ; clip_feat] -> in_planes (base=768, small=384)
+            # global fusion projection: [bb; clip] -> C
             self.fuse_proj_global = nn.Linear(
                 self.in_planes + self.clip_model.visual.output_dim,
                 self.in_planes
             )
 
-            # Cache ImageNet and CLIP normalization stats as buffers (move with .to(device))
+            # cache normalization stats as buffers
             im_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
             im_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
             clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
@@ -449,8 +454,32 @@ class build_transformer_local(nn.Module):
             self.register_buffer("clip_mean",  clip_mean, persistent=False)
             self.register_buffer("clip_std",   clip_std,  persistent=False)
 
-            print(f"[make_model][init] CLIP fusion enabled (TransformerLocal): "
-                  f"global pre-BN only; locals unchanged. expected_size={self.clip_input_size}")
+            # ==== [NEW] Global fusion alignment + scalar gate ====
+            self.fuse_ln_global_backbone = nn.LayerNorm(self.in_planes)
+            self.fuse_ln_global_clip = nn.LayerNorm(self.clip_model.visual.output_dim)
+            self.fuse_gate_global = nn.Sequential(
+                nn.Linear(self.in_planes + self.clip_model.visual.output_dim, self.in_planes // 4),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.in_planes // 4, 1),
+                nn.Sigmoid()
+            )
+
+            # ==== [NEW] Shared lightweight fusion for 4 local branches ====
+            self.fuse_proj_local  = nn.Linear(
+                self.in_planes + self.clip_model.visual.output_dim,
+                self.in_planes
+            )
+            self.fuse_ln_local_bb = nn.LayerNorm(self.in_planes)
+            self.fuse_ln_local_cf = nn.LayerNorm(self.clip_model.visual.output_dim)
+            self.fuse_gate_local  = nn.Sequential(
+                nn.Linear(self.in_planes + self.clip_model.visual.output_dim, self.in_planes // 4),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.in_planes // 4, 1),
+                nn.Sigmoid()
+            )
+
+            print(f"[make_model][init] CLIP fusion enabled (TransformerLocal quick-win): "
+                  f"global + 4×local with LN+gate. expected_size={self.clip_input_size}")
 
         # SupCon head
         self.supcon_enabled = (
@@ -497,26 +526,45 @@ class build_transformer_local(nn.Module):
         local_feat_3 = extract_local(patch_length * 2, patch_length * 3)
         local_feat_4 = extract_local(patch_length * 3, patch_length * 4)
 
-        # ---------------- CLIP fusion for GLOBAL pre-BN only ----------------
+        # ---------------- CLIP fusion (global + locals, LN + scalar gate) ----------------
         if getattr(self, "use_clip", False):
             with torch.no_grad():
-                # x_img is ImageNet-normalized (256x256 from main pipeline)
-                # 1) de-normalize to [0,1] with ImageNet stats
+                # 1) denorm ImageNet -> approx [0,1]
                 x_denorm = x_img * self.imnet_std + self.imnet_mean
-                # 2) normalize with CLIP stats
+                # 2) CLIP normalization
                 x_clip = (x_denorm - self.clip_mean) / self.clip_std
                 x_clip = x_clip.float()
-
-                # ✅ 3) resize to CLIP expected size (e.g., 224x224)
+                # 3) resize to CLIP expected size
                 h, w = self.clip_input_size
                 if x_clip.shape[-2:] != (h, w):
                     x_clip = F.interpolate(x_clip, size=(h, w), mode='bicubic', align_corners=False)
-
-                # 4) encode with CLIP
+                # 4) encode via CLIP (no grad)
                 feat_clip = self.clip_model.encode_image(x_clip)  # [B, D_clip]
-            pre_bn_global = self.fuse_proj_global(torch.cat([global_feat, feat_clip], dim=1))
+
+            # ---- Global fusion: LN-align + scalar gate -> weighted concat -> proj ----
+            bb_g  = self.fuse_ln_global_backbone(global_feat)     # [B, C]
+            cf_g  = self.fuse_ln_global_clip(feat_clip)           # [B, D]
+            cat_g = torch.cat([bb_g, cf_g], dim=1)                # [B, C+D]
+            a_g   = self.fuse_gate_global(cat_g)                  # [B, 1] in (0,1)
+            fused_in_g   = torch.cat([(1.0 - a_g) * bb_g, a_g * cf_g], dim=1)  # [B, C+D]
+            pre_bn_global = self.fuse_proj_global(fused_in_g)     # [B, C]
+
+            # ---- Local fusion (shared weights): LN-align + scalar gate -> weighted concat -> proj ----
+            def fuse_local_prebn(local_feat: torch.Tensor) -> torch.Tensor:
+                bb  = self.fuse_ln_local_bb(local_feat)           # [B, C]
+                cf  = self.fuse_ln_local_cf(feat_clip)            # [B, D]
+                cat = torch.cat([bb, cf], dim=1)                  # [B, C+D]
+                a   = self.fuse_gate_local(cat)                   # [B, 1]
+                fused_in = torch.cat([(1.0 - a) * bb, a * cf], dim=1)
+                return self.fuse_proj_local(fused_in)             # [B, C]
+
+            local_feat_1 = fuse_local_prebn(local_feat_1)
+            local_feat_2 = fuse_local_prebn(local_feat_2)
+            local_feat_3 = fuse_local_prebn(local_feat_3)
+            local_feat_4 = fuse_local_prebn(local_feat_4)
         else:
             pre_bn_global = global_feat
+        # ---------------- end CLIP fusion ----------------
 
         feat_bn_global = self.bottleneck(pre_bn_global)
         local_feat_1_bn = self.bottleneck_1(local_feat_1)
@@ -549,7 +597,7 @@ class build_transformer_local(nn.Module):
                     self.classifier_4(local_feat_4_bn)
                 ]
 
-            # pre-BN features: global uses fused pre-BN; locals unchanged
+            # pre-BN features: global uses fused pre-BN; locals now also fused (quick-win)
             feats = [pre_bn_global, local_feat_1, local_feat_2, local_feat_3, local_feat_4]
 
             # BNNeck list (Option-B parity)
