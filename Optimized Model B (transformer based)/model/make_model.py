@@ -91,7 +91,7 @@ from transformers import CLIPModel, CLIPConfig
 #                                   Keeps JPM/local branches intact and preserves original behavior
 #                                   when `MODEL.USE_CLIP=False`.
 # [2025-10-24 | Hang Zhang]      **TinyCLIP + AFEM (paper-aligned)**
-#                                 - Added TinyCLIP-ViT-B-16 (laion2b_yfcc_s11b, 320×320)
+#                                 - Added TinyCLIP-ViT-B-32 (laion2b_yfcc_s11b, 320×320)
 #                                 - Added AFEM module and fusion: T = FC([T_a ⊕ T_s]) + Proj(AFEM(T_s))
 #                                 - ε-level fine-tuning for TinyCLIP
 #                                 - Fully compatible with Transformer + JPM + SIE pipeline
@@ -431,7 +431,7 @@ class build_transformer_local(nn.Module):
                     print(f"[make_model][init] Loading TinyCLIP via open_clip (safe float32 mode): {local_tinyclip_path}")
 
                     # (1) Create model structure only, without loading weights
-                    clip_model = open_clip.create_model("ViT-B-16", pretrained=None)
+                    clip_model = open_clip.create_model("ViT-B-32", pretrained=None)
                     clip_model = clip_model.float()  # Ensure all params & buffers are float32
 
                     # (2) Manually load weights and convert any HalfTensor to Float32
@@ -523,7 +523,7 @@ class build_transformer_local(nn.Module):
             self.register_buffer("clip_mean", clip_mean, persistent=False)
             self.register_buffer("clip_std", clip_std, persistent=False)
 
-            print(f"[make_model][init] Using TinyCLIP-ViT-B-16 "
+            print(f"[make_model][init] Using TinyCLIP-ViT-B-32 "
                   f"(laion2b_yfcc_s11b, 320×320) + AFEM(groups=32). "
                   f"ε-level fine-tuning enabled.")
 
