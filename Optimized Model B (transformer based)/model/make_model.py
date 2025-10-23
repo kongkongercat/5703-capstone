@@ -80,11 +80,14 @@ from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 #                                 - Fused CLIP only into GLOBAL pre-BN (concat+Linear); 4 local branches unchanged.
 #                                 - Controlled by MODEL.USE_CLIP, with MODEL.CLIP_BACKBONE / CLIP_PRETRAIN (optional).
 #                                 - Disabled -> exact parity with previous behavior (bitwise-compatible paths).
-# [2025-10-23 | Hang Zhang]      **CLIP pos-embed size fix (197 -> 257)**
-#                                 - Initialize CLIP with image_size=256 so positional embedding is
-#                                   auto-interpolated to 16*16+1=257 tokens.
-#                                 - In forward(), convert ImageNet-normalized tensor to CLIP stats
-#                                   before encode_image (no resizing). Fixes RuntimeError: 257 vs 197.
+# [2025-10-23 | Hang Zhang]      **CLIP init compat (open-clip 3.x)**
+#                                 - Stop passing `image_size` to CLIP constructor; use `create_model(...)`
+#                                   and read `visual.image_size` as the expected input resolution.
+# [2025-10-23 | Hang Zhang]      **CLIP input resize in forward**
+#                                 - In forward(), de-normalize (ImageNet) → normalize (CLIP) →
+#                                   bicubic resize to `visual.image_size` → `encode_image()`.
+#                                   Keeps JPM/local branches intact and preserves original behavior
+#                                   when `MODEL.USE_CLIP=False`.
 # =============================================================================
 
 
@@ -418,13 +421,17 @@ class build_transformer_local(nn.Module):
             clip_backbone = getattr(cfg.MODEL, "CLIP_BACKBONE", "ViT-B-16")
             clip_pretrain = getattr(cfg.MODEL, "CLIP_PRETRAIN", "laion2b_s34b_b88k")
 
-            # Key: image_size=256 -> auto-interpolate CLIP positional embedding to 16*16+1=257
-            self.clip_model, _, _ = open_clip.create_model_and_transforms(
-                clip_backbone, pretrained=clip_pretrain, image_size=256
-            )
+            # ✅ open-clip 3.x 兼容：不要把 image_size 传进模型构造
+            self.clip_model = open_clip.create_model(clip_backbone, pretrained=clip_pretrain)
             for p in self.clip_model.parameters():
                 p.requires_grad = False
             self.clip_model.eval()
+
+            # Record CLIP expected input size (int or (H, W))
+            size = getattr(self.clip_model.visual, "image_size", 224)
+            if isinstance(size, int):
+                size = (size, size)
+            self.clip_input_size = tuple(size)  # e.g., (224, 224) for ViT-B/16
 
             # Fuse [global_feat ; clip_feat] -> in_planes (base=768, small=384)
             self.fuse_proj_global = nn.Linear(
@@ -442,8 +449,8 @@ class build_transformer_local(nn.Module):
             self.register_buffer("clip_mean",  clip_mean, persistent=False)
             self.register_buffer("clip_std",   clip_std,  persistent=False)
 
-            print("[make_model][init] CLIP fusion enabled (TransformerLocal, image_size=256): "
-                  "global pre-BN only; locals unchanged.")
+            print(f"[make_model][init] CLIP fusion enabled (TransformerLocal): "
+                  f"global pre-BN only; locals unchanged. expected_size={self.clip_input_size}")
 
         # SupCon head
         self.supcon_enabled = (
@@ -493,12 +500,19 @@ class build_transformer_local(nn.Module):
         # ---------------- CLIP fusion for GLOBAL pre-BN only ----------------
         if getattr(self, "use_clip", False):
             with torch.no_grad():
-                # x_img is ImageNet-normalized at 256x256.
+                # x_img is ImageNet-normalized (256x256 from main pipeline)
                 # 1) de-normalize to [0,1] with ImageNet stats
                 x_denorm = x_img * self.imnet_std + self.imnet_mean
-                # 2) normalize with CLIP stats (no resizing; CLIP initialized at 256)
+                # 2) normalize with CLIP stats
                 x_clip = (x_denorm - self.clip_mean) / self.clip_std
-                x_clip = x_clip.float()  # safer around AMP
+                x_clip = x_clip.float()
+
+                # ✅ 3) resize to CLIP expected size (e.g., 224x224)
+                h, w = self.clip_input_size
+                if x_clip.shape[-2:] != (h, w):
+                    x_clip = F.interpolate(x_clip, size=(h, w), mode='bicubic', align_corners=False)
+
+                # 4) encode with CLIP
                 feat_clip = self.clip_model.encode_image(x_clip)  # [B, D_clip]
             pre_bn_global = self.fuse_proj_global(torch.cat([global_feat, feat_clip], dim=1))
         else:
