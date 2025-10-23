@@ -544,7 +544,7 @@ class build_transformer_local(nn.Module):
                     x_clip = F.interpolate(x_clip, size=(320, 320),
                                            mode='bicubic', align_corners=False)
                 x_clip = x_clip.float()
-                feat_clip = self.clip_model.encode_image(x_clip)
+                feat_clip = self.clip_model(x_clip)
 
             tu = self.fuse_proj_global(torch.cat([global_feat, feat_clip], dim=1))
             ts_refined = self.afem(feat_clip)
