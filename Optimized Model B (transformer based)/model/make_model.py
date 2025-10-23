@@ -432,7 +432,9 @@ class build_transformer_local(nn.Module):
                         model_name="ViT-B-16",  # TinyCLIP based on ViT-B/16
                         pretrained=local_tinyclip_path
                     )
-                    if any(p.dtype == torch.float16 for p in clip_model.parameters()):
+                   
+                    first_param = next(iter(clip_model.parameters()))
+                    if first_param.dtype == torch.float16:
                         print("[make_model][TinyCLIP] Detected float16 weights, converting to float32 for stability...")
                         clip_model = clip_model.float()
 
