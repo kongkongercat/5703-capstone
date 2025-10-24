@@ -653,7 +653,7 @@ class build_transformer_local(nn.Module):
             # New: try to pass interpolate_pos_encoding=True (newer HF).
             # Fallback: call without it (older HF).
             try:
-                out_clip = self.clip_model(pixel_values=x_clip, interpolate_pos_encoding=True)
+                out_clip = self.clip_model(pixel_values=x_clip, interpolate_pos_encoding=False)
             except TypeError:
                 out_clip = self.clip_model(pixel_values=x_clip)
 
