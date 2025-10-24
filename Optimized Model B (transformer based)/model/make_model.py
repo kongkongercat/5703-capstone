@@ -590,48 +590,54 @@ class build_transformer_local(nn.Module):
         local_feat_4 = extract_local(patch_length * 3, patch_length * 4)
         
         if self.use_clip:
-            # ====== 1. Grab same image tensor used by the main backbone ======
-            x_clip = x_img  # [B,3,H,W] after your standard train transforms
+            # 1. Use the exact same input image tensor the main backbone saw
+            #    (already augmented and resized to e.g. 320×320 by the dataloader / main pipeline).
+            x_clip = x_img  # [B,3,H,W]
 
-            # ====== 2. Convert ImageNet normalization -> CLIP normalization ======
-            # undo ImageNet norm, then apply CLIP's own mean/std
+            # 2. Convert ImageNet-style normalization -> CLIP-style normalization.
+            #    First undo ImageNet norm, then apply CLIP mean/std.
             x_unnorm = x_clip * self.imnet_std + self.imnet_mean
-            x_clip = (x_unnorm - self.clip_mean) / self.clip_std
+            x_clip = (x_unnorm - self.clip_mean) / self.clip_std  # now matches CLIP pixel_values space
 
-            # ====== 3. Force TinyCLIP to run at the resolution WE choose (e.g. 256/320) ======
-            # self.clip_target_size was set in __init__, e.g. (320,320) or (256,256)
+            # 3. Force TinyCLIP to run at our desired resolution (e.g. 256x256 or 320x320),
+            #    not just the pretraining 224x224.
             target_h, target_w = self.clip_target_size
             if x_clip.shape[-2:] != (target_h, target_w):
                 x_clip = F.interpolate(
                     x_clip,
                     size=(target_h, target_w),
                     mode="bilinear",
-                    align_corners=False
+                    align_corners=False,
                 )
 
-            # ====== 4. One-time resize of TinyCLIP's positional embeddings to match new patch grid ======
-            # This is CRITICAL for high-res operation (paper-style ↑resolution).
+            # 4. On the first forward only:
+            #    - Resize TinyCLIP's positional embeddings to the new patch grid.
+            #    - Patch TinyCLIP's internal "image_size" bookkeeping so it stops assuming 224.
             if not self._clip_pos_resized:
                 _hf_resize_pos_embed(self.clip_model, (target_h, target_w))
 
-                # NEW >>> tell TinyCLIP "you are now a 256x256 / 320x320 model"
-                # HF CLIPVisionModel checks .config.image_size to assert input size.
-                # We override it so it won't scream "Input image size (320*320) doesn't match model (224*224)".
+                # Sync model metadata so HF's forward() won't complain about 224x224 mismatch.
                 if hasattr(self.clip_model, "config") and hasattr(self.clip_model.config, "image_size"):
-                    self.clip_model.config.image_size = target_h
-
-                # tiny safety: in some HF versions, clip_model might itself have .vision_model.config
-                if hasattr(self.clip_model, "vision_model") and hasattr(self.clip_model.vision_model, "config"):
-                    if hasattr(self.clip_model.vision_model.config, "image_size"):
-                        self.clip_model.vision_model.config.image_size = target_h
-                # <<< NEW
+                    # vision_model.config.image_size (int)
+                    self.clip_model.config.image_size = target_h  # e.g. 320
+                if hasattr(self.clip_model, "embeddings") and hasattr(self.clip_model.embeddings, "image_size"):
+                    # CLIPVisionEmbeddings.image_size (int cached at init time)
+                    self.clip_model.embeddings.image_size = target_h
 
                 self._clip_pos_resized = True
-                print(f"[make_model][clip] resized TinyCLIP pos_embed to {target_h}x{target_w}")
+                print(f"[make_model][clip] resized TinyCLIP pos_embed to {target_h}x{target_w} (patch OK)")
 
-            # ====== 5. Run TinyCLIP vision tower at this (possibly larger) resolution ======
+            # 5. Run TinyCLIP's vision tower at this higher resolution.
+            #    We explicitly set interpolate_pos_encoding=True to bypass HF's strict size check
+            #    and allow arbitrary spatial size.
             def _clip_vision_pool(outputs):
-                """Extract pooled visual embedding safely across HF versions."""
+                """
+                Safely extract a pooled visual embedding [B, C] from various HF return types.
+                Priority:
+                - pooler_output
+                - last_hidden_state[:,0]
+                - first tensor in tuple/list
+                """
                 if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
                     return outputs.pooler_output
                 if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
@@ -644,24 +650,35 @@ class build_transformer_local(nn.Module):
                     return outputs[:, 0] if outputs.dim() == 3 else outputs
                 raise RuntimeError("Unsupported CLIP vision outputs structure.")
 
+            # New: try to pass interpolate_pos_encoding=True (newer HF).
+            # Fallback: call without it (older HF).
             try:
-                out_clip = self.clip_model(pixel_values=x_clip)
+                out_clip = self.clip_model(pixel_values=x_clip, interpolate_pos_encoding=True)
             except TypeError:
-                out_clip = self.clip_model(x_clip)
+                out_clip = self.clip_model(pixel_values=x_clip)
 
-            # raw TinyCLIP semantic feature (before AFEM)
-            ts_raw = _clip_vision_pool(out_clip)  # [B, clip_output_dim]
+            # Raw TinyCLIP semantic embedding (CLS / pooled visual token), shape [B, clip_output_dim]
+            ts_raw = _clip_vision_pool(out_clip)
 
-            # ====== 6. Fuse CLIP semantics with Transformer global feature (AFEM path) ======
-            # Tu = FC([Ta ⊕ Ts_raw])
-            Tu = self.fuse_fc(torch.cat([global_feat, ts_raw], dim=1))      # (B, in_planes)
+            # 6. Fuse TinyCLIP semantics with our transformer global feature via AFEM (+ projection heads).
+            #
+            #   Tu      = fuse_fc([Ta ⊕ Ts_raw])
+            #   Ts_ref  = AFEM(Ts_raw)
+            #   Ts'     = sem_refine_proj(Ts_ref)
+            #   T_final = Tu + Ts'
+            #
+            # where:
+            #   Ta          : our global_feat from the ViT/DeiT branch  (dim = in_planes)
+            #   Ts_raw      : TinyCLIP pooled vision feature            (dim = clip_output_dim)
+            #   fuse_fc     : Linear(in_planes + clip_output_dim -> in_planes)
+            #   AFEM        : learns channel-group reweighting on Ts_raw
+            #   sem_refine_proj: Linear(clip_output_dim -> in_planes)
+            #
+            Tu = self.fuse_fc(torch.cat([global_feat, ts_raw], dim=1))          # [B, in_planes]
+            Ts_prime = self.sem_refine_proj(self.afem(ts_raw))                  # [B, in_planes]
 
-            # Ts' = Proj(AFEM(Ts_raw))
-            Ts_prime = self.sem_refine_proj(self.afem(ts_raw))              # (B, in_planes)
-
-            # Final fused global feature
+            # final fused global feature replaces the old global_feat for downstream heads/losses
             global_feat = Tu + Ts_prime
-
 
         # pre-BN feature for downstream heads/losses (works with or without CLIP)
         pre_bn_global = global_feat
