@@ -236,7 +236,7 @@ _C.LOSS.BRIGHTNESS.K = 0.08         # extra weight or gating factor (your usage)
 _C.MODEL.USE_CLIP = True
 _C.MODEL.CLIP_HF_ID =  "wkcn/TinyCLIP-ViT-61M-32-Text-29M-LAION400M"
 _C.MODEL.CLIP_LOCAL_PATH = ""
-_C.MODEL.CLIP_INPUT_SIZE = (256, 256)
+_C.MODEL.CLIP_INPUT_SIZE = (320, 320)
 _C.MODEL.CLIP_FINETUNE=True
 
 

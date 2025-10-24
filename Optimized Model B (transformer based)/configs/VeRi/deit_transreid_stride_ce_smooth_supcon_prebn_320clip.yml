@@ -1,0 +1,49 @@
+MODEL:
+  TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
+  PRETRAIN_CHOICE: 'imagenet'
+  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
+  NAME: 'transformer'
+  STRIDE_SIZE: [12, 12]
+  SIE_CAMERA: True
+  SIE_VIEW: True
+  SIE_COE: 3.0
+  JPM: True
+  SHIFT_NUM: 8
+  RE_ARRANGE: True
+
+  # === Loss setup ===
+  METRIC_LOSS_TYPE: 'softmax'        # ← Triplet off, CE+SupCon only
+  NO_MARGIN: True
+  IF_LABELSMOOTH: 'on'               # ← Enable label smoothing
+  IF_WITH_CENTER: 'no'
+  ID_LOSS_WEIGHT: 1.0
+  TRIPLET_LOSS_WEIGHT: 0.0           # ← Disable Triplet loss
+
+  # === CLIP integration ===
+  USE_CLIP: True
+  CLIP_INPUT_SIZE: [320, 320]        # ← Align TinyCLIP with 320×320 input
+
+INPUT:
+  SIZE_TRAIN: [320, 320]             # ← Training input resolution
+  SIZE_TEST: [320, 320]              # ← Testing input resolution
+
+LOSS:
+  PHASED:
+    ENABLE: False
+
+  TRIPLET:
+    ENABLE: False                    # ← Fully disabled, optional for safety
+    FEAT_SRC: 'pre_bn'
+
+  SUPCON:
+    ENABLE: True
+    FEAT_SRC: 'pre_bn'               # Use pre-BN feature (paper setup)
+    W: 0.30
+    T: 0.07
+    CAM_AWARE: False
+    POS_RULE: "class"
+    W0: 0.30
+    DECAY_TYPE: "const"
+    DECAY_START: 0
+    DECAY_END: 0
+

@@ -482,10 +482,15 @@ class build_transformer_local(nn.Module):
             # (6) Output dimension from vision_config.hidden_size (not projection_dim)
             self.clip_output_dim = int(hf_clip.config.vision_config.hidden_size)
 
-            # (7) Fusion heads for global and semantic features
-            self.fuse_proj_global = nn.Linear(2 * self.in_planes, self.in_planes)
+           
+            # (7) Fusion heads (paper-aligned):
+            # Tu = FC([Ta ⊕ Ts_raw]) where Ta∈R^{in_planes}, Ts_raw∈R^{clip_output_dim}
+            self.fuse_fc = nn.Linear(self.in_planes + self.clip_output_dim, self.in_planes)
+
+            # Ts' = Proj(AFEM(Ts_raw))
             self.afem = AFEM(dim=self.clip_output_dim, groups=32)
             self.sem_refine_proj = nn.Linear(self.clip_output_dim, self.in_planes)
+
 
             print(f"[make_model][init] TinyCLIP (HF) ready. input={self.clip_input_size}, "
                   f"proj_dim={self.clip_output_dim}, AFEM(groups=32), finetune={self.clip_finetune}.")
@@ -581,16 +586,18 @@ class build_transformer_local(nn.Module):
             except TypeError:
                 out_clip = self.clip_model(x_clip)
 
-            clip_feat = _clip_vision_pool(out_clip)  # [B, hidden_size]
+            ts_raw = _clip_vision_pool(out_clip)  # [B, clip_output_dim], raw TinyCLIP semantic
 
-            # Optional refinement & semantic enhancement
-            clip_feat = self.afem(clip_feat)              # (B, in_planes)
-            clip_feat = self.sem_refine_proj(clip_feat)   # (B, in_planes)
-    
-            # Fuse with backbone global feature (pre-BN)
-            fused = torch.cat([global_feat, clip_feat], dim=1)     # (B, in_planes + in_planes)
-            fused = self.fuse_proj_global(fused)                   # (B, in_planes)
-            global_feat = fused
+            # ---- Paper-aligned fusion ----
+            # 1) Tu = FC([Ta ⊕ Ts_raw])
+            Tu = self.fuse_fc(torch.cat([global_feat, ts_raw], dim=1))  # (B, in_planes)
+
+            # 2) Ts' = Proj(AFEM(Ts_raw))
+            Ts_prime = self.sem_refine_proj(self.afem(ts_raw))          # (B, in_planes)
+
+            # 3) Final T = Tu + Ts'
+            global_feat = Tu + Ts_prime
+
 
         # pre-BN feature for downstream heads/losses (works with or without CLIP)
         pre_bn_global = global_feat
