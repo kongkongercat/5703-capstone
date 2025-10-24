@@ -540,33 +540,60 @@ class build_transformer_local(nn.Module):
             x_unnorm = x_clip * self.imnet_std + self.imnet_mean
             x_clip = (x_unnorm - self.clip_mean) / self.clip_std
 
-            # Run TinyCLIP vision branch; allow 224→256/320 via pos-embed interpolation
+            def _clip_vision_pool(outputs):
+                """Robustly extract pooled visual feature across HF versions.
+                Priority: pooler_output -> last_hidden_state[:,0] -> first-tensor[:,0]"""
+                # Case 1: HF BaseModelOutputWithPooling
+                if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                    return outputs.pooler_output
+                # Case 2: last_hidden_state present
+                if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+                    x = outputs.last_hidden_state  # [B, N, C]
+                    return x[:, 0] if x.dim() == 3 else x
+                # Case 3: tuple/list
+                if isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+                    x = outputs[0]
+                    return x[:, 0] if (torch.is_tensor(x) and x.dim() == 3) else x
+                # Case 4: raw tensor
+                if torch.is_tensor(outputs):
+                    return outputs[:, 0] if outputs.dim() == 3 else outputs
+                raise RuntimeError("Unsupported CLIP vision outputs structure.")
+
+            # Call vision tower without kwargs not supported by older HF versions.
             try:
-                out_clip = self.clip_model(
-                    pixel_values=x_clip,
-                    return_dict=True,
-                    interpolate_pos_encoding=True
-                )
+                # Newer HF often accepts keyword 'pixel_values=...'
+                out_clip = self.clip_model(pixel_values=x_clip)
             except TypeError:
-                # Fallback for very old Transformers versions: resize to 224
-                import torch.nn.functional as F
-                x224 = F.interpolate(x_clip, size=(224, 224), mode="bilinear", align_corners=False)
-                out_clip = self.clip_model(pixel_values=x224, return_dict=True)
+                # Very old HF may expect positional input
+                out_clip = self.clip_model(x_clip)
 
-            # Pooled visual feature from CLIP vision branch
-            clip_feat = out_clip.pooler_output  # shape: (B, hidden_size)
+            # If interpolate_pos_encoding is not supported as an arg, we rely on config flag
+            # set at init-time: self.clip_model.config.interpolate_pos_encoding = True.
+            # If your installed version ignores that too, uncomment the 224 fallback below:
+            # if out-of-shape occurs, fall back to 224 resize
+            # (Keep it commented unless you see shape errors again.)
+            # try:
+            #     _ = _clip_vision_pool(out_clip)
+            # except Exception:
+            #     x224 = F.interpolate(x_clip, size=(224, 224), mode="bilinear", align_corners=False)
+            #     try:
+            #         out_clip = self.clip_model(pixel_values=x224)
+            #     except TypeError:
+            #         out_clip = self.clip_model(x224)
 
-            # Optional refinement & semantic enhancement (keep your existing heads)
+            clip_feat = _clip_vision_pool(out_clip)  # [B, hidden_size]
+
+            # Optional refinement & semantic enhancement
             clip_feat = self.sem_refine_proj(clip_feat)   # (B, in_planes)
-            clip_feat = self.afem(clip_feat)              # (B, in_planes) semantic-enhanced
+            clip_feat = self.afem(clip_feat)              # (B, in_planes)
 
-            # Fuse with backbone global feature (pre-BN) for downstream losses/heads
+            # Fuse with backbone global feature (pre-BN)
             fused = torch.cat([global_feat, clip_feat], dim=1)     # (B, in_planes + in_planes)
             fused = self.fuse_proj_global(fused)                   # (B, in_planes)
-
-            # Overwrite global_feat so the rest of your pipeline stays unchanged
             global_feat = fused
-            pre_bn_global = global_feat
+
+        # Use fused global feature as the pre-BN source for downstream heads/losses
+        pre_bn_global = global_feat
 
 
         # BNNecks
