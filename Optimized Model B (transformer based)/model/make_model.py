@@ -150,27 +150,48 @@ def _hf_get_pos_embed(clip_vision):
 @torch.no_grad()
 def _hf_resize_pos_embed(clip_vision, new_hw):
     """
-    Resize ViT positional embeddings to fit new_hw=(H,W).
-    Works only for HF CLIP vision tower; keeps Parameter identity.
+    Resize ViT positional embeddings to fit new_hw=(H,W) in pixels.
+    This will REPLACE clip_vision.embeddings.position_embedding with a new nn.Parameter
+    whose length matches the new patch grid (i.e. not just copy_ into old shape).
+    Works for HF CLIP vision towers like TinyCLIP.
     """
-    pe, patch = _hf_get_pos_embed(clip_vision)  # [1,N,C]
+    pe, patch = _hf_get_pos_embed(clip_vision)  # pe: [1, N, C], N = 1 + gh*gw
     _, N, C = pe.shape
-    cls_tok, grid = pe[:, :1, :], pe[:, 1:, :]
+
+    # split cls token vs grid tokens
+    cls_tok, grid = pe[:, :1, :], pe[:, 1:, :]  # cls_tok: [1,1,C], grid:[1,gh*gw,C]
+
+    # infer original grid size gh, gw from N-1
     gh = gw = int((N - 1) ** 0.5)
     assert gh * gw == (N - 1), f"Non-square grid: N-1={N-1}"
+
+    # reshape grid tokens -> [1,C,gh,gw] so we can bicubic interpolate
     grid = grid.reshape(1, gh, gw, C).permute(0, 3, 1, 2)  # [1,C,gh,gw]
 
-    new_h, new_w = new_hw
-    new_gh, new_gw = new_h // patch, new_w // patch
-    grid = F.interpolate(grid, size=(new_gh, new_gw), mode="bicubic", align_corners=False)
-    grid = grid.permute(0, 2, 3, 1).reshape(1, new_gh * new_gw, C)
-    pe_new = torch.cat([cls_tok, grid], dim=1)
+    # compute new grid size from requested new_hw and patch size
+    new_h, new_w = new_hw  # e.g. (256,256)
+    new_gh, new_gw = new_h // patch, new_w // patch  # e.g. 256//32=8
 
-    tgt = clip_vision.embeddings.position_embedding.weight
-    if tgt.dim() == 2:
-        tgt.data.copy_(pe_new.squeeze(0))
-    else:
-        tgt.data.copy_(pe_new)
+    # bicubic interpolate positional grid to new size
+    grid = F.interpolate(
+        grid,
+        size=(new_gh, new_gw),
+        mode="bicubic",
+        align_corners=False
+    )  # [1,C,new_gh,new_gw]
+
+    # back to tokens: [1, new_gh*new_gw, C]
+    grid = grid.permute(0, 2, 3, 1).reshape(1, new_gh * new_gw, C)
+
+    # concat cls token back: [1, 1+new_gh*new_gw, C]
+    pe_new = torch.cat([cls_tok, grid], dim=1)  # [1, new_N, C]
+
+    # Now actually update the model's parameter.
+    # We cannot .copy_() because shape changed (e.g. 50 -> 65 tokens),
+    # so we REPLACE it with a new nn.Parameter.
+    new_param = nn.Parameter(pe_new.squeeze(0))  # [new_N, C] to match HF style
+    clip_vision.embeddings.position_embedding = new_param
+
 
 
 # --------------------------- AFEM (TinyCLIP semantics) -----------------------
