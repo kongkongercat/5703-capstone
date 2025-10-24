@@ -31,9 +31,6 @@ LOSS:
   PHASED:
     ENABLE: False
 
-  TRIPLET:
-    ENABLE: False                    # ← Fully disabled, optional for safety
-    FEAT_SRC: 'pre_bn'
 
   SUPCON:
     ENABLE: True
