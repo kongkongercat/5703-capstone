@@ -441,7 +441,7 @@ class build_transformer_local(nn.Module):
         self.shift_num = cfg.MODEL.SHIFT_NUM
         self.divide_length = cfg.MODEL.DEVIDE_LENGTH
 
-        # ---------------- TinyCLIP + AFEM integration (HF-only) ----------------
+        # ---------------- TinyCLIP + AFEM integration (HF-only, vision-only branch) ----------------
         self.use_clip = getattr(cfg.MODEL, "USE_CLIP", False)
         if self.use_clip:
             hf_id = getattr(cfg.MODEL, "CLIP_HF_ID", "wkcn/TinyCLIP-ViT-61M-32-Text-29M-LAION400M")
@@ -449,15 +449,14 @@ class build_transformer_local(nn.Module):
             model_id_or_path = local_path if local_path else hf_id
             print(f"[make_model][init] Loading TinyCLIP (HF) from: {model_id_or_path}")
 
-            # (1) Processor & full CLIP model (vision + projection)
+            # (1) Load processor and TinyCLIP vision-only branch
             self.hf_processor = CLIPImageProcessor.from_pretrained(model_id_or_path, use_fast=True)
             hf_clip = CLIPModel.from_pretrained(model_id_or_path)
-            self.clip_model = hf_clip  # keep full model for image_embeds
+            self.clip_model = hf_clip.vision_model        # ← keep vision-only (no text encoder)
             self.clip_impl = "hf"
 
-            # (2) Allow runtime interpolation for arbitrary input sizes
-            #     HF CLIP will interpolate position embeddings on-the-fly.
-            self.clip_model.config.vision_config.interpolate_pos_encoding = True
+            # (2) Enable runtime interpolation for arbitrary input sizes (224→256/320)
+            self.clip_model.config.interpolate_pos_encoding = True
 
             # (3) Configurable input size (fallback to processor default)
             default_h = self.hf_processor.size.get("shortest_edge", None)
@@ -465,7 +464,7 @@ class build_transformer_local(nn.Module):
                 default_h = self.hf_processor.size.get("height", 224)
             self.clip_input_size = tuple(getattr(cfg.MODEL, "CLIP_INPUT_SIZE", (default_h, default_h)))
 
-            # (4) Norm buffers: ImageNet -> CLIP
+            # (4) Register normalization buffers for ImageNet ↔ CLIP conversion
             im_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
             im_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
             clip_mean = torch.tensor(self.hf_processor.image_mean).view(1, 3, 1, 1)
@@ -475,27 +474,22 @@ class build_transformer_local(nn.Module):
             self.register_buffer("clip_mean",  clip_mean, persistent=False)
             self.register_buffer("clip_std",   clip_std,  persistent=False)
 
-            # (5) Do NOT rewrite weights; rely on runtime interpolation instead
-            # try:
-            #     _hf_resize_pos_embed(self.clip_model.vision_model, self.clip_input_size)
-            # except Exception as e:
-            #     print(f"[TinyCLIP][HF] pos-embed resize skipped: {e}")
-
-            # (6) ε-level fine-tuning toggle
+            # (5) ε-level fine-tuning control (only affects the vision branch)
             self.clip_finetune = bool(getattr(cfg.MODEL, "CLIP_FINETUNE", True))
             for p in self.clip_model.parameters():
                 p.requires_grad = self.clip_finetune
 
-            # (7) Determine output dim from projection head (image_embeds dim)
-            self.clip_output_dim = int(getattr(self.clip_model.config, "projection_dim", 768))
+            # (6) Output dimension from vision_config.hidden_size (not projection_dim)
+            self.clip_output_dim = int(hf_clip.config.vision_config.hidden_size)
 
-            # (8) Fusion heads
+            # (7) Fusion heads for global and semantic features
             self.fuse_proj_global = nn.Linear(self.in_planes + self.clip_output_dim, self.in_planes)
             self.afem = AFEM(dim=self.clip_output_dim, groups=32)
             self.sem_refine_proj = nn.Linear(self.clip_output_dim, self.in_planes)
 
             print(f"[make_model][init] TinyCLIP (HF) ready. input={self.clip_input_size}, "
                   f"proj_dim={self.clip_output_dim}, AFEM(groups=32), finetune={self.clip_finetune}.")
+
 
         # SupCon head
         self.supcon_enabled = (
@@ -537,36 +531,43 @@ class build_transformer_local(nn.Module):
         local_feat_2 = extract_local(patch_length, patch_length * 2)
         local_feat_3 = extract_local(patch_length * 2, patch_length * 3)
         local_feat_4 = extract_local(patch_length * 3, patch_length * 4)
+        
+        if self.use_clip:
+            # Use the same image tensor as the backbone input
+            x_clip = x_img
 
-        # ---------------- TinyCLIP + AFEM fusion (HF-only) ----------------
-        if getattr(self, "use_clip", False):
-            # Enable/disable grad according to finetune flag
-            with torch.set_grad_enabled(getattr(self, "clip_finetune", True)):
-                # De-normalize from ImageNet -> normalize to CLIP, then resize
-                x_denorm = x_img * self.imnet_std + self.imnet_mean
-                x_clip = (x_denorm - self.clip_mean) / self.clip_std
-                if x_clip.shape[-2:] != self.clip_input_size:
-                    x_clip = F.interpolate(
-                        x_clip, size=self.clip_input_size, mode="bicubic", align_corners=False
-                    )
-                # Use projection output (image_embeds)
-                out = self.clip_model(
+            # Optional: convert ImageNet normalization -> CLIP normalization
+            x_unnorm = x_clip * self.imnet_std + self.imnet_mean
+            x_clip = (x_unnorm - self.clip_mean) / self.clip_std
+
+            # Run TinyCLIP vision branch; allow 224→256/320 via pos-embed interpolation
+            try:
+                out_clip = self.clip_model(
                     pixel_values=x_clip,
                     return_dict=True,
-                    interpolate_pos_encoding=True   
+                    interpolate_pos_encoding=True
                 )
+            except TypeError:
+                # Fallback for very old Transformers versions: resize to 224
+                import torch.nn.functional as F
+                x224 = F.interpolate(x_clip, size=(224, 224), mode="bilinear", align_corners=False)
+                out_clip = self.clip_model(pixel_values=x224, return_dict=True)
 
-                feat_clip = out.image_embeds  # [B, projection_dim]
+            # Pooled visual feature from CLIP vision branch
+            clip_feat = out_clip.pooler_output  # shape: (B, hidden_size)
 
-            # Align dtype before fusion (safe with AMP/bfloat16)
-            feat_clip = feat_clip.to(global_feat.dtype)
+            # Optional refinement & semantic enhancement (keep your existing heads)
+            clip_feat = self.sem_refine_proj(clip_feat)   # (B, in_planes)
+            clip_feat = self.afem(clip_feat)              # (B, in_planes) semantic-enhanced
 
-            # Global fusion: concat + FC, plus AFEM-refined semantics residual
-            tu = self.fuse_proj_global(torch.cat([global_feat, feat_clip], dim=1))
-            ts_refined = self.afem(feat_clip)
-            pre_bn_global = tu + self.sem_refine_proj(ts_refined)
-        else:
+            # Fuse with backbone global feature (pre-BN) for downstream losses/heads
+            fused = torch.cat([global_feat, clip_feat], dim=1)     # (B, in_planes + in_planes)
+            fused = self.fuse_proj_global(fused)                   # (B, in_planes)
+
+            # Overwrite global_feat so the rest of your pipeline stays unchanged
+            global_feat = fused
             pre_bn_global = global_feat
+
 
         # BNNecks
         feat_bn_global = self.bottleneck(pre_bn_global)
