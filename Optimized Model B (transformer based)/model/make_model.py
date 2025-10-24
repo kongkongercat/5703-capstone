@@ -150,47 +150,58 @@ def _hf_get_pos_embed(clip_vision):
 @torch.no_grad()
 def _hf_resize_pos_embed(clip_vision, new_hw):
     """
-    Resize ViT positional embeddings to fit new_hw=(H,W) in pixels.
-    This will REPLACE clip_vision.embeddings.position_embedding with a new nn.Parameter
-    whose length matches the new patch grid (i.e. not just copy_ into old shape).
-    Works for HF CLIP vision towers like TinyCLIP.
+    Resize TinyCLIP / HF CLIP vision tower positional embeddings
+    so it can run at a new spatial size (e.g. 256x256 or 320x320).
+
+    Steps:
+    1. Take the original position_embedding (CLS + grid tokens).
+    2. Bicubic-interpolate the grid part from old (gh x gw) to new (new_gh x new_gw).
+    3. Concat CLS token back.
+    4. Replace clip_vision.embeddings.position_embedding with a NEW nn.Parameter
+       that has the correct new length.
     """
-    pe, patch = _hf_get_pos_embed(clip_vision)  # pe: [1, N, C], N = 1 + gh*gw
+    # Get original positional embedding as [1, N, C]
+    pe, patch = _hf_get_pos_embed(clip_vision)  # pe: [1, N, C]
     _, N, C = pe.shape
 
-    # split cls token vs grid tokens
-    cls_tok, grid = pe[:, :1, :], pe[:, 1:, :]  # cls_tok: [1,1,C], grid:[1,gh*gw,C]
+    # Split CLS token (index 0) and patch grid tokens (1:)
+    cls_tok = pe[:, :1, :]      # [1,1,C]
+    grid    = pe[:, 1:, :]      # [1,(N-1),C]
 
-    # infer original grid size gh, gw from N-1
+    # Figure out original grid size (should be square for TinyCLIP pretrain)
     gh = gw = int((N - 1) ** 0.5)
     assert gh * gw == (N - 1), f"Non-square grid: N-1={N-1}"
 
-    # reshape grid tokens -> [1,C,gh,gw] so we can bicubic interpolate
-    grid = grid.reshape(1, gh, gw, C).permute(0, 3, 1, 2)  # [1,C,gh,gw]
+    # Reshape grid tokens to [1, C, gh, gw] so we can spatially interpolate
+    grid = grid.reshape(1, gh, gw, C).permute(0, 3, 1, 2)  # -> [1, C, gh, gw]
 
-    # compute new grid size from requested new_hw and patch size
-    new_h, new_w = new_hw  # e.g. (256,256)
-    new_gh, new_gw = new_h // patch, new_w // patch  # e.g. 256//32=8
+    # Compute target grid size from desired new_hw and patch size
+    new_h, new_w = new_hw                # e.g. (320,320)
+    new_gh = new_h // patch             # e.g. 320//32 = 10
+    new_gw = new_w // patch             #      320//32 = 10
 
-    # bicubic interpolate positional grid to new size
+    # Bicubic interpolate positional grid to new grid resolution
     grid = F.interpolate(
         grid,
         size=(new_gh, new_gw),
         mode="bicubic",
         align_corners=False
-    )  # [1,C,new_gh,new_gw]
+    )  # -> [1, C, new_gh, new_gw]
 
-    # back to tokens: [1, new_gh*new_gw, C]
+    # Flatten back to tokens: [1, new_gh*new_gw, C]
     grid = grid.permute(0, 2, 3, 1).reshape(1, new_gh * new_gw, C)
 
-    # concat cls token back: [1, 1+new_gh*new_gw, C]
+    # Concat CLS token back in front → [1, 1+new_gh*new_gw, C]
     pe_new = torch.cat([cls_tok, grid], dim=1)  # [1, new_N, C]
 
-    # Now actually update the model's parameter.
-    # We cannot .copy_() because shape changed (e.g. 50 -> 65 tokens),
-    # so we REPLACE it with a new nn.Parameter.
-    new_param = nn.Parameter(pe_new.squeeze(0))  # [new_N, C] to match HF style
-    clip_vision.embeddings.position_embedding = new_param
+    # IMPORTANT:
+    # Replace clip_vision.embeddings.position_embedding with a fresh nn.Parameter
+    # whose length matches the new patch grid. We CANNOT just .copy_() into the old
+    # param because token counts don't match (e.g. 50 -> 101).
+    clip_vision.embeddings.position_embedding = nn.Parameter(
+        pe_new.squeeze(0)  # HF CLIP vision stores it as [N, C] (no batch dim)
+    )
+
 
 
 
@@ -588,7 +599,7 @@ class build_transformer_local(nn.Module):
             x_clip = (x_unnorm - self.clip_mean) / self.clip_std
 
             # ====== 3. Force TinyCLIP to run at the resolution WE choose (e.g. 256/320) ======
-            # self.clip_target_size is defined in __init__, e.g. (320,320) or (256,256)
+            # self.clip_target_size was set in __init__, e.g. (320,320) or (256,256)
             target_h, target_w = self.clip_target_size
             if x_clip.shape[-2:] != (target_h, target_w):
                 x_clip = F.interpolate(
@@ -602,6 +613,19 @@ class build_transformer_local(nn.Module):
             # This is CRITICAL for high-res operation (paper-style ↑resolution).
             if not self._clip_pos_resized:
                 _hf_resize_pos_embed(self.clip_model, (target_h, target_w))
+
+                # NEW >>> tell TinyCLIP "you are now a 256x256 / 320x320 model"
+                # HF CLIPVisionModel checks .config.image_size to assert input size.
+                # We override it so it won't scream "Input image size (320*320) doesn't match model (224*224)".
+                if hasattr(self.clip_model, "config") and hasattr(self.clip_model.config, "image_size"):
+                    self.clip_model.config.image_size = target_h
+
+                # tiny safety: in some HF versions, clip_model might itself have .vision_model.config
+                if hasattr(self.clip_model, "vision_model") and hasattr(self.clip_model.vision_model, "config"):
+                    if hasattr(self.clip_model.vision_model.config, "image_size"):
+                        self.clip_model.vision_model.config.image_size = target_h
+                # <<< NEW
+
                 self._clip_pos_resized = True
                 print(f"[make_model][clip] resized TinyCLIP pos_embed to {target_h}x{target_w}")
 
@@ -637,6 +661,7 @@ class build_transformer_local(nn.Module):
 
             # Final fused global feature
             global_feat = Tu + Ts_prime
+
 
         # pre-BN feature for downstream heads/losses (works with or without CLIP)
         pre_bn_global = global_feat
