@@ -483,7 +483,7 @@ class build_transformer_local(nn.Module):
             self.clip_output_dim = int(hf_clip.config.vision_config.hidden_size)
 
             # (7) Fusion heads for global and semantic features
-            self.fuse_proj_global = nn.Linear(self.in_planes + self.clip_output_dim, self.in_planes)
+            self.fuse_proj_global = nn.Linear(2 * self.in_planes, self.in_planes)
             self.afem = AFEM(dim=self.clip_output_dim, groups=32)
             self.sem_refine_proj = nn.Linear(self.clip_output_dim, self.in_planes)
 
@@ -584,9 +584,9 @@ class build_transformer_local(nn.Module):
             clip_feat = _clip_vision_pool(out_clip)  # [B, hidden_size]
 
             # Optional refinement & semantic enhancement
-            clip_feat = self.sem_refine_proj(clip_feat)   # (B, in_planes)
             clip_feat = self.afem(clip_feat)              # (B, in_planes)
-
+            clip_feat = self.sem_refine_proj(clip_feat)   # (B, in_planes)
+    
             # Fuse with backbone global feature (pre-BN)
             fused = torch.cat([global_feat, clip_feat], dim=1)     # (B, in_planes + in_planes)
             fused = self.fuse_proj_global(fused)                   # (B, in_planes)
