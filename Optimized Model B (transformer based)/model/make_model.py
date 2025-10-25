@@ -285,8 +285,9 @@ def _hf_resize_pos_embed(clip_vision, new_hw):
 class AFEM(nn.Module):
     """
     Adaptive Fine-grained Enhancement Module for CLIP semantics.
-    Input : [B, D_sem]  TinyCLIP semantic vector
+    Input : [B, D_sem]  TinyCLIP semantic vector T_s
     Output: [B, D_sem]  refined semantics T_s'
+            T_s' = T_s + W_g * f_theta(T_s)
     """
     def __init__(self, dim: int, groups: int = 32):
         super().__init__()
@@ -295,22 +296,31 @@ class AFEM(nn.Module):
         self.groups = groups
         self.group_dim = dim // groups
 
+        # f_theta: lightweight transform
         self.linear = nn.Sequential(
             nn.Linear(dim, dim, bias=True),
             nn.BatchNorm1d(dim),
             nn.ReLU(inplace=True)
         )
 
+        # group-wise learnable weights W_g \in R^G
         self.group_weight = nn.Parameter(torch.randn(groups))
         nn.init.normal_(self.group_weight, mean=0.0, std=1.0)
 
     def forward(self, ts: torch.Tensor) -> torch.Tensor:
-        base = self.linear(ts)                           # f_linear(T_s)
+        # ts: [B, D] = TinyCLIP pooled visual embedding (T_s)
+        base = self.linear(ts)                           # f_theta(T_s), shape [B, D]
+
         B, D = base.shape
-        g = base.view(B, self.groups, self.group_dim)    # [B,G,d]
-        w = self.group_weight.view(1, self.groups, 1)
-        weighted = (w * g).view(B, D)                    # Σ w_i * group_i
-        return base + weighted                           # residual add
+        g = base.view(B, self.groups, self.group_dim)    # [B, G, d]
+        w = self.group_weight.view(1, self.groups, 1)    # [1, G, 1]
+
+        # group reweight
+        weighted = (w * g).view(B, D)                    # W_g * f_theta(T_s), shape [B, D]
+
+        # residual refinement:
+        # T_s' = T_s + W_g * f_theta(T_s)
+        return ts + weighted
 
 
 # --------------------------- ResNet Backbone ---------------------------------
@@ -624,7 +634,18 @@ class build_transformer_local(nn.Module):
             self.clip_use_sem_refine = bool(getattr(cfg.MODEL, "CLIP_USE_SEM_REFINE", True))
             print(f"[make_model][init] CLIP_USE_AFEM={self.clip_use_afem}, "
                   f"CLIP_USE_SEM_REFINE={self.clip_use_sem_refine}")
-
+            
+            # ------------------- Log fusion mode once -------------------
+            if not hasattr(self, "_clip_fusion_mode_logged"):
+                if self.clip_use_sem_refine:
+                    if self.clip_use_afem:
+                        mode_str = "CLIP fusion mode: AFEM + sem_refine_proj (full)"
+                    else:
+                        mode_str = "CLIP fusion mode: sem_refine_proj only (no AFEM)"
+                else:
+                    mode_str = "CLIP fusion mode: fuse_fc only (no refine branch)"
+                print("[make_model][clip]", mode_str)
+                self._clip_fusion_mode_logged = True
 
 
         # SupCon head
