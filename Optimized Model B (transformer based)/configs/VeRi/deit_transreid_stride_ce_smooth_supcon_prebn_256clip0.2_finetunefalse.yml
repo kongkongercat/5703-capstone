@@ -24,6 +24,7 @@ MODEL:
   CLIP_INPUT_SIZE: [256, 256]        # ← Align TinyCLIP with 256×256 input
   CLIP_SEPARATE_LR: True
   CLIP_LR_SCALE: 0.2
+  CLIP_FINETUNE: False
 
 
 INPUT:
