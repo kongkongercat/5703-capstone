@@ -17,11 +17,11 @@ MODEL:
   IF_LABELSMOOTH: 'off'               
   IF_WITH_CENTER: 'no'
   ID_LOSS_WEIGHT: 1.0
-  TRIPLET_LOSS_WEIGHT: 1.0           # ← Disable Triplet loss
+  TRIPLET_LOSS_WEIGHT: 1.0        
 
   # === CLIP integration ===
   USE_CLIP: True
-  CLIP_INPUT_SIZE: [320, 320]        # ← Align TinyCLIP with 256×256 input
+  CLIP_INPUT_SIZE: [320, 320]        
   CLIP_SEPARATE_LR: True
   CLIP_LR_SCALE: 0.2
   # AFEM / fusion ablation switches

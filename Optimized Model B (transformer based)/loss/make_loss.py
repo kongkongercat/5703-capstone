@@ -184,6 +184,81 @@ def _reduce_triplet_output(out):
     """Some triplet implementations return (loss, aux). Normalize to a single scalar."""
     return out[0] if isinstance(out, (list, tuple)) else out
 
+# ---------- PHASED helpers (shared) ----------
+def _phase_index(epoch: int, boundaries) -> int:
+    """Map epoch to phase index for half-open segments: [0,b0), [b0,b1), ..., [b_{n-1}, +inf)."""
+    bounds = list(boundaries or [])
+    e = int(epoch or 0)
+    for i, b in enumerate(bounds):
+        if e < int(b):
+            return i
+    return len(bounds)
+
+# ---------- PHASED SupCon helpers ----------
+def _parse_sup_spec_item(spec: str):
+    """Parse 'const:x' or 'linear:x->y'; return ('const', x) or ('linear', x, y)."""
+    s = (spec or "").strip().lower()
+    try:
+        if s.startswith("const:"):
+            x = float(s.split("const:")[1])
+            return ("const", x)
+        if s.startswith("linear:"):
+            body = s.split("linear:")[1]
+            x, y = body.split("->")
+            return ("linear", float(x), float(y))
+    except Exception:
+        pass
+    return ("const", 0.0)
+
+def _sup_w_from_spec(cfg, epoch: int):
+    """Compute SupCon weight from PHASED.W_SUP_SPEC/BOUNDARIES; return float or None."""
+    phased = getattr(cfg.LOSS, "PHASED", None)
+    if phased is None:
+        return None
+    spec = getattr(phased, "W_SUP_SPEC", None)
+    bounds = getattr(phased, "BOUNDARIES", None)
+    if not isinstance(spec, (list, tuple)) or len(spec) == 0:
+        return None
+    i = _phase_index(epoch, bounds)
+    i = max(0, min(i, len(spec) - 1))
+    kind = _parse_sup_spec_item(spec[i])
+    if kind[0] == "const":
+        return max(0.0, float(kind[1]))
+    if kind[0] == "linear":
+        boundaries = list(bounds or [])
+        start = 0 if i == 0 else int(boundaries[i - 1])
+        end = int(boundaries[i]) if i < len(boundaries) else int(getattr(getattr(cfg, "SOLVER", {}), "MAX_EPOCHS", 120))
+        start = int(start); end = int(max(end, start + 1))
+        t = float((epoch - start)) / float(max(end - start, 1))
+        x, y = float(kind[1]), float(kind[2])
+        return max(0.0, (1.0 - t) * x + t * y)
+    return None
+
+# ---------- PHASED Metric helpers (Triplet/TripletX) ----------
+def _metric_kind_and_weight_from_spec(cfg, epoch: int):
+    """
+    If PHASED.METRIC_SEQ/W_METRIC_SEQ provided and lengths match (#phases = len(BOUNDARIES)+1),
+    return ('triplet'|'tripletx', weight) for the current phase; else return None.
+    """
+    phased = getattr(cfg.LOSS, "PHASED", None)
+    if phased is None:
+        return None
+    mseq = getattr(phased, "METRIC_SEQ", None)
+    wseq = getattr(phased, "W_METRIC_SEQ", None)
+    bounds = getattr(phased, "BOUNDARIES", None)
+    if not (isinstance(mseq, (list, tuple)) and isinstance(wseq, (list, tuple))):
+        return None
+    num_phases = (len(list(bounds or [])) + 1)
+    if not (len(mseq) == len(wseq) == num_phases):
+        return None
+    i = _phase_index(epoch, bounds)
+    i = max(0, min(i, num_phases - 1))
+    kind = str(mseq[i]).strip().lower()
+    w = float(wseq[i])
+    if kind not in ("triplet", "tripletx"):
+        return None
+    return (kind, max(0.0, w))
+
 
 def _unpack_feats_for_sources(feat, feat_bn):
     """Recover (global_pre_bn, bnneck_feat) for flexible feature routing.
@@ -377,35 +452,56 @@ def make_loss(cfg, num_classes):
                            getattr(getattr(cfg, "SOLVER", {}), "MAX_EPOCHS", 120)))
 
     def _supcon_weight_by_epoch(epoch: int) -> float:
-        """Compute the effective SupCon weight for the given epoch."""
-        if not (phased_on and (epoch is not None)):
-            return supcon_w_static
-        if decay_type == "linear":
-            if epoch <= decay_st:
+        """
+        SupCon effective weight precedence:
+          1) PHASED.ENABLE=True & epoch!=None & W_SUP_SPEC provided: use PHASED spec.
+          2) Else if PHASED.ENABLE=True & epoch!=None: fallback to legacy SUPCON.DECAY_*.
+          3) Else: static cfg.LOSS.SUPCON.W.
+        """
+        # 1) Prefer PHASED.W_SUP_SPEC (if enabled)
+        if phased_on and (epoch is not None):
+            w_from_spec = _sup_w_from_spec(cfg, int(epoch))
+            if w_from_spec is not None:
+                return float(w_from_spec)
+
+        # 2) Fallback to legacy DECAY_* (linear/const/exp)
+        if phased_on and (epoch is not None):
+            if decay_type == "linear":
+                if epoch <= decay_st:
+                    return max(0.0, sup_w0)
+                if epoch >= decay_ed:
+                    return 0.0
+                frac = float(epoch - decay_st) / float(max(decay_ed - decay_st, 1))
+                return max(0.0, sup_w0 * (1.0 - frac))
+            elif decay_type == "const":
                 return max(0.0, sup_w0)
-            if epoch >= decay_ed:
-                return 0.0
-            frac = float(epoch - decay_st) / float(max(decay_ed - decay_st, 1))
-            return max(0.0, sup_w0 * (1.0 - frac))
-        elif decay_type == "const":
-            return max(0.0, sup_w0)
-        elif decay_type == "exp":
-            import math
-            if epoch < decay_st:
-                return max(0.0, sup_w0)
-            return max(0.0, sup_w0 * math.exp(-0.05 * (epoch - decay_st)))
-        return max(0.0, sup_w0)
+            elif decay_type == "exp":
+                import math
+                if epoch < decay_st:
+                    return max(0.0, sup_w0)
+                return max(0.0, sup_w0 * math.exp(-0.05 * (epoch - decay_st)))
+
+        # 3) Static weight (PHASED off or no epoch)
+        return supcon_w_static
 
     def _phase_tag(epoch: int) -> str:
-        """Return human-readable phase tag (A/B/C or 'static')."""
+        """Return phase tag based on PHASED.BOUNDARIES when available; else fallback to legacy A/B/C."""
         if not (phased_on and (epoch is not None)):
             return "static"
+        # Prefer PHASED boundaries if provided
+        bounds = getattr(getattr(cfg.LOSS, "PHASED", {}), "BOUNDARIES", None)
+        if isinstance(bounds, (list, tuple)) and len(bounds) >= 1:
+            idx = _phase_index(epoch, bounds)
+            tags = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            return tags[idx] if idx < len(tags) else f"P{idx}"
+        # Fallback to legacy A/B/C
         e = int(epoch)
         if e <= int(tripletx_end):
             return "A"
         if e <= int(decay_ed):
             return "B"
         return "C"
+
 
     # --------------------------------------------------------
     # ACTIVE combo logger
@@ -460,6 +556,7 @@ def make_loss(cfg, num_classes):
 
             _combo_logged["active_last"] = sig
             _combo_logged["phase_last"] = phase_tag
+
 
     # ========================================================
     # Loss function closure
@@ -601,17 +698,28 @@ def make_loss(cfg, num_classes):
                     phase_use_tx = False  # logged as Split
             # === Single-path (fallback / brightness OFF / split disabled) ===
             if not did_split and (sampler != "random"):
-                # Only use TripletX in phased Stage-A; otherwise prefer Triplet.
-                if phased_on and (epoch is not None) and (TripletXLoss is not None) and tripletx_cfg_enabled:
-                    phase_use_tx = (int(epoch) <= int(tripletx_end))
+                # ---- 新逻辑开始：优先用 PHASED 表，其次回退 TRIPLETX_END ----
+                desired_kind = None
+                desired_w = 0.0
+                if phased_on and (epoch is not None):
+                    mk = _metric_kind_and_weight_from_spec(cfg, int(epoch))
+                    if mk is not None:
+                        desired_kind, desired_w = mk
+
+                if desired_kind is None:
+                    if phased_on and (epoch is not None) and (TripletXLoss is not None) and tripletx_cfg_enabled:
+                        phase_use_tx = (int(epoch) <= int(tripletx_end))
+                    else:
+                        phase_use_tx = False
+                    desired_kind = ("tripletx" if phase_use_tx else "triplet")
+                    desired_w = (tx_w if phase_use_tx else tri_w)
                 else:
-                    phase_use_tx = False  # Triplet-first
+                    phase_use_tx = (desired_kind == "tripletx")
 
-                metric_w_eff = (tx_w if phase_use_tx else tri_w)
+                metric_w_eff = float(desired_w)
 
-                # Runtime selector to call the correct loss object/signature
                 def _call_triplet_core(f):
-                    if phase_use_tx and (tripletx_obj is not None) and (tx_w > 0.0):
+                    if phase_use_tx and (tripletx_obj is not None) and (metric_w_eff > 0.0):
                         try:
                             return _reduce_triplet_output(tripletx_obj(f, target, camids=camids, epoch=epoch))
                         except TypeError:
@@ -636,6 +744,7 @@ def make_loss(cfg, num_classes):
                         TRI_LOSS = _call_triplet_core(tri_in)
                     total += metric_w_eff * TRI_LOSS
                     metric_w_eff_for_log = metric_w_eff
+
 
         # --- SupCon ---
         if supcon_enabled and eff_w > 0.0:
