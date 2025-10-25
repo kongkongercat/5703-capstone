@@ -236,10 +236,14 @@ _C.LOSS.BRIGHTNESS.K = 0.08         # extra weight or gating factor (your usage)
 _C.MODEL.USE_CLIP = True
 _C.MODEL.CLIP_HF_ID =  "wkcn/TinyCLIP-ViT-61M-32-Text-29M-LAION400M"
 _C.MODEL.CLIP_LOCAL_PATH = ""
-_C.MODEL.CLIP_INPUT_SIZE = (320, 320)
+_C.MODEL.CLIP_INPUT_SIZE = (224, 224)
 _C.MODEL.CLIP_FINETUNE=True
 _C.MODEL.CLIP_SEPARATE_LR = True
 _C.MODEL.CLIP_LR_SCALE = 1.0
+# AFEM / fusion ablation switches
+_C.MODEL.CLIP_USE_AFEM = True          # if False: skip AFEM(), just pass raw TinyCLIP feature
+_C.MODEL.CLIP_USE_SEM_REFINE = True    # if False: skip sem_refine_proj(), only use fuse_fc()
+
 
 
 

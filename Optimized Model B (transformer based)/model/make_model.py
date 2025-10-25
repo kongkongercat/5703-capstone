@@ -618,6 +618,12 @@ class build_transformer_local(nn.Module):
 
             # (9) We'll only resize TinyCLIP positional embeddings ONCE
             self._clip_pos_resized = False
+            
+            # === NEW switches for ablation ===
+            self.clip_use_afem = bool(getattr(cfg.MODEL, "CLIP_USE_AFEM", True))
+            self.clip_use_sem_refine = bool(getattr(cfg.MODEL, "CLIP_USE_SEM_REFINE", True))
+            print(f"[make_model][init] CLIP_USE_AFEM={self.clip_use_afem}, "
+                  f"CLIP_USE_SEM_REFINE={self.clip_use_sem_refine}")
 
 
 
@@ -747,6 +753,22 @@ class build_transformer_local(nn.Module):
             #
             Tu = self.fuse_fc(torch.cat([global_feat, ts_raw], dim=1))          # [B, in_planes]
             Ts_prime = self.sem_refine_proj(self.afem(ts_raw))                  # [B, in_planes]
+            
+            # 7. Optional semantic refinement path (AFEM + proj)
+            #    We build Ts_prime depending on the ablation flags.
+            #
+            #    Case A (full): AFEM(ts_raw) -> sem_refine_proj -> Ts_prime
+            #    Case B (no AFEM but still project): ts_raw -> sem_refine_proj
+            #    Case C (no refine at all): Ts_prime = 0
+            #
+            if self.clip_use_sem_refine:
+                if self.clip_use_afem:
+                    ts_ref = self.afem(ts_raw)                       # AFEM on TinyCLIP feat
+                else:
+                    ts_ref = ts_raw                                  # bypass AFEM
+                Ts_prime = self.sem_refine_proj(ts_ref)              # [B, in_planes]
+            else:
+                Ts_prime = torch.zeros_like(Tu)                      # no refine branch
 
             # final fused global feature replaces the old global_feat for downstream heads/losses
             global_feat = Tu + Ts_prime
