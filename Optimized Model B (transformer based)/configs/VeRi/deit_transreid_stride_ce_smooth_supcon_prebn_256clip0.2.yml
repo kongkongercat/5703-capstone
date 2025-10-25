@@ -27,6 +27,10 @@ MODEL:
 
 
 INPUT:
+git pull origin main --rebase
+git add .
+git commit -m "Update project files"
+git push origin main
   SIZE_TRAIN: [256, 256]             # ← Training input resolution
   SIZE_TEST: [256, 256]              # ← Testing input resolution
 
