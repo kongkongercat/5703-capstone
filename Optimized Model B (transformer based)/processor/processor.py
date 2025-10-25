@@ -187,22 +187,34 @@ def do_train(
           - B/C-stage (epoch > TRIPLETX_END): K=cfg.DATALOADER.PHASED.K_OTHER
         * When SAMPLER=='random', skip PK-K switching (no P×K semantics).                             # [NEW]
     """
-import logging, sys
-    logger = logging.getLogger("transreid.train")
-    logger.propagate = False
-    logger.setLevel(logging.INFO)
-   
-    for h in list(logger.handlers):
-        logger.removeHandler(h)
 
+    # ------------------------------------------------------------------
+    # [NEW] Minimal logger fix to prevent duplicate prints
+    # ------------------------------------------------------------------
+    import sys
+    train_logger = logging.getLogger("transreid.train")
+    train_logger.propagate = False            # do NOT bubble up to parent/root
+    train_logger.setLevel(logging.INFO)
 
-    stream_handler = logging.StreamHandler(stream=sys.stdout)
-    formatter = logging.Formatter(
+    # clear old handlers (avoid stacking if do_train is called again)
+    for h in list(train_logger.handlers):
+        train_logger.removeHandler(h)
+
+    # attach exactly one clean StreamHandler with timestamp format
+    _stream = logging.StreamHandler(stream=sys.stdout)
+    _formatter = logging.Formatter(
         "%(asctime)s %(name)s %(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
+    _stream.setFormatter(_formatter)
+    train_logger.addHandler(_stream)
+
+    # optional: quiet root so it doesn't re-print INFO lines
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.WARNING)
+
+    # from here on, just use `logger`
+    logger = train_logger
 
     log_period = cfg.SOLVER.LOG_PERIOD
     checkpoint_period = cfg.SOLVER.CHECKPOINT_PERIOD
