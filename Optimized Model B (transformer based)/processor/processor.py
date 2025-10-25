@@ -187,8 +187,22 @@ def do_train(
           - B/C-stage (epoch > TRIPLETX_END): K=cfg.DATALOADER.PHASED.K_OTHER
         * When SAMPLER=='random', skip PK-K switching (no P×K semantics).                             # [NEW]
     """
-
+import logging, sys
     logger = logging.getLogger("transreid.train")
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+   
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+
+
+    stream_handler = logging.StreamHandler(stream=sys.stdout)
+    formatter = logging.Formatter(
+        "%(asctime)s %(name)s %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
 
     log_period = cfg.SOLVER.LOG_PERIOD
     checkpoint_period = cfg.SOLVER.CHECKPOINT_PERIOD
