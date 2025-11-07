@@ -1,0 +1,53 @@
+# -----------------------------------------------------------------------------
+# Change Log (for this config file)
+# [2025-11-04 | Hang Zhang] Updated after 2025-11-04 model merge.
+#                           - File: deit_transreid_stride_ce_smooth_supcon_prebn_256tinyclip.yml
+#                           - TinyCLIP (HF) @ 256×256, CLIP default LR scale (=1.0), separate LR off.
+#                           - CE label smoothing ON; SupCon enabled with FEAT_SRC=pre_bn.
+# -----------------------------------------------------------------------------
+
+MODEL:
+  NAME: 'transformer'
+  TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
+  STRIDE_SIZE: [12, 12]
+  SIE_CAMERA: True
+  SIE_VIEW: True
+  SIE_COE: 3.0
+  JPM: True
+  RE_ARRANGE: True
+  SHIFT_NUM: 8
+
+  PRETRAIN_CHOICE: 'imagenet'
+  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
+
+  METRIC_LOSS_TYPE: 'triplet'
+  NO_MARGIN: True
+  IF_LABELSMOOTH: 'on'
+  IF_WITH_CENTER: 'no'
+  ID_LOSS_WEIGHT: 1.0
+  TRIPLET_LOSS_WEIGHT: 1.0
+
+  USE_CLIP: False
+
+INPUT:
+  SIZE_TRAIN: [256, 256]
+  SIZE_TEST:  [256, 256]
+
+LOSS:
+  PHASED:
+    ENABLE: False
+
+  TRIPLET:
+    FEAT_SRC: 'pre_bn'
+
+  SUPCON:
+    ENABLE: True
+    FEAT_SRC: 'pre_bn'
+    W: 0.30
+    T: 0.07
+    CAM_AWARE: True
+    POS_RULE: "class"
+    W0: 0.30
+    DECAY_TYPE: "const"
+    DECAY_START: 0
+    DECAY_END: 0

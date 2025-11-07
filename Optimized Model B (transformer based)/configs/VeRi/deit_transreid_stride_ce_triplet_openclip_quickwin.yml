@@ -1,0 +1,49 @@
+# -----------------------------------------------------------------------------
+# Change Log (for this config file)
+# [2025-11-04 | Hang Zhang] Updated according to latest merged make_model (OpenCLIP/TinyCLIP switch framework).
+#                           - Renamed to deit_transreid_stride_ce_triplet_openclip_quickwin.yml
+#                           - Explicitly sets MODEL.USE_CLIP=True, CLIP_IMPL="open_clip", CLIP_FUSION="quickwin"
+#                           - Keeps other fields aligned with 2025-11-04 defaults.py baseline.
+# -----------------------------------------------------------------------------
+
+# OpenCLIP quick-win fusion:
+# - Global + 4×local fusion with LayerNorm alignment + scalar gate + projection
+# - Matches the 2025-10-24 "quick-win" experimental branch behavior
+
+MODEL:
+  NAME: 'transformer'
+  TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
+  STRIDE_SIZE: [12, 12]
+  SIE_CAMERA: True
+  SIE_VIEW: True
+  SIE_COE: 3.0
+  JPM: True
+  RE_ARRANGE: True
+  SHIFT_NUM: 8
+
+  PRETRAIN_CHOICE: 'imagenet'
+  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
+
+  METRIC_LOSS_TYPE: 'triplet'
+  NO_MARGIN: True
+  IF_LABELSMOOTH: 'off'
+  IF_WITH_CENTER: 'no'
+  ID_LOSS_WEIGHT: 1.0
+  TRIPLET_LOSS_WEIGHT: 1.0
+
+  # --- CLIP switches (OpenCLIP quick-win) ---
+  USE_CLIP: True
+  CLIP_IMPL: "open_clip"          # {open_clip | hf}
+  CLIP_FUSION: "quickwin"         # {minimal | quickwin}
+  CLIP_BACKBONE: "ViT-B-16"
+  CLIP_PRETRAIN: "laion2b_s34b_b88k"
+
+LOSS:
+  PHASED:
+    ENABLE: False
+
+  TRIPLET:
+    FEAT_SRC: 'pre_bn'
+
+  SUPCON:
+    ENABLE: False

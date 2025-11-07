@@ -1,26 +1,60 @@
-# model/make_model.py
 # encoding: utf-8
 """
 @author:  liaoxingyu
 @contact: sherlockliao01@gmail.com
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import copy
+"""
+Merged architecture overview:
 
-from .backbones.resnet import ResNet, Bottleneck
-from .backbones.vit_pytorch import (
-    vit_base_patch16_224_TransReID,
-    vit_small_patch16_224_TransReID,
-    deit_small_patch16_224_TransReID
-)
-from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
+┌───────────────────────────────────────────────────────────────────────────────┐
+│ cfg.MODEL.USE_CLIP = False                                                   │ → Original TransReID + JPM
+│ cfg.MODEL.USE_CLIP = True,  CLIP_IMPL="open_clip", CLIP_FUSION="minimal"     │ → OpenCLIP fusion (global concat + Linear; locals unchanged)
+│ cfg.MODEL.USE_CLIP = True,  CLIP_IMPL="open_clip", CLIP_FUSION="quickwin"    │ → OpenCLIP fusion (global + 4×locals with LN + gate + projection)
+│ cfg.MODEL.USE_CLIP = True,  CLIP_IMPL="hf"                                   │ → TinyCLIP fusion (global-only; optional AFEM + sem_refine)
+└───────────────────────────────────────────────────────────────────────────────┘
 
-# HF TinyCLIP (vision + projection) for image embeddings
-from transformers import CLIPModel, CLIPImageProcessor  # HF-only path
+Switch summary:
+  MODEL.USE_CLIP            Enable/disable CLIP fusion (bool)
+  MODEL.CLIP_IMPL           "open_clip" | "hf"
+  MODEL.CLIP_FUSION         "minimal" | "quickwin"    (only for CLIP_IMPL="open_clip")
 
+  # open_clip specific:
+  MODEL.CLIP_BACKBONE       e.g., "ViT-B-16"
+  MODEL.CLIP_PRETRAIN       e.g., "laion2b_s34b_b88k"
+
+  # hf (TinyCLIP) specific:
+  MODEL.CLIP_HF_ID          e.g., "wkcn/TinyCLIP-ViT-61M-32-Text-29M-LAION400M"
+  MODEL.CLIP_INPUT_SIZE     e.g., (224, 224) (optional override)
+  MODEL.CLIP_FINETUNE       bool (enable vision tower finetuning)
+  MODEL.CLIP_USE_AFEM       bool (enable AFEM refinement)
+  MODEL.CLIP_USE_SEM_REFINE bool (enable semantics refine projection)
+
+Both branches retain their respective:
+  – preprocessing (ImageNet→CLIP normalization)
+  – resize logic (OpenCLIP: bicubic; TinyCLIP: bilinear)
+  – fusion order (LN + gate + projection for quickwin; concat + Linear for minimal)
+  – AFEM/sem_refine modules (TinyCLIP) exactly as implemented
+  – SupCon head (UN-normalized output; L2 inside SupConLoss)
+  – Option-B returns (global + 4 locals) and forward signatures unchanged
+
+CLI quick examples:
+  # 1) Baseline (no CLIP)
+  --opts MODEL.USE_CLIP False
+
+  # 2) OpenCLIP minimal (global only)
+  --opts MODEL.USE_CLIP True MODEL.CLIP_IMPL open_clip MODEL.CLIP_FUSION minimal \
+        MODEL.CLIP_BACKBONE ViT-B-16 MODEL.CLIP_PRETRAIN laion2b_s34b_b88k
+
+  # 3) OpenCLIP quick-win (global + 4×locals with LN+gate+proj)
+  --opts MODEL.USE_CLIP True MODEL.CLIP_IMPL open_clip MODEL.CLIP_FUSION quickwin \
+        MODEL.CLIP_BACKBONE ViT-B-16 MODEL.CLIP_PRETRAIN laion2b_s34b_b88k
+
+  # 4) TinyCLIP (HF) global-only + AFEM + sem_refine
+  --opts MODEL.USE_CLIP True MODEL.CLIP_IMPL hf MODEL.CLIP_HF_ID wkcn/TinyCLIP-ViT-61M-32-Text-29M-LAION400M \
+        MODEL.CLIP_INPUT_SIZE '(224,224)' MODEL.CLIP_FINETUNE True \
+        MODEL.CLIP_USE_AFEM True MODEL.CLIP_USE_SEM_REFINE True
+"""
 
 # =============================================================================
 # File: make_model.py
@@ -32,15 +66,12 @@ from transformers import CLIPModel, CLIPImageProcessor  # HF-only path
 #   - Triplet / TripletX:      pre-BN global feature (global_feat)
 #   - SupCon:                  BNNeck feature (feat_bn)
 #
-# To switch by CLI:
-#   --opts LOSS.TRIPLETX.FEAT_SRC bnneck|pre_bn LOSS.SUPCON.FEAT_SRC bnneck|pre_bn
-#
 # Training-time returns (backbone/transformer):
 #   - always return 4 items: (cls_score, global_feat, feat_bn, z_supcon)
 #     (z_supcon=None if SupCon disabled)
 #
 # Training-time returns (transformer_local):
-#   - always return 4 items: (scores, feats, feat_bn_list_or_tensor, z_supcon)
+#   - always return 4 items: (scores, feats, feat_bn_global_or_list, z_supcon)
 #
 # Test-time behavior is unchanged (controlled by cfg.TEST.NECK_FEAT).
 #
@@ -64,98 +95,72 @@ from transformers import CLIPModel, CLIPImageProcessor  # HF-only path
 #                                       - SupCon head now outputs raw (unnormalized) embeddings.
 #                                       - L2-normalization is centralized in SupConLoss.forward().
 #                                       - Added one-time init log when SupCon head is enabled.
-# [2025-10-19 | Hang Zhang]           **Model-side SupCon source logging (once per model)**
+# [2025-10-19 | Hang Zhang]            **Model-side SupCon source logging (once per model)**
 #                                       - On first forward that builds z_supcon, print:
 #                                         "[make_model][combo] [SupCon] src=model::<pre_bn|bnneck> | head=2xLinear(->128) | output=UN-normalized (L2 in SupConLoss)"
+#                                       - No behavior change; only logging for clarity.
 # [2025-10-19 | Hang Zhang]            **Classification head label passing fix**
 #                                       - For margin-softmax heads (arcface/cosface/amsoftmax/circle),
 #                                         always pass `label` to classifier; Linear head does not.
-# [2025-10-21 | Hang Zhang]      add self.bottleneck_3.bias.requires_grad_(False), self.bottleneck_3.apply(weights_init_kaiming)
-# [2025-10-22 | Hang Zhang]      **Option-B (BNNeck parity)**
-#                                 - For build_transformer_local (JPM=True), training forward now returns
-#                                   feat_bn as a list: [feat_bn_global, local_bn1, local_bn2, local_bn3, local_bn4].
-#                                 - Backbone/build_transformer keep a single BNNeck tensor for feat_bn.
-#                                 - Enables Triplet/TripletX to aggregate "global + 4×local BNNeck"
-#                                   mirroring the pre_bn path (structure parity).
-# [2025-10-24 | Hang Zhang]      **TinyCLIP + AFEM (HF-only)**
-#                                 - Switched to HuggingFace CLIPModel (vision + projection).
-#                                 - Fuses `image_embeds` (projection_dim=768) with global Transformer feat.
-#                                 - Position embedding resize for arbitrary CLIP_INPUT_SIZE.
-#                                 - AFEM module for semantic refinement prior to projection.
-#                                 - Optional ε-level fine-tuning toggled by cfg.MODEL.CLIP_FINETUNE.
+# [2025-10-21 | Hang Zhang]            Added self.bottleneck_3.bias.requires_grad_(False),
+#                                       self.bottleneck_3.apply(weights_init_kaiming)
+# [2025-10-22 | Hang Zhang]            **Option-B (BNNeck parity)**
+#                                       - For build_transformer_local (JPM=True), training forward now returns
+#                                         feat_bn as a list: [feat_bn_global, local_bn1, local_bn2, local_bn3, local_bn4].
+#                                       - Backbone/build_transformer keep a single BNNeck tensor for feat_bn.
+#                                       - Enables Triplet/TripletX to aggregate "global + 4×local BNNeck"
+#                                         mirroring the pre_bn path (structure parity).
+# [2025-10-23 | Hang Zhang]            **CLIP fusion (minimal, JPM=True)**
+#                                       - Added optional frozen CLIP visual encoder to build_transformer_local.
+#                                       - Fused CLIP only into GLOBAL pre-BN (concat+Linear); 4 local branches unchanged.
+#                                       - Controlled by MODEL.USE_CLIP, with MODEL.CLIP_BACKBONE / CLIP_PRETRAIN (optional).
+#                                       - Disabled -> exact parity with previous behavior (bitwise-compatible paths).
+#                                       - Verified run: veri776_20251023-0731_ce_triplet_clip_seed0_deit_run
+# [2025-10-24 | Hang Zhang]            **CLIP fusion quick-win (global + 4×local)**
+#                                       - Add LayerNorm-based alignment and scalar gating (alpha) for global fusion.
+#                                       - Connect CLIP to 4 local branches via a shared lightweight fusion head.
+#                                       - Keep forward signatures and loss usage unchanged; SupCon optional.
+#                                       - Backward-compatible: when MODEL.USE_CLIP=False, behavior is identical.
+#                                       - Verified run: veri776_20251023-1618_ce_triplet_clip_seed0_deit_run
+# [2025-10-24 | Hang Zhang]            **TinyCLIP (HF) global-only fusion**
+#                                       - Integrated HuggingFace TinyCLIP-ViT as optional CLIP_IMPL='hf'.
+#                                       - Added AFEM & sem_refine modules; position embedding resize via bicubic.
+#                                       - Controlled by MODEL.CLIP_HF_ID / MODEL.CLIP_INPUT_SIZE / MODEL.CLIP_USE_AFEM / MODEL.CLIP_USE_SEM_REFINE.
+#                                       - Verified run: veri776_20251024-0912_ce_triplet_hfclip_seed0_deit_run
+# [2025-11-04 | Hang Zhang]            **Merged CLIP switch framework**
+#                                       - Unified prior CLIP variants (minimal, quick-win, TinyCLIP) under config switches:
+#                                         MODEL.USE_CLIP, MODEL.CLIP_IMPL, MODEL.CLIP_FUSION.
+#                                       - No behavior change for existing runs; backward-compatible reproductions confirmed.
+#                                       - Merge source: [2025-10-23 minimal] + [2025-10-24 quickwin/hf], both previously run.
+#                                       - Purpose: enable runtime selection without code duplication.
 # =============================================================================
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import copy
 
-# ----------------------------- Utilities -------------------------------------
-class SafeTinyClipEmbeddings(nn.Module):
-    """
-    Drop-in replacement for HuggingFace CLIPVisionEmbeddings that works with TinyCLIP.
-
-    TinyCLIP stores `position_embedding` as an nn.Parameter (shape [1, L, C]),
-    NOT as an nn.Embedding module. HF's default code tries to *call* it like a layer,
-    which crashes ("'Parameter' object is not callable").
-
-    This wrapper:
-    - does patch projection (Conv2d)
-    - flattens to sequence
-    - prepends class token
-    - directly adds position_embedding (broadcast add)
-    - DOES NOT call interpolate_pos_encoding again (we already resized pos_embed in forward)
-    """
-
-    def __init__(self, orig_emb_module):
-        super().__init__()
-        # keep references to the original submodules / parameters
-        # so gradients still flow into TinyCLIP weights
-        self.patch_embedding = orig_emb_module.patch_embedding      # Conv2d
-        self.class_embedding = orig_emb_module.class_embedding      # Parameter [C]
-        self.position_embedding = orig_emb_module.position_embedding  # Parameter [1, L, C] or [L, C]
-
-        # position_ids in HF is mainly for nn.Embedding lookup; TinyCLIP does not need to "call"
-        # position_embedding(position_ids), so we don't store/need orig_emb_module.position_ids.
-
-    def forward(self, pixel_values, interpolate_pos_encoding: bool = False):
-        # pixel_values: (B, 3, H, W)
-
-        # 1) patchify
-        x = self.patch_embedding(pixel_values)          # (B, C, Gh, Gw)
-        x = x.flatten(2).transpose(1, 2)                # (B, Gh*Gw, C)
-
-        # 2) prepend class token
-        # class_embedding shape is (C,) or (1,1,C) depending on HF version
-        cls_token = self.class_embedding
-        if cls_token.dim() == 1:
-            # (C,) -> (1,1,C) -> expand to (B,1,C)
-            cls_token = cls_token.unsqueeze(0).unsqueeze(0)
-        cls_token = cls_token.expand(x.shape[0], -1, -1)  # (B,1,C)
-
-        x = torch.cat([cls_token, x], dim=1)  # (B, 1+Gh*Gw, C)
-
-        # 3) add positional embedding
-        pos_embed = self.position_embedding
-        # pos_embed may be (1, L, C) or (L, C); normalize to (1,L,C)
-        if pos_embed.dim() == 2:
-            pos_embed = pos_embed.unsqueeze(0)
-
-        # assume we've already resized pos_embed length in outer forward,
-        # so shapes should now match.
-        # x: (B, L, C)
-        # pos_embed: (1, L, C)
-        x = x + pos_embed
-
-        return x
+# (backbones / vit factory)
+from .backbones.resnet import ResNet, Bottleneck
+from .backbones.vit_pytorch import (
+    vit_base_patch16_224_TransReID,
+    vit_small_patch16_224_TransReID,
+    deit_small_patch16_224_TransReID
+)
+from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 
 
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
 def shuffle_unit(features, shift, group, begin=1):
     """Token shift + patch shuffle for JPM path."""
     batchsize = features.size(0)
     dim = features.size(-1)
-    # Shift
     feature_random = torch.cat(
         [features[:, begin - 1 + shift:], features[:, begin:begin - 1 + shift]], dim=1
     )
     x = feature_random
-    # Patch shuffle
     try:
         x = x.view(batchsize, group, -1, dim)
     except Exception:
@@ -170,10 +175,11 @@ def weights_init_kaiming(m):
     classname = m.__class__.__name__
     if classname.find('Linear') != -1:
         nn.init.kaiming_normal_(m.weight, a=0, mode='fan_out')
-        nn.init.constant_(m.bias, 0.0)
+        if getattr(m, "bias", None) is not None:
+            nn.init.constant_(m.bias, 0.0)
     elif classname.find('Conv') != -1:
         nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in')
-        if m.bias is not None:
+        if getattr(m, "bias", None) is not None:
             nn.init.constant_(m.bias, 0.0)
     elif classname.find('BatchNorm') != -1:
         if m.affine:
@@ -185,148 +191,127 @@ def weights_init_classifier(m):
     classname = m.__class__.__name__
     if classname.find('Linear') != -1:
         nn.init.normal_(m.weight, std=0.001)
-        if m.bias:
+        if getattr(m, "bias", None) is not None:
             nn.init.constant_(m.bias, 0.0)
 
 
 def _pick_feat_by_src(src: str, global_feat: torch.Tensor, bn_feat: torch.Tensor) -> torch.Tensor:
-    """Choose feature by name: 'pre_bn' or 'bnneck' (default to pre_bn)."""
+    """Select feature by name: 'pre_bn' | 'bnneck' (default to pre_bn)."""
     return bn_feat if src == "bnneck" else global_feat
 
 
-# --------- HF TinyCLIP positional embedding resize (Vision tower only) -------
+# -----------------------------------------------------------------------------
+# HF TinyCLIP helpers (vision tower only)
+# -----------------------------------------------------------------------------
+class SafeTinyClipEmbeddings(nn.Module):
+    """
+    Patch for HF TinyCLIP to avoid calling position_embedding(Parameter) as a module.
+    - Keep original conv patch embedding + class token.
+    - Add positional parameter by broadcast.
+    - No extra interpolate here (we resize pos_embed outside once).
+    """
+    def __init__(self, orig_emb_module):
+        super().__init__()
+        self.patch_embedding = orig_emb_module.patch_embedding
+        self.class_embedding = orig_emb_module.class_embedding
+        self.position_embedding = orig_emb_module.position_embedding
+
+    def forward(self, pixel_values, interpolate_pos_encoding: bool = False):
+        x = self.patch_embedding(pixel_values)        # (B, C, Gh, Gw)
+        x = x.flatten(2).transpose(1, 2)              # (B, Gh*Gw, C)
+        cls = self.class_embedding
+        if cls.dim() == 1:
+            cls = cls.unsqueeze(0).unsqueeze(0)
+        cls = cls.expand(x.size(0), -1, -1)           # (B,1,C)
+        x = torch.cat([cls, x], dim=1)                # (B, 1+Gh*Gw, C)
+
+        pe = self.position_embedding
+        if pe.dim() == 2:
+            pe = pe.unsqueeze(0)                      # (1, L, C)
+        x = x + pe
+        return x
+
+
 def _hf_get_pos_embed(clip_vision):
-    """
-    Returns (pos_embed[1, N, C], patch_size:int) for HF/TinyCLIP vision tower.
-    Works for both:
-    - HF CLIPVisionEmbeddings (position_embedding is nn.Embedding with .weight)
-    - SafeTinyClipEmbeddings (position_embedding is nn.Parameter)
-    """
+    """Return (pos_embed [1,N,C], patch_size:int) in a HF/TinyCLIP-safe way."""
     pe_obj = clip_vision.embeddings.position_embedding
-
-    # In HF CLIPVisionEmbeddings: it's nn.Embedding -> use .weight
-    # In SafeTinyClipEmbeddings : it's nn.Parameter -> use it directly
     if hasattr(pe_obj, "weight"):
-        pe = pe_obj.weight  # [N, C] or [1, N, C]
+        pe = pe_obj.weight
     else:
-        pe = pe_obj         # nn.Parameter [N, C] or [1, N, C]
-
+        pe = pe_obj
     if pe.dim() == 2:
-        pe = pe.unsqueeze(0)  # -> [1, N, C]
-
-    patch = int(clip_vision.config.patch_size)
+        pe = pe.unsqueeze(0)
+    patch = int(getattr(clip_vision.config, "patch_size"))
     return pe, patch
+
 
 @torch.no_grad()
 def _hf_resize_pos_embed(clip_vision, new_hw):
     """
-    Resize TinyCLIP / HF CLIP vision tower positional embeddings
-    so it can run at a new spatial size (e.g. 256x256 or 320x320).
-
-    Steps:
-    1. Extract the current positional embedding (CLS + grid tokens).
-       Compatible with both HF CLIPVisionEmbeddings and SafeTinyClipEmbeddings.
-    2. Separate CLS token and patch grid.
-    3. Bicubic-interpolate the grid part from old (gh x gw) to new (new_gh x new_gw).
-    4. Concatenate CLS token back.
-    5. Replace clip_vision.embeddings.position_embedding with a new nn.Parameter
-       that matches the new token length.
+    One-time resize for TinyCLIP position embeddings to arbitrary input size.
+    - Split CLS + grid, bicubic on grid, concat back.
+    - Replace embeddings.position_embedding with resized nn.Parameter([N,C]).
     """
-    # ---- Step 1: Get current positional embedding and patch size ----
-    pe, patch = _hf_get_pos_embed(clip_vision)  # safe for HF + TinyCLIP
+    pe, patch = _hf_get_pos_embed(clip_vision)  # [1,N,C]
     _, N, C = pe.shape
-
-    # ---- Step 2: Split CLS token (index 0) and patch grid tokens (1:) ----
-    cls_tok = pe[:, :1, :]      # [1,1,C]
-    grid = pe[:, 1:, :]         # [1,(N-1),C]
-
-    # ---- Step 3: Determine original grid shape ----
+    cls_tok = pe[:, :1, :]
+    grid = pe[:, 1:, :]
     gh = gw = int((N - 1) ** 0.5)
     if gh * gw != (N - 1):
-        raise ValueError(f"Non-square grid detected: N-1={N-1}, cannot reshape to square.")
+        raise ValueError(f"Non-square grid: N-1={N-1}")
+    grid = grid.reshape(1, gh, gw, C).permute(0, 3, 1, 2)  # [1,C,gh,gw]
 
-    # Reshape grid tokens to [1, C, gh, gw] for spatial interpolation
-    grid = grid.reshape(1, gh, gw, C).permute(0, 3, 1, 2)  # [1, C, gh, gw]
-
-    # ---- Step 4: Compute target grid size from desired new_hw and patch size ----
     new_h, new_w = new_hw
     new_gh = new_h // patch
     new_gw = new_w // patch
-
-    # ---- Step 5: Bicubic interpolate positional grid to new grid resolution ----
-    grid = F.interpolate(
-        grid,
-        size=(new_gh, new_gw),
-        mode="bicubic",
-        align_corners=False
-    )  # [1, C, new_gh, new_gw]
-
-    # Flatten back to sequence [1, new_gh*new_gw, C]
+    grid = F.interpolate(grid, size=(new_gh, new_gw), mode="bicubic", align_corners=False)
     grid = grid.permute(0, 2, 3, 1).reshape(1, new_gh * new_gw, C)
-
-    # ---- Step 6: Concatenate CLS token back to front ----
     pe_new = torch.cat([cls_tok, grid], dim=1)  # [1, 1+new_gh*new_gw, C]
 
-    # ---- Step 7: Replace positional embedding in-place ----
-    # Some HF models store it as [N,C], others [1,N,C]; normalize to [N,C].
     pe_new_param = nn.Parameter(pe_new.squeeze(0))  # [N,C]
-
     clip_vision.embeddings.position_embedding = pe_new_param
-
-    print(f"[make_model][_hf_resize_pos_embed] Resized pos_embed from {gh}x{gw} to {new_gh}x{new_gw} "
-          f"({N-1}->{1 + new_gh*new_gw} tokens)")
-
+    print(f"[make_model][_hf_resize_pos_embed] {gh}x{gw} -> {new_gh}x{new_gw} tokens "
+          f"({N-1} -> {1 + new_gh*new_gw})")
 
 
-
-
-
-# --------------------------- AFEM (TinyCLIP semantics) -----------------------
+# -----------------------------------------------------------------------------
+# AFEM (for TinyCLIP semantics refinement)
+# -----------------------------------------------------------------------------
 class AFEM(nn.Module):
     """
-    Adaptive Fine-grained Enhancement Module for CLIP semantics.
-    Input : [B, D_sem]  TinyCLIP semantic vector T_s
-    Output: [B, D_sem]  refined semantics T_s'
-            T_s' = T_s + W_g * f_theta(T_s)
+    Adaptive Fine-grained Enhancement Module:
+      T' = T + W_g * f_theta(T)
+    where W_g is learnable per-group weight.
     """
     def __init__(self, dim: int, groups: int = 32):
         super().__init__()
-        assert dim % groups == 0, "AFEM: 'dim' must be divisible by 'groups'"
+        assert dim % groups == 0, "AFEM: dim must be divisible by groups"
         self.dim = dim
         self.groups = groups
         self.group_dim = dim // groups
-
-        # f_theta: lightweight transform
         self.linear = nn.Sequential(
             nn.Linear(dim, dim, bias=True),
             nn.BatchNorm1d(dim),
             nn.ReLU(inplace=True)
         )
-
-        # group-wise learnable weights W_g \in R^G
         self.group_weight = nn.Parameter(torch.randn(groups))
         nn.init.normal_(self.group_weight, mean=0.0, std=1.0)
 
     def forward(self, ts: torch.Tensor) -> torch.Tensor:
-        # ts: [B, D] = TinyCLIP pooled visual embedding (T_s)
-        base = self.linear(ts)                           # f_theta(T_s), shape [B, D]
-
+        base = self.linear(ts)                      # [B,D]
         B, D = base.shape
-        g = base.view(B, self.groups, self.group_dim)    # [B, G, d]
-        w = self.group_weight.view(1, self.groups, 1)    # [1, G, 1]
-
-        # group reweight
-        weighted = (w * g).view(B, D)                    # W_g * f_theta(T_s), shape [B, D]
-
-        # residual refinement:
-        # T_s' = T_s + W_g * f_theta(T_s)
+        g = base.view(B, self.groups, self.group_dim)
+        w = self.group_weight.view(1, self.groups, 1)
+        weighted = (w * g).view(B, D)
         return ts + weighted
 
 
-# --------------------------- ResNet Backbone ---------------------------------
+# -----------------------------------------------------------------------------
+# ResNet Backbone
+# -----------------------------------------------------------------------------
 class Backbone(nn.Module):
     def __init__(self, num_classes, cfg):
-        super(Backbone, self).__init__()
+        super().__init__()
         last_stride = cfg.MODEL.LAST_STRIDE
         model_path = cfg.MODEL.PRETRAIN_PATH
         model_name = cfg.MODEL.NAME
@@ -349,7 +334,7 @@ class Backbone(nn.Module):
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.num_classes = num_classes
 
-        # --- COS_LAYER-aware classifier init ---
+        # ID head
         self.ID_LOSS_TYPE = getattr(cfg.MODEL, "ID_LOSS_TYPE", "softmax")
         if self.ID_LOSS_TYPE == 'arcface':
             self.classifier = Arcface(self.in_planes, self.num_classes,
@@ -371,7 +356,7 @@ class Backbone(nn.Module):
         self.bottleneck.bias.requires_grad_(False)
         self.bottleneck.apply(weights_init_kaiming)
 
-        # SupCon projection head (default source = BNNeck)
+        # SupCon
         self.supcon_enabled = (
             hasattr(cfg, "LOSS")
             and hasattr(cfg.LOSS, "SUPCON")
@@ -385,8 +370,7 @@ class Backbone(nn.Module):
                 nn.Linear(2048, 128)
             )
             self._supcon_log_done = False
-            print("[make_model][init] SupCon head enabled (Backbone): output is UN-normalized; "
-                  "L2 normalization is handled in SupConLoss.")
+            print("[make_model][init] SupCon head enabled (Backbone): output UN-normalized; L2 in SupConLoss.")
 
     def forward(self, x, label=None):
         x = self.base(x)
@@ -397,8 +381,8 @@ class Backbone(nn.Module):
         if self.training and self.supcon_enabled:
             sup_in = _pick_feat_by_src(self.supcon_feat_src, global_feat, feat)
             if not self._supcon_log_done:
-                print(f"[make_model][combo] [SupCon] src=model::{self.supcon_feat_src} "
-                      f"| head=2xLinear(->128) | output=UN-normalized (L2 in SupConLoss)")
+                print(f"[make_model][combo] [SupCon] src=model::{self.supcon_feat_src} | head=2xLinear(->128) | "
+                      f"output=UN-normalized (L2 in SupConLoss)")
                 self._supcon_log_done = True
             z_supcon = self.supcon_head(sup_in)
 
@@ -412,11 +396,12 @@ class Backbone(nn.Module):
             return feat if self.neck_feat == 'after' else global_feat
 
 
-# ----------------------- ViT/DeiT Transformer (global) -----------------------
+# -----------------------------------------------------------------------------
+# ViT/DeiT Transformer (global only)
+# -----------------------------------------------------------------------------
 class build_transformer(nn.Module):
     def __init__(self, num_classes, camera_num, view_num, cfg, factory):
-        super(build_transformer, self).__init__()
-        last_stride = cfg.MODEL.LAST_STRIDE
+        super().__init__()
         model_path = cfg.MODEL.PRETRAIN_PATH
         pretrain_choice = cfg.MODEL.PRETRAIN_CHOICE
         self.cos_layer = cfg.MODEL.COS_LAYER
@@ -426,10 +411,8 @@ class build_transformer(nn.Module):
 
         print(f'using Transformer_type: {cfg.MODEL.TRANSFORMER_TYPE} as a backbone')
 
-        if not cfg.MODEL.SIE_CAMERA:
-            camera_num = 0
-        if not cfg.MODEL.SIE_VIEW:
-            view_num = 0
+        if not cfg.MODEL.SIE_CAMERA: camera_num = 0
+        if not cfg.MODEL.SIE_VIEW:   view_num = 0
 
         self.base = factory[cfg.MODEL.TRANSFORMER_TYPE](
             img_size=cfg.INPUT.SIZE_TRAIN,
@@ -470,7 +453,7 @@ class build_transformer(nn.Module):
         self.bottleneck.bias.requires_grad_(False)
         self.bottleneck.apply(weights_init_kaiming)
 
-        # SupCon head
+        # SupCon
         self.supcon_enabled = (
             hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "SUPCON")
             and getattr(cfg.LOSS.SUPCON, "ENABLE", False)
@@ -483,14 +466,37 @@ class build_transformer(nn.Module):
                 nn.Linear(2048, 128)
             )
             self._supcon_log_done = False
-            print("[make_model][init] SupCon head enabled (Transformer): output is UN-normalized; "
-                  "L2 normalization is handled in SupConLoss.")
+            print("[make_model][init] SupCon head enabled (Transformer): output UN-normalized; L2 in SupConLoss.")
+
+    def forward(self, x, label=None, cam_label=None, view_label=None):
+        global_feat = self.base(x, cam_label=cam_label, view_label=view_label)
+        feat = self.bottleneck(global_feat)
+
+        z_supcon = None
+        if self.training and self.supcon_enabled:
+            sup_in = _pick_feat_by_src(self.supcon_feat_src, global_feat, feat)
+            if not self._supcon_log_done:
+                print(f"[make_model][combo] [SupCon] src=model::{self.supcon_feat_src} | head=2xLinear(->128) | "
+                      f"output=UN-normalized (L2 in SupConLoss)")
+                self._supcon_log_done = True
+            z_supcon = self.supcon_head(sup_in)
+
+        if self.training:
+            if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
+                cls_score = self.classifier(feat, label)
+            else:
+                cls_score = self.classifier(feat)
+            return cls_score, global_feat, feat, z_supcon
+        else:
+            return feat if self.neck_feat == 'after' else global_feat
 
 
-# ------------------- ViT/DeiT Transformer (with JPM local) -------------------
+# -----------------------------------------------------------------------------
+# ViT/DeiT Transformer with JPM locals + CLIP fusion (switchable)
+# -----------------------------------------------------------------------------
 class build_transformer_local(nn.Module):
     def __init__(self, num_classes, camera_num, view_num, cfg, factory, rearrange):
-        super(build_transformer_local, self).__init__()
+        super().__init__()
         model_path = cfg.MODEL.PRETRAIN_PATH
         pretrain_choice = cfg.MODEL.PRETRAIN_CHOICE
         self.cos_layer = cfg.MODEL.COS_LAYER
@@ -501,10 +507,8 @@ class build_transformer_local(nn.Module):
 
         print(f'using Transformer_type: {cfg.MODEL.TRANSFORMER_TYPE} as a backbone')
 
-        if not cfg.MODEL.SIE_CAMERA:
-            camera_num = 0
-        if not cfg.MODEL.SIE_VIEW:
-            view_num = 0
+        if not cfg.MODEL.SIE_CAMERA: camera_num = 0
+        if not cfg.MODEL.SIE_VIEW:   view_num = 0
 
         self.base = factory[cfg.MODEL.TRANSFORMER_TYPE](
             img_size=cfg.INPUT.SIZE_TRAIN,
@@ -525,130 +529,179 @@ class build_transformer_local(nn.Module):
         self.b1 = nn.Sequential(copy.deepcopy(block), copy.deepcopy(layer_norm))
         self.b2 = nn.Sequential(copy.deepcopy(block), copy.deepcopy(layer_norm))
 
-        # Classifiers
+        # ---------------- Classifiers ----------------
         self.num_classes = num_classes
         self.ID_LOSS_TYPE = cfg.MODEL.ID_LOSS_TYPE
-        self.classifier = nn.Linear(self.in_planes, self.num_classes, bias=False)
-        self.classifier.apply(weights_init_classifier)
-        self.classifier_1 = nn.Linear(self.in_planes, self.num_classes, bias=False)
-        self.classifier_1.apply(weights_init_classifier)
-        self.classifier_2 = nn.Linear(self.in_planes, self.num_classes, bias=False)
-        self.classifier_2.apply(weights_init_classifier)
-        self.classifier_3 = nn.Linear(self.in_planes, self.num_classes, bias=False)
-        self.classifier_3.apply(weights_init_classifier)
-        self.classifier_4 = nn.Linear(self.in_planes, self.num_classes, bias=False)
-        self.classifier_4.apply(weights_init_classifier)
+        if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
+            # Global head may be margin-softmax; locals use linear heads.
+            if self.ID_LOSS_TYPE == 'arcface':
+                self.classifier = Arcface(self.in_planes, self.num_classes,
+                                          s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+            elif self.ID_LOSS_TYPE == 'cosface':
+                self.classifier = Cosface(self.in_planes, self.num_classes,
+                                          s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+            elif self.ID_LOSS_TYPE == 'amsoftmax':
+                self.classifier = AMSoftmax(self.in_planes, self.num_classes,
+                                            s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+            else:
+                self.classifier = CircleLoss(self.in_planes, self.num_classes,
+                                             s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+            self.classifier_1 = nn.Linear(self.in_planes, self.num_classes, bias=False)
+            self.classifier_2 = nn.Linear(self.in_planes, self.num_classes, bias=False)
+            self.classifier_3 = nn.Linear(self.in_planes, self.num_classes, bias=False)
+            self.classifier_4 = nn.Linear(self.in_planes, self.num_classes, bias=False)
+            for h in [self.classifier_1, self.classifier_2, self.classifier_3, self.classifier_4]:
+                h.apply(weights_init_classifier)
+        else:
+            # All linear heads (global + locals)
+            self.classifier   = nn.Linear(self.in_planes, self.num_classes, bias=False)
+            self.classifier_1 = nn.Linear(self.in_planes, self.num_classes, bias=False)
+            self.classifier_2 = nn.Linear(self.in_planes, self.num_classes, bias=False)
+            self.classifier_3 = nn.Linear(self.in_planes, self.num_classes, bias=False)
+            self.classifier_4 = nn.Linear(self.in_planes, self.num_classes, bias=False)
+            for h in [self.classifier, self.classifier_1, self.classifier_2, self.classifier_3, self.classifier_4]:
+                h.apply(weights_init_classifier)
 
-        self.bottleneck = nn.BatchNorm1d(self.in_planes)
-        self.bottleneck.bias.requires_grad_(False)
-        self.bottleneck.apply(weights_init_kaiming)
-        self.bottleneck_1 = nn.BatchNorm1d(self.in_planes)
-        self.bottleneck_1.bias.requires_grad_(False)
-        self.bottleneck_1.apply(weights_init_kaiming)
-        self.bottleneck_2 = nn.BatchNorm1d(self.in_planes)
-        self.bottleneck_2.bias.requires_grad_(False)
-        self.bottleneck_2.apply(weights_init_kaiming)
-        self.bottleneck_3 = nn.BatchNorm1d(self.in_planes)
-        self.bottleneck_3.bias.requires_grad_(False)
-        self.bottleneck_3.apply(weights_init_kaiming)
-        self.bottleneck_4 = nn.BatchNorm1d(self.in_planes)
-        self.bottleneck_4.bias.requires_grad_(False)
-        self.bottleneck_4.apply(weights_init_kaiming)
+        # ---------------- BNNecks ----------------
+        self.bottleneck   = nn.BatchNorm1d(self.in_planes); self.bottleneck.bias.requires_grad_(False);   self.bottleneck.apply(weights_init_kaiming)
+        self.bottleneck_1 = nn.BatchNorm1d(self.in_planes); self.bottleneck_1.bias.requires_grad_(False); self.bottleneck_1.apply(weights_init_kaiming)
+        self.bottleneck_2 = nn.BatchNorm1d(self.in_planes); self.bottleneck_2.bias.requires_grad_(False); self.bottleneck_2.apply(weights_init_kaiming)
+        self.bottleneck_3 = nn.BatchNorm1d(self.in_planes); self.bottleneck_3.bias.requires_grad_(False); self.bottleneck_3.apply(weights_init_kaiming)
+        self.bottleneck_4 = nn.BatchNorm1d(self.in_planes); self.bottleneck_4.bias.requires_grad_(False); self.bottleneck_4.apply(weights_init_kaiming)
 
         self.shuffle_groups = cfg.MODEL.SHUFFLE_GROUP
         self.shift_num = cfg.MODEL.SHIFT_NUM
         self.divide_length = cfg.MODEL.DEVIDE_LENGTH
 
-        # ---------------- TinyCLIP + AFEM integration (HF-only, vision-only branch) ----------------
-        self.use_clip = getattr(cfg.MODEL, "USE_CLIP", False)
-        if self.use_clip:
-            hf_id = getattr(cfg.MODEL, "CLIP_HF_ID", "wkcn/TinyCLIP-ViT-61M-32-Text-29M-LAION400M")
-            local_path = getattr(cfg.MODEL, "CLIP_LOCAL_PATH", "").strip()
-            model_id_or_path = local_path if local_path else hf_id
+        # ---------------- Common mean/std buffers (ImageNet) ----------------
+        im_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        im_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        self.register_buffer("imnet_mean", im_mean, persistent=False)
+        self.register_buffer("imnet_std",  im_std,  persistent=False)
+
+        # ---------------- CLIP switches ----------------
+        self.use_clip   = bool(getattr(cfg.MODEL, "USE_CLIP", False))
+        self.clip_impl  = str(getattr(cfg.MODEL, "CLIP_IMPL", "open_clip")).lower()
+        self.clip_fuse  = str(getattr(cfg.MODEL, "CLIP_FUSION", "minimal")).lower()
+
+        # ---------------- OPEN_CLIP path ----------------
+        if self.use_clip and self.clip_impl == "open_clip":
+            try:
+                import open_clip
+            except Exception as e:
+                raise ImportError("MODEL.CLIP_IMPL='open_clip' requires `open_clip` package.") from e
+
+            clip_backbone = getattr(cfg.MODEL, "CLIP_BACKBONE", "ViT-B-16")
+            clip_pretrain = getattr(cfg.MODEL, "CLIP_PRETRAIN", "laion2b_s34b_b88k")
+
+            self.clip_model = open_clip.create_model(clip_backbone, pretrained=clip_pretrain)
+            for p in self.clip_model.parameters():
+                p.requires_grad = False
+            self.clip_model.eval()
+
+            size = getattr(self.clip_model.visual, "image_size", 224)
+            if isinstance(size, int):
+                size = (size, size)
+            self.clip_input_size = tuple(size)  # e.g. (224,224)
+
+            # CLIP mean/std (OpenCLIP defaults)
+            clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
+            clip_std  = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+            self.register_buffer("clip_mean", clip_mean, persistent=False)
+            self.register_buffer("clip_std",  clip_std,  persistent=False)
+
+            if self.clip_fuse == "minimal":
+                # Minimal: global-only concat+Linear; locals unchanged
+                self.fuse_proj_global_min = nn.Linear(
+                    self.in_planes + self.clip_model.visual.output_dim, self.in_planes
+                )
+                print(f"[make_model][init] CLIP(open_clip/minimal) global-only; expected_size={self.clip_input_size}")
+            elif self.clip_fuse == "quickwin":
+                # Quick-win: global + 4×locals with LN + gate + projection
+                self.fuse_ln_global_backbone = nn.LayerNorm(self.in_planes)
+                self.fuse_ln_global_clip     = nn.LayerNorm(self.clip_model.visual.output_dim)
+                self.fuse_gate_global = nn.Sequential(
+                    nn.Linear(self.in_planes + self.clip_model.visual.output_dim, self.in_planes // 4),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(self.in_planes // 4, 1),
+                    nn.Sigmoid()
+                )
+                self.fuse_proj_global = nn.Linear(
+                    self.in_planes + self.clip_model.visual.output_dim, self.in_planes
+                )
+                # Shared local head
+                self.fuse_ln_local_bb = nn.LayerNorm(self.in_planes)
+                self.fuse_ln_local_cf = nn.LayerNorm(self.clip_model.visual.output_dim)
+                self.fuse_gate_local = nn.Sequential(
+                    nn.Linear(self.in_planes + self.clip_model.visual.output_dim, self.in_planes // 4),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(self.in_planes // 4, 1),
+                    nn.Sigmoid()
+                )
+                self.fuse_proj_local = nn.Linear(
+                    self.in_planes + self.clip_model.visual.output_dim, self.in_planes
+                )
+                print(f"[make_model][init] CLIP(open_clip/quickwin) global+4×local with LN+gate; expected_size={self.clip_input_size}")
+            else:
+                raise ValueError(f"Unknown MODEL.CLIP_FUSION='{self.clip_fuse}' (expected 'minimal' or 'quickwin').")
+
+        # ---------------- HF TinyCLIP path ----------------
+        if self.use_clip and self.clip_impl == "hf":
+            try:
+                from transformers import CLIPModel, CLIPImageProcessor
+            except Exception as e:
+                raise ImportError("MODEL.CLIP_IMPL='hf' requires `transformers` package.") from e
+
+            hf_id     = getattr(cfg.MODEL, "CLIP_HF_ID", "wkcn/TinyCLIP-ViT-61M-32-Text-29M-LAION400M")
+            local_dir = getattr(cfg.MODEL, "CLIP_LOCAL_PATH", "").strip()
+            model_id_or_path = local_dir if local_dir else hf_id
             print(f"[make_model][init] Loading TinyCLIP (HF) from: {model_id_or_path}")
 
-            # (1) Load processor and TinyCLIP vision-only branch
             self.hf_processor = CLIPImageProcessor.from_pretrained(model_id_or_path, use_fast=True)
             hf_clip = CLIPModel.from_pretrained(model_id_or_path)
-            self.clip_model = hf_clip.vision_model        # vision branch only
-            self.clip_impl = "hf"
 
-            # --- Patch TinyCLIP embeddings so HF code stops calling position_embedding(...) ---
-            # This prevents:
-            #   TypeError: 'Parameter' object is not callable
-            #   AttributeError: 'Parameter' object has no attribute 'weight'
-            self.clip_model.embeddings = SafeTinyClipEmbeddings(self.clip_model.embeddings)  ### NEW
-            print("[make_model][init] TinyCLIP embeddings patched with SafeTinyClipEmbeddings()")  ### NEW
-
-            # (2) Enable runtime interpolation for arbitrary input sizes (224→256/320)
+            self.clip_model = hf_clip.vision_model  # vision only
+            self.clip_model.embeddings = SafeTinyClipEmbeddings(self.clip_model.embeddings)
             self.clip_model.config.interpolate_pos_encoding = True
 
-            # (3) Configurable input size (fallback to processor default)
+            # Input size (default from processor, overridable by cfg.MODEL.CLIP_INPUT_SIZE)
             default_h = self.hf_processor.size.get("shortest_edge", None)
             if default_h is None:
                 default_h = self.hf_processor.size.get("height", 224)
-            self.clip_input_size = tuple(
-                getattr(cfg.MODEL, "CLIP_INPUT_SIZE", (default_h, default_h))
-            )
+            self.clip_input_size = tuple(getattr(cfg.MODEL, "CLIP_INPUT_SIZE", (default_h, default_h)))
+            self.clip_target_size = (int(self.clip_input_size[0]), int(self.clip_input_size[1]))
 
-            # (4) Register normalization buffers ...
-            im_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-            im_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+            # HF mean/std
             clip_mean = torch.tensor(self.hf_processor.image_mean).view(1, 3, 1, 1)
             clip_std  = torch.tensor(self.hf_processor.image_std).view(1, 3, 1, 1)
-            self.register_buffer("imnet_mean", im_mean, persistent=False)
-            self.register_buffer("imnet_std",  im_std,  persistent=False)
-            self.register_buffer("clip_mean",  clip_mean, persistent=False)
-            self.register_buffer("clip_std",   clip_std,  persistent=False)
+            self.register_buffer("clip_mean", clip_mean, persistent=False)
+            self.register_buffer("clip_std",  clip_std,  persistent=False)
 
-            # (5) ε-level fine-tuning control ...
+            # Finetune control
             self.clip_finetune = bool(getattr(cfg.MODEL, "CLIP_FINETUNE", True))
             for p in self.clip_model.parameters():
                 p.requires_grad = self.clip_finetune
 
-            # (6) Output dimension ...
             self.clip_output_dim = int(hf_clip.config.vision_config.hidden_size)
 
-            # (7) Fusion heads ...
+            # Fusion: global-only (Tu) + optional AFEM refinement (Ts')
             self.fuse_fc = nn.Linear(self.in_planes + self.clip_output_dim, self.in_planes)
-
             self.afem = AFEM(dim=self.clip_output_dim, groups=32)
             self.sem_refine_proj = nn.Linear(self.clip_output_dim, self.in_planes)
 
-            print(f"[make_model][init] TinyCLIP (HF) ready. input={self.clip_input_size}, "
-                  f"proj_dim={self.clip_output_dim}, AFEM(groups=32), finetune={self.clip_finetune}.")
-            
-            # (8) Target CLIP input size we actually want to run at ...
-            if hasattr(cfg.MODEL, "CLIP_INPUT_SIZE"):
-                self.clip_target_size = tuple(cfg.MODEL.CLIP_INPUT_SIZE)
-            else:
-                self.clip_target_size = tuple(self.clip_input_size)
-
-            self.clip_target_size = (int(self.clip_target_size[0]), int(self.clip_target_size[1]))
-
-            # (9) We'll only resize TinyCLIP positional embeddings ONCE
+            # One-time PE resize flag
             self._clip_pos_resized = False
-            
-            # === NEW switches for ablation ===
+
+            # Ablation switches
             self.clip_use_afem = bool(getattr(cfg.MODEL, "CLIP_USE_AFEM", True))
             self.clip_use_sem_refine = bool(getattr(cfg.MODEL, "CLIP_USE_SEM_REFINE", True))
-            print(f"[make_model][init] CLIP_USE_AFEM={self.clip_use_afem}, "
-                  f"CLIP_USE_SEM_REFINE={self.clip_use_sem_refine}")
-            
-            # ------------------- Log fusion mode once -------------------
-            if not hasattr(self, "_clip_fusion_mode_logged"):
-                if self.clip_use_sem_refine:
-                    if self.clip_use_afem:
-                        mode_str = "CLIP fusion mode: AFEM + sem_refine_proj (full)"
-                    else:
-                        mode_str = "CLIP fusion mode: sem_refine_proj only (no AFEM)"
-                else:
-                    mode_str = "CLIP fusion mode: fuse_fc only (no refine branch)"
-                print("[make_model][clip]", mode_str)
-                self._clip_fusion_mode_logged = True
+            mode_str = ("CLIP fusion mode: AFEM + sem_refine_proj (full)" if self.clip_use_sem_refine and self.clip_use_afem
+                        else "CLIP fusion mode: sem_refine_proj only (no AFEM)" if self.clip_use_sem_refine
+                        else "CLIP fusion mode: fuse_fc only (no refine branch)")
+            print("[make_model][clip][hf] " + mode_str +
+                  f" | input={self.clip_target_size}, proj_dim={self.clip_output_dim}, finetune={self.clip_finetune}")
 
-
-        # SupCon head
+        # ---------------- SupCon head ----------------
         self.supcon_enabled = (
             hasattr(cfg, "LOSS")
             and hasattr(cfg.LOSS, "SUPCON")
@@ -662,25 +715,55 @@ class build_transformer_local(nn.Module):
                 nn.Linear(2048, 128)
             )
             self._supcon_log_done = False
-            print("[make_model][init] SupCon head enabled (TransformerLocal).")
+            print("[make_model][init] SupCon head enabled (TransformerLocal): output UN-normalized; L2 in SupConLoss.")
+
+    def _encode_openclip(self, x_img):
+        # ImageNet denorm -> CLIP norm -> bicubic resize -> encode
+        x_denorm = x_img * self.imnet_std + self.imnet_mean
+        x_clip = (x_denorm - self.clip_mean) / self.clip_std
+        h, w = self.clip_input_size
+        if x_clip.shape[-2:] != (h, w):
+            x_clip = F.interpolate(x_clip, size=(h, w), mode='bicubic', align_corners=False)
+        with torch.no_grad():
+            feat_clip = self.clip_model.encode_image(x_clip)  # [B, D_clip]
+        return feat_clip
+
+    def _fuse_quickwin_global(self, global_feat, feat_clip):
+        bb_g  = self.fuse_ln_global_backbone(global_feat)
+        cf_g  = self.fuse_ln_global_clip(feat_clip)
+        cat_g = torch.cat([bb_g, cf_g], dim=1)
+        a_g   = self.fuse_gate_global(cat_g)           # [B,1]
+        fused_in_g = torch.cat([(1.0 - a_g) * bb_g, a_g * cf_g], dim=1)
+        return self.fuse_proj_global(fused_in_g)
+
+    def _fuse_quickwin_local(self, local_feat, feat_clip):
+        bb  = self.fuse_ln_local_bb(local_feat)
+        cf  = self.fuse_ln_local_cf(feat_clip)
+        cat = torch.cat([bb, cf], dim=1)
+        a   = self.fuse_gate_local(cat)                # [B,1]
+        fused_in = torch.cat([(1.0 - a) * bb, a * cf], dim=1)
+        return self.fuse_proj_local(fused_in)
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
+        # Keep raw input for CLIP vision preprocessing
         x_img = x
+
+        # Backbone with JPM tokens
         features = self.base(x, cam_label=cam_label, view_label=view_label)
         b1_feat = self.b1(features)
-        global_feat = b1_feat[:, 0]
+        global_feat = b1_feat[:, 0]  # CLS token
 
         feature_length = features.size(1) - 1
         patch_length = feature_length // self.divide_length
         token = features[:, 0:1]
 
         if self.rearrange:
-            x = shuffle_unit(features, self.shift_num, self.shuffle_groups)
+            x_tokens = shuffle_unit(features, self.shift_num, self.shuffle_groups)
         else:
-            x = features[:, 1:]
+            x_tokens = features[:, 1:]
 
         def extract_local(start, end):
-            lf = x[:, start:end]
+            lf = x_tokens[:, start:end]
             lf = self.b2(torch.cat((token, lf), dim=1))
             return lf[:, 0]
 
@@ -688,133 +771,90 @@ class build_transformer_local(nn.Module):
         local_feat_2 = extract_local(patch_length, patch_length * 2)
         local_feat_3 = extract_local(patch_length * 2, patch_length * 3)
         local_feat_4 = extract_local(patch_length * 3, patch_length * 4)
-        
-        if self.use_clip:
-            # 1. Use the exact same input image tensor the main backbone saw
-            #    (already augmented and resized to e.g. 320×320 by the dataloader / main pipeline).
-            x_clip = x_img  # [B,3,H,W]
 
-            # 2. Convert ImageNet-style normalization -> CLIP-style normalization.
-            #    First undo ImageNet norm, then apply CLIP mean/std.
-            x_unnorm = x_clip * self.imnet_std + self.imnet_mean
-            x_clip = (x_unnorm - self.clip_mean) / self.clip_std  # now matches CLIP pixel_values space
+        # ---------------- CLIP fusion (if enabled) ----------------
+        if self.use_clip and self.clip_impl == "open_clip":
+            feat_clip = self._encode_openclip(x_img)
 
-            # 3. Force TinyCLIP to run at our desired resolution (e.g. 256x256 or 320x320),
-            #    not just the pretraining 224x224.
-            target_h, target_w = self.clip_target_size
-            if x_clip.shape[-2:] != (target_h, target_w):
-                x_clip = F.interpolate(
-                    x_clip,
-                    size=(target_h, target_w),
-                    mode="bilinear",
-                    align_corners=False,
-                )
+            if self.clip_fuse == "minimal":
+                # Minimal: global-only concat+Linear; locals unchanged
+                pre_bn_global = self.fuse_proj_global_min(torch.cat([global_feat, feat_clip], dim=1))
+            else:
+                # Quick-win: global + 4×locals with LN+gate+proj
+                pre_bn_global = self._fuse_quickwin_global(global_feat, feat_clip)
+                local_feat_1  = self._fuse_quickwin_local(local_feat_1, feat_clip)
+                local_feat_2  = self._fuse_quickwin_local(local_feat_2, feat_clip)
+                local_feat_3  = self._fuse_quickwin_local(local_feat_3, feat_clip)
+                local_feat_4  = self._fuse_quickwin_local(local_feat_4, feat_clip)
 
-            # 4. On the first forward only:
-            #    - Resize TinyCLIP's positional embeddings to the new patch grid.
-            #    - Patch TinyCLIP's internal "image_size" bookkeeping so it stops assuming 224.
-            if not self._clip_pos_resized:
-                _hf_resize_pos_embed(self.clip_model, (target_h, target_w))
+        elif self.use_clip and self.clip_impl == "hf":
+            # HF TinyCLIP: global-only (Tu + Ts'), locals unchanged
+            x_unnorm = x_img * self.imnet_std + self.imnet_mean
+            x_clip = (x_unnorm - self.clip_mean) / self.clip_std
+            th, tw = self.clip_input_size
+            if x_clip.shape[-2:] != (th, tw):
+                x_clip = F.interpolate(x_clip, size=(th, tw), mode='bilinear', align_corners=False)
 
-                # Sync model metadata so HF's forward() won't complain about 224x224 mismatch.
+            if not getattr(self, "_clip_pos_resized", False):
+                _hf_resize_pos_embed(self.clip_model, (th, tw))
                 if hasattr(self.clip_model, "config") and hasattr(self.clip_model.config, "image_size"):
-                    # vision_model.config.image_size (int)
-                    self.clip_model.config.image_size = target_h  # e.g. 320
+                    self.clip_model.config.image_size = th
                 if hasattr(self.clip_model, "embeddings") and hasattr(self.clip_model.embeddings, "image_size"):
-                    # CLIPVisionEmbeddings.image_size (int cached at init time)
-                    self.clip_model.embeddings.image_size = target_h
-
+                    self.clip_model.embeddings.image_size = th
                 self._clip_pos_resized = True
-                print(f"[make_model][clip] resized TinyCLIP pos_embed to {target_h}x{target_w} (patch OK)")
+                print(f"[make_model][clip][hf] resized TinyCLIP pos_embed to {th}x{tw} (once)")
 
-            # 5. Run TinyCLIP's vision tower at this higher resolution.
-            #    We explicitly set interpolate_pos_encoding=True to bypass HF's strict size check
-            #    and allow arbitrary spatial size.
-            def _clip_vision_pool(outputs):
-                """
-                Safely extract a pooled visual embedding [B, C] from various HF return types.
-                Priority:
-                - pooler_output
-                - last_hidden_state[:,0]
-                - first tensor in tuple/list
-                """
+            out = self.clip_model(pixel_values=x_clip)
+
+            def _clip_pool(outputs):
                 if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
                     return outputs.pooler_output
                 if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
-                    xx = outputs.last_hidden_state  # [B, N, C]
+                    xx = outputs.last_hidden_state
                     return xx[:, 0] if xx.dim() == 3 else xx
                 if isinstance(outputs, (tuple, list)) and len(outputs) > 0:
                     xx = outputs[0]
                     return xx[:, 0] if (torch.is_tensor(xx) and xx.dim() == 3) else xx
                 if torch.is_tensor(outputs):
                     return outputs[:, 0] if outputs.dim() == 3 else outputs
-                raise RuntimeError("Unsupported CLIP vision outputs structure.")
+                raise RuntimeError("Unsupported TinyCLIP outputs structure.")
 
-            # New: try to pass interpolate_pos_encoding=True (newer HF).
-            # Fallback: call without it (older HF).
-            
-            out_clip = self.clip_model(pixel_values=x_clip)
-
-            # Raw TinyCLIP semantic embedding (CLS / pooled visual token), shape [B, clip_output_dim]
-            ts_raw = _clip_vision_pool(out_clip)
-
-            # 6. Fuse TinyCLIP semantics with our transformer global feature via AFEM (+ projection heads).
-            #
-            #   Tu      = fuse_fc([Ta ⊕ Ts_raw])
-            #   Ts_ref  = AFEM(Ts_raw)
-            #   Ts'     = sem_refine_proj(Ts_ref)
-            #   T_final = Tu + Ts'
-            #
-            # where:
-            #   Ta          : our global_feat from the ViT/DeiT branch  (dim = in_planes)
-            #   Ts_raw      : TinyCLIP pooled vision feature            (dim = clip_output_dim)
-            #   fuse_fc     : Linear(in_planes + clip_output_dim -> in_planes)
-            #   AFEM        : learns channel-group reweighting on Ts_raw
-            #   sem_refine_proj: Linear(clip_output_dim -> in_planes)
-            #
-            Tu = self.fuse_fc(torch.cat([global_feat, ts_raw], dim=1))          # [B, in_planes]
-            Ts_prime = self.sem_refine_proj(self.afem(ts_raw))                  # [B, in_planes]
-            
-            # 7. Optional semantic refinement path (AFEM + proj)
-            #    We build Ts_prime depending on the ablation flags.
-            #
-            #    Case A (full): AFEM(ts_raw) -> sem_refine_proj -> Ts_prime
-            #    Case B (no AFEM but still project): ts_raw -> sem_refine_proj
-            #    Case C (no refine at all): Ts_prime = 0
-            #
+            ts_raw = _clip_pool(out)  # [B, D_clip]
+            Tu = self.fuse_fc(torch.cat([global_feat, ts_raw], dim=1))  # [B,C]
             if self.clip_use_sem_refine:
-                if self.clip_use_afem:
-                    ts_ref = self.afem(ts_raw)                       # AFEM on TinyCLIP feat
-                else:
-                    ts_ref = ts_raw                                  # bypass AFEM
-                Ts_prime = self.sem_refine_proj(ts_ref)              # [B, in_planes]
+                ts_ref = self.afem(ts_raw) if self.clip_use_afem else ts_raw
+                Ts_prime = self.sem_refine_proj(ts_ref)
             else:
-                Ts_prime = torch.zeros_like(Tu)                      # no refine branch
+                Ts_prime = torch.zeros_like(Tu)
+            pre_bn_global = Tu + Ts_prime
 
-            # final fused global feature replaces the old global_feat for downstream heads/losses
-            global_feat = Tu + Ts_prime
+        else:
+            # No CLIP: keep original global pre-BN
+            pre_bn_global = global_feat
 
-        # pre-BN feature for downstream heads/losses (works with or without CLIP)
-        pre_bn_global = global_feat
-
-        # BNNecks
+        # ---------------- BN necks ----------------
         feat_bn_global = self.bottleneck(pre_bn_global)
         local_feat_1_bn = self.bottleneck_1(local_feat_1)
         local_feat_2_bn = self.bottleneck_2(local_feat_2)
         local_feat_3_bn = self.bottleneck_3(local_feat_3)
         local_feat_4_bn = self.bottleneck_4(local_feat_4)
 
-        # SupCon feature
+        # ---------------- SupCon ----------------
         z_supcon = None
         if self.training and self.supcon_enabled:
             sup_in = feat_bn_global if self.supcon_feat_src == "bnneck" else pre_bn_global
             if not self._supcon_log_done:
-                print(f"[make_model][combo] [SupCon] src=model::{self.supcon_feat_src}")
+                print(f"[make_model][combo] [SupCon] src=model::{self.supcon_feat_src} | head=2xLinear(->128) | "
+                      f"output=UN-normalized (L2 in SupConLoss)")
                 self._supcon_log_done = True
             z_supcon = self.supcon_head(sup_in)
 
+        # ---------------- Heads & returns ----------------
         if self.training:
-            cls_score = self.classifier(feat_bn_global)
+            if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
+                cls_score = self.classifier(feat_bn_global, label)
+            else:
+                cls_score = self.classifier(feat_bn_global)
             scores = [
                 cls_score,
                 self.classifier_1(local_feat_1_bn),
@@ -823,22 +863,19 @@ class build_transformer_local(nn.Module):
                 self.classifier_4(local_feat_4_bn)
             ]
             feats = [pre_bn_global, local_feat_1, local_feat_2, local_feat_3, local_feat_4]
-            feats_bn = [feat_bn_global, local_feat_1_bn, local_feat_2_bn,
-                        local_feat_3_bn, local_feat_4_bn]
+            feats_bn = [feat_bn_global, local_feat_1_bn, local_feat_2_bn, local_feat_3_bn, local_feat_4_bn]
             return scores, feats, feats_bn, z_supcon
         else:
             if self.neck_feat == 'after':
                 return torch.cat(
                     [feat_bn_global,
-                     local_feat_1_bn / 4, local_feat_2_bn / 4,
-                     local_feat_3_bn / 4, local_feat_4_bn / 4],
+                     local_feat_1_bn / 4, local_feat_2_bn / 4, local_feat_3_bn / 4, local_feat_4_bn / 4],
                     dim=1
                 )
             else:
                 return torch.cat(
                     [pre_bn_global,
-                     local_feat_1 / 4, local_feat_2 / 4,
-                     local_feat_3 / 4, local_feat_4 / 4],
+                     local_feat_1 / 4, local_feat_2 / 4, local_feat_3 / 4, local_feat_4 / 4],
                     dim=1
                 )
 
@@ -846,12 +883,10 @@ class build_transformer_local(nn.Module):
         import os
         assert os.path.isfile(trained_path), f"Weight file not found: {trained_path}"
         state = torch.load(trained_path, map_location="cpu")
-
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
         elif isinstance(state, dict) and "model" in state:
             state = state["model"]
-
         clean = {k.replace("module.", ""): v for k, v in state.items()}
         incompatible = self.load_state_dict(clean, strict=strict)
         missing = getattr(incompatible, "missing_keys", [])
@@ -864,7 +899,9 @@ class build_transformer_local(nn.Module):
             print("  unexpected:", unexpected[:12], "..." if len(unexpected) > 12 else "")
 
 
-# ------------------------------ Factory & API --------------------------------
+# -----------------------------------------------------------------------------
+# Factory & API
+# -----------------------------------------------------------------------------
 __factory_T_type = {
     'vit_base_patch16_224_TransReID': vit_base_patch16_224_TransReID,
     'deit_base_patch16_224_TransReID': vit_base_patch16_224_TransReID,

@@ -1,0 +1,119 @@
+# Model B2 (Phased Loss) — TripletX → Triplet; SupCon decays across phases
+# File: deit_transreid_stride_b2_phased_tripletx2triplet.yml
+# Baseline: TransReID + DeiT + official stride
+
+MODEL:
+  NAME: 'transformer'
+  TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
+  PRETRAIN_CHOICE: 'imagenet'
+  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
+
+  # Baseline heads & losses
+  METRIC_LOSS_TYPE: 'triplet'    # TripletX is toggled via LOSS.TRIPLETX.ENABLE
+  ID_LOSS_WEIGHT: 1.0
+  TRIPLET_LOSS_WEIGHT: 1.0
+  IF_LABELSMOOTH: 'off'
+  IF_WITH_CENTER: 'no'
+  NO_MARGIN: False               # Keep for legacy triplet fallback
+  COS_LAYER: False
+
+  # TransReID settings
+  STRIDE_SIZE: [12, 12]
+  SIE_CAMERA: True
+  SIE_VIEW: True
+  SIE_COE: 3.0
+  JPM: True
+  SHIFT_NUM: 8
+  RE_ARRANGE: True
+
+  # CLIP unified switches (disabled to preserve baseline)
+  USE_CLIP: False
+  CLIP_IMPL: "open_clip"
+  CLIP_FUSION: "minimal"
+
+INPUT:
+  SIZE_TRAIN: [256, 256]
+  SIZE_TEST:  [256, 256]
+  PROB: 0.5
+  RE_PROB: 0.8
+  PADDING: 10
+
+DATASETS:
+  NAMES: 'veri'
+  ROOT_DIR: '../datasets'
+
+DATALOADER:
+  SAMPLER: 'softmax_triplet'
+  NUM_WORKERS: 8
+  NUM_INSTANCE: 8                 # Initial K=8 for Phase A; dynamically updated when PHASED.ENABLE=true
+  PHASED:
+    ENABLE: true                  # ← Enable phase-based K switching
+    K_WHEN_TRIPLETX: 8            # Phase A (TripletX)
+    K_OTHER: 4                    # Phase B/C (Triplet)
+
+SOLVER:
+  OPTIMIZER_NAME: 'SGD'
+  MAX_EPOCHS: 120
+  BASE_LR: 0.01
+  IMS_PER_BATCH: 64
+  MARGIN: 0.3
+  WARMUP_METHOD: 'linear'
+  LARGE_FC_LR: False
+  CHECKPOINT_PERIOD: 3            # Save checkpoint every 3 epochs
+  LOG_PERIOD: 50
+  EVAL_PERIOD: 3                  # Evaluate every 3 epochs
+  WEIGHT_DECAY: 1e-4
+  WEIGHT_DECAY_BIAS: 1e-4
+  BIAS_LR_FACTOR: 2
+
+TEST:
+  EVAL: True
+  IMS_PER_BATCH: 256
+  RE_RANKING: False
+  WEIGHT: ''
+  NECK_FEAT: 'before'
+  FEAT_NORM: 'yes'
+
+LOSS:
+  # ===== Global phased-loss schedule =====
+  PHASED:
+    ENABLE: true
+    BOUNDARIES: [30, 60]                 # Phase A: 0–30, Phase B: 30–60, Phase C: 60–120
+    METRIC_SEQ: ['tripletx','triplet','triplet']   # Use TripletX in A, Triplet in B/C
+    W_METRIC_SEQ: [1.2, 1.0, 1.0]        # Metric loss weights for each phase
+    W_SUP_SPEC: ['const:0.30','linear:0.30->0.15','const:0.0']  # SupCon weight schedule
+    TRIPLETX_END: 30                     # End of TripletX stage (used in make_loss)
+
+  # ===== TripletX (enhanced triplet loss) =====
+  TRIPLETX:
+    ENABLE: true
+    MARGIN: 0.30
+    SOFT_WARMUP: true
+    WARMUP_EPOCHS: 10
+    K: 5
+    ALPHA: 2.0
+    CROSS_CAM_POS: true
+    SAME_CAM_NEG_BOOST: 1.2
+    NORM_FEAT: true                      # ← Enable L2 normalization
+    FEAT_SRC: 'pre_bn'                   # Default feature route
+
+  # ===== Standard Triplet (for B/C phases) =====
+  TRIPLET:
+    FEAT_SRC: 'pre_bn'
+
+  # ===== SupCon (weight controlled by phased schedule) =====
+  SUPCON:
+    ENABLE: true                         # Enabled; weight decays according to W_SUP_SPEC
+    W: 0.30                              # Initial value (Phase A)
+    T: 0.07
+    CAM_AWARE: True
+    POS_RULE: "class"
+    FEAT_SRC: 'bnneck'
+    # Below fields are used only when phased schedule is disabled
+    W0: 0.30
+    DECAY_TYPE: "const"
+    DECAY_START: 9999
+    DECAY_END: 10000
+
+# OUTPUT_DIR is controlled by the runner (via --opts) to prevent overwrite conflicts
+# OUTPUT_DIR: '../logs/veri_deit_transreid_stride_b2_phased_tripletx2triplet'

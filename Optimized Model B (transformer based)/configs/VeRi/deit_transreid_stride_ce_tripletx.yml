@@ -1,0 +1,91 @@
+MODEL:
+  PRETRAIN_CHOICE: 'imagenet'                        # Use ImageNet pretrained weights
+  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
+  NAME: 'transformer'                                # TransReID transformer model
+  TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
+  STRIDE_SIZE: [12, 12]                              # Official stride for TransReID
+  SIE_CAMERA: True                                   # Enable SIE (camera-aware tokens)
+  SIE_VIEW: True                                     # Enable SIE (view-aware tokens)
+  SIE_COE: 3.0                                       # SIE coefficient
+  JPM: True                                          # Enable JPM locals
+  SHIFT_NUM: 8                                       # JPM shift steps
+  RE_ARRANGE: True                                   # Token rearrangement for JPM
+
+  # Loss plumbing (keep baseline triplet type; TripletX is enabled below)
+  METRIC_LOSS_TYPE: 'triplet'
+  NO_MARGIN: True                                    # Soft-margin mode by default
+  IF_LABELSMOOTH: 'off'
+  IF_WITH_CENTER: 'no'
+  ID_LOSS_WEIGHT: 1.0
+  TRIPLET_LOSS_WEIGHT: 0.0                           # Disable legacy Triplet branch explicitly
+
+INPUT:
+  SIZE_TRAIN: [256, 256]
+  SIZE_TEST:  [256, 256]
+  PROB: 0.5
+  RE_PROB: 0.8
+  PADDING: 10
+
+DATASETS:
+  NAMES: 'veri'                                      # VeRi-776
+  ROOT_DIR: '../datasets'
+
+DATALOADER:
+  SAMPLER: 'softmax_triplet'                         # P×K sampler
+  NUM_INSTANCE: 4                                    # K in P×K (kept at 4 for this single-run config)
+  NUM_WORKERS: 8
+  PHASED:
+    ENABLE: False                                    # No epoch-phase switching in this config
+
+SOLVER:
+  OPTIMIZER_NAME: 'SGD'
+  MAX_EPOCHS: 120
+  BASE_LR: 0.01
+  IMS_PER_BATCH: 64
+  WARMUP_METHOD: 'linear'
+  LARGE_FC_LR: False
+  CHECKPOINT_PERIOD: 3                               # Save checkpoint every 3 epochs (optional)
+  LOG_PERIOD: 50
+  EVAL_PERIOD: 3                                     # Evaluate every 3 epochs (optional)
+  WEIGHT_DECAY: 1e-4
+  WEIGHT_DECAY_BIAS: 1e-4
+  BIAS_LR_FACTOR: 2
+  MARGIN: 0.3                                        # Kept for legacy compatibility
+
+TEST:
+  EVAL: True
+  IMS_PER_BATCH: 256
+  RE_RANKING: False
+  WEIGHT: ''
+  NECK_FEAT: 'before'                                # Use pre-BN features for testing
+  FEAT_NORM: 'yes'
+
+LOSS:
+  PHASED:
+    ENABLE: False                                    # Not using phased loss schedule here
+
+  TRIPLET:
+    FEAT_SRC: 'pre_bn'                               # Source when/if legacy Triplet is used
+
+  TRIPLETX:
+    ENABLE: True                                     # Turn on TripletX
+    FEAT_SRC: 'pre_bn'                               # Use pre-BN features for distance
+    NORM_FEAT: True                                  # L2-normalize features inside TripletX
+    MARGIN: 0.30                                     # Hinge margin after warmup
+    SOFT_WARMUP: True                                # Softplus warmup in early epochs
+    WARMUP_EPOCHS: 10                                # Warmup length
+    K: 5                                             # Default Top-k hard mining
+    ALPHA: 2.0                                       # Hardness-aware sample weighting
+    CROSS_CAM_POS: True                              # Prefer cross-camera positives
+    SAME_CAM_NEG_BOOST: 1.2                          # Boost same-camera negatives (harder)
+    W: 1.0                                           # Loss weight of TripletX
+
+  SUPCON:
+    ENABLE: False                                    # Disabled for this run
+    W: 0.30
+    T: 0.07
+    CAM_AWARE: True
+    POS_RULE: 'class'
+    FEAT_SRC: 'bnneck'
+
+OUTPUT_DIR: './logs/veri_transreid_tripletx_topk8'   # Output directory for logs/checkpoints

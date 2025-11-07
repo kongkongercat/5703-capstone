@@ -2,7 +2,7 @@
 # =============================================================================
 # File: tripletx_loss.py
 # Description: Enhanced Triplet Loss (TripletLossX) with 5 improvements
-#              (L2, top-k hard, margin schedule, camera-aware, hardness-aware)
+#              (BNNeck+L2, top-k hard, margin schedule, camera-aware, hardness-aware)
 #              for vehicle Re-ID on VeRi-776.
 #
 # Based on: triplet_loss.py (original baseline TripletLoss implementation)
@@ -16,14 +16,6 @@
 # [2025-10-09 | Hang Zhang] FIX: Added cross-camera positive fallback to avoid -inf/+inf
 # [2025-10-09 | Hang Zhang] FIX: Ensured finite top-k selection via row-wise fallback and cleanup
 # [2025-10-09 | Hang Zhang] FIX: Safe reduction using nan_to_num() and weight normalization
-# [2025-10-18 | Hang Zhang] CHANGE: Remove all "row-wise fallback" and "pos_all fallback";
-#                           skip anchors with no positive/negative via valid_mask during reduction.
-# [2025-10-18 | Hang Zhang] CHANGE: _topk_mean() adds `fallback_when_empty=False` (default);
-#                           invalid rows remain invalid (masked out later).
-# [2025-10-21 | Hang Zhang] REVERT: Restore row-wise fallback & pos-all fallback removed on 2025-10-18;
-#                           - _topk_mean(): default fallback_when_empty=True (legacy)
-#                           - _make_masks(): if cross-cam positives empty, fallback to all positives
-#                           - Keep valid_mask & nan_to_num() safety reduction
 # =============================================================================
 
 import torch
@@ -43,19 +35,10 @@ def _euclidean_dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return dist
 
 
-def _topk_mean(
-    dist_mat: torch.Tensor,
-    mask: torch.Tensor,
-    k: int = 5,
-    largest: bool = False,
-    fallback_when_empty: bool = True,  # REVERT: default True (legacy row-wise fallback)
-) -> torch.Tensor:
+def _topk_mean(dist_mat: torch.Tensor, mask: torch.Tensor, k: int = 5, largest: bool = False) -> torch.Tensor:
     """
-    Stable top-k mean under masking.
-
-    If a row has no valid entries (mask=False for all columns):
-    - When `fallback_when_empty` is True (default), the row falls back to "whole row minus diagonal".
-    - When False, the row remains invalid (all fill_val) and should be skipped by a later valid_mask.
+    Stable top-k mean under masking, with per-row fallback to "whole row minus self".
+    Ensures finite outputs even when a row has no True in mask.
     """
     N = dist_mat.size(0)
     device = dist_mat.device
@@ -64,16 +47,12 @@ def _topk_mean(
     fill_val = float("-inf") if largest else float("inf")
     work = dist_mat.masked_fill(~mask, fill_val)
 
+    # Fallback: rows with no valid entries -> whole row minus diagonal
     row_has_any = mask.any(dim=1)
-    rows_empty = ~row_has_any
-    if rows_empty.any():
-        if fallback_when_empty:
-            # Legacy fallback: use the whole row except diagonal
-            fallback_mask = ~eye
-            work[rows_empty] = dist_mat[rows_empty].masked_fill(~fallback_mask[rows_empty], fill_val)
-        else:
-            # Keep invalid
-            work[rows_empty] = torch.full_like(work[rows_empty], fill_val)
+    if (~row_has_any).any():
+        rows = ~row_has_any
+        fallback_mask = ~eye
+        work[rows] = dist_mat[rows].masked_fill(~fallback_mask[rows], fill_val)
 
     k_eff = max(1, min(k, N - 1))
     vals, _ = torch.topk(work, k=k_eff, dim=1, largest=largest)
@@ -128,18 +107,13 @@ class TripletLossX(nn.Module):
         labels: torch.Tensor,
         camids: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Build positive/negative masks with camera-aware option.
-        REVERT (2025-10-21): If cross-camera positives are empty for an anchor, fall back to "all positives".
-        """
         N = labels.size(0)
         labels = labels.view(-1, 1)
+        is_pos = labels.eq(labels.t())
+        is_neg = ~is_pos
         eye = torch.eye(N, dtype=torch.bool, device=labels.device)
-
-        # Base positives/negatives (ignore diagonal)
-        is_pos_all = labels.eq(labels.t())
-        is_pos_all = is_pos_all & (~eye)
-        is_neg = ~is_pos_all & (~eye)
+        is_pos = is_pos & (~eye)
+        is_neg = is_neg & (~eye)
 
         same_cam = None
         if camids is not None:
@@ -147,17 +121,7 @@ class TripletLossX(nn.Module):
             same_cam = camids.eq(camids.t())
             if self.cross_cam_pos:
                 cross_cam = ~same_cam
-                is_pos = is_pos_all & cross_cam  # cross-camera positives only
-                # REVERT: pos-all fallback when cross-camera pos is empty for some anchors
-                has_pos = is_pos.any(dim=1)
-                if (~has_pos).any():
-                    rows = (~has_pos).nonzero(as_tuple=False).view(-1)
-                    is_pos[rows] = is_pos_all[rows]
-            else:
-                is_pos = is_pos_all
-        else:
-            is_pos = is_pos_all
-
+                is_pos = is_pos & cross_cam
         return is_pos, is_neg, same_cam
 
     def forward(
@@ -171,16 +135,24 @@ class TripletLossX(nn.Module):
         x = _l2_normalize(feats) if self.normalize_feature else feats
 
         if self.debug_checks and (not torch.isfinite(x).all()):
-            print("[TripletLossX] Non-finite features detected before distance computation.")
+            print("[TripletX] Non-finite features detected before distance computation.")
 
         dist = _euclidean_dist(x, x)
         if self.debug_checks and (not torch.isfinite(dist).all()):
-            print("[TripletLossX] Non-finite pairwise distances detected.")
+            print("[TripletX] Non-finite pairwise distances detected.")
 
-        # Build masks (with pos-all fallback when needed)
+        # Build masks
         is_pos, is_neg, same_cam = self._make_masks(labels, camids)
 
-        # (4) Camera-aware: boost same-camera negatives (distance shrink for same-cam negatives)
+        # [FIX 2025-10-09] Cross-camera positive fallback
+        with torch.no_grad():
+            pos_all = (labels.view(-1, 1).eq(labels.view(1, -1))) & \
+                      (~torch.eye(labels.size(0), dtype=torch.bool, device=labels.device))
+            no_pos = (is_pos.sum(dim=1) == 0)
+            if no_pos.any():
+                is_pos[no_pos] = pos_all[no_pos]
+
+        # (4) Camera-aware: boost same-camera negatives
         if same_cam is not None and self.same_cam_neg_boost > 1.0:
             bias_mask = is_neg & same_cam
             neg_bias = torch.ones_like(dist).masked_fill(bias_mask, self.same_cam_neg_boost)
@@ -188,34 +160,27 @@ class TripletLossX(nn.Module):
         else:
             dist_neg_sel = dist
 
-        # (2) Top-k hard mining WITH row-wise fallback enabled (legacy default)
-        d_ap = _topk_mean(dist,        is_pos, k=self.k, largest=True,  fallback_when_empty=True)
-        d_an = _topk_mean(dist_neg_sel, is_neg, k=self.k, largest=False, fallback_when_empty=True)
+        # (2) Top-k hard mining (finite safe)
+        d_ap = _topk_mean(dist, is_pos, k=self.k, largest=True)
+        d_an = _topk_mean(dist_neg_sel, is_neg, k=self.k, largest=False)
 
         if self.debug_checks:
             if (not torch.isfinite(d_ap).all()) or (not torch.isfinite(d_an).all()):
-                print("[TripletLossX] Non-finite d_ap/d_an detected.")
+                print("[TripletX] Non-finite d_ap/d_an detected.")
 
-        # Valid anchors (still keep safety mask; with fallbacks most anchors will be valid)
-        with torch.no_grad():
-            has_pos = is_pos.any(dim=1)
-            has_neg = is_neg.any(dim=1)
-            valid_mask = (has_pos & has_neg).float()
-
-        # (5) Hardness-aware weighting (masked by valid anchors)
+        # (5) Hardness-aware weighting
         with torch.no_grad():
             w = torch.sigmoid(self.alpha * (d_ap - d_an))
             w = w / (w.mean().clamp_min(1e-12))
-            w = w * valid_mask  # skip invalid anchors if any
 
         # (3) Margin schedule (warmup)
         if self.use_soft_warmup and (epoch is not None) and (epoch < self.warmup_epochs):
-            per_sample = self.softplus(d_ap - d_an)  # softplus(-(d_an - d_ap))
+            per_sample = self.softplus(-(d_an - d_ap))
         else:
             y = torch.ones_like(d_an)
             per_sample = self.rank_hinge(d_an, d_ap, y)
 
-        # Safe reduction
+        # [FIX 2025-10-09] Safe reduction
         per_sample = torch.nan_to_num(per_sample, nan=0.0, posinf=0.0, neginf=0.0)
         w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
         loss = (w * per_sample).sum() / w.sum().clamp_min(1e-12)

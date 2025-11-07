@@ -1,0 +1,69 @@
+# -----------------------------------------------------------------------------
+# Change Log (for this config file)
+# [2025-11-04 | Hang Zhang] Updated after 2025-11-04 model merge (OpenCLIP/TinyCLIP switch framework).
+#                           - File name: deit_transreid_stride_ce_triplet_320tinyclip0.2_noafem.yml
+#                           - Configured for TinyCLIP (HF branch) with 320×320 input.
+#                           - Enabled MODEL.USE_CLIP=True and CLIP_IMPL="hf".
+#                           - Applied LR scale = 0.2, separate learning rate for CLIP.
+#                           - Disabled AFEM module (no-AFEM variant), kept semantic refine active.
+#                           - All other parameters follow the latest defaults.py baseline.
+# -----------------------------------------------------------------------------
+
+MODEL:
+  NAME: 'transformer'
+  TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
+  STRIDE_SIZE: [12, 12]
+  SIE_CAMERA: True
+  SIE_VIEW: True
+  SIE_COE: 3.0
+  JPM: True
+  RE_ARRANGE: True
+  SHIFT_NUM: 8
+
+  PRETRAIN_CHOICE: 'imagenet'
+  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
+
+  # === Loss setup ===
+  METRIC_LOSS_TYPE: 'triplet'
+  NO_MARGIN: True
+  IF_LABELSMOOTH: 'off'
+  IF_WITH_CENTER: 'no'
+  ID_LOSS_WEIGHT: 1.0
+  TRIPLET_LOSS_WEIGHT: 1.0
+
+  # === CLIP (TinyCLIP, HF implementation) ===
+  USE_CLIP: True
+  CLIP_IMPL: "hf"                           # {"open_clip" | "hf"}
+  CLIP_HF_ID: "wkcn/TinyCLIP-ViT-61M-32-Text-29M-LAION400M"
+  CLIP_LOCAL_PATH: ""                       # empty to use HuggingFace hub
+  CLIP_INPUT_SIZE: [320, 320]               # match the 320×320 training resolution
+  CLIP_FINETUNE: True
+  CLIP_SEPARATE_LR: True
+  CLIP_LR_SCALE: 0.2                        # learning-rate multiplier for CLIP
+
+  # AFEM / refinement ablation flags
+  CLIP_USE_AFEM: False                      # disable AFEM module (no-AFEM variant)
+  CLIP_USE_SEM_REFINE: True                 # keep semantic-refine projection active
+
+INPUT:
+  SIZE_TRAIN: [320, 320]
+  SIZE_TEST: [320, 320]
+
+LOSS:
+  PHASED:
+    ENABLE: False
+
+  TRIPLET:
+    FEAT_SRC: 'pre_bn'                      # use pre-BN features for Triplet loss
+
+  SUPCON:
+    ENABLE: False
+    FEAT_SRC: 'pre_bn'
+    W: 0.30
+    T: 0.07
+    CAM_AWARE: False
+    POS_RULE: "class"
+    W0: 0.30
+    DECAY_TYPE: "const"
+    DECAY_START: 0
+    DECAY_END: 0
