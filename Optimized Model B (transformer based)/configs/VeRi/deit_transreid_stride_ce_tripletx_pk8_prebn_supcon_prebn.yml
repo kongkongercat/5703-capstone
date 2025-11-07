@@ -1,0 +1,92 @@
+MODEL:
+  NAME: 'transformer'
+  TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
+  STRIDE_SIZE: [12, 12]
+  PRETRAIN_CHOICE: 'imagenet'
+  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
+
+  # Supervised training mode
+  TRAINING_MODE: 'supervised'
+
+  # CLIP module disabled (pure supervised setting)
+  USE_CLIP: False
+
+# -----------------------------------------------------------------------------
+# LOSS CONFIGURATION
+# -----------------------------------------------------------------------------
+LOSS:
+  # ---------------- TripletX (Enhanced Metric Learning) ----------------
+  TRIPLETX:
+    ENABLE: True                     # Enable TripletX
+    W: 1.0                           # Loss weight for TripletX
+    FEAT_SRC: 'pre_bn'               # Use pre-BN (backbone) features
+    NORM_FEAT: True                  # Apply L2 normalization before distance calculation
+    MARGIN: 0.30                     # Margin value for hinge loss
+    SOFT_WARMUP: True                # Use soft-margin warmup at early epochs
+    WARMUP_EPOCHS: 10                # Number of warmup epochs
+    K: 8                             # Top-k hard sample mining
+    ALPHA: 2.0                       # Hardness-aware weighting factor
+    CROSS_CAM_POS: True              # Allow cross-camera positive mining
+    SAME_CAM_NEG_BOOST: 1.2          # Boost same-camera negatives
+
+  # ---------------- SupCon (Supervised Contrastive Learning) ----------------
+  SUPCON:
+    ENABLE: True                     # Enable SupCon loss
+    W: 0.30                          # Static SupCon weight
+    T: 0.07                          # Temperature parameter
+    CAM_AWARE: True                  # Camera-aware positive sampling
+    POS_RULE: "class"                # Positive pairs follow class-based rule
+    FEAT_SRC: 'pre_bn'               # Use pre-BN features for consistent semantic space
+
+  # ---------------- Phased loss (disabled) ----------------
+  PHASED:
+    ENABLE: False                    # No epoch-based phase switching
+
+  # ---------------- Brightness weighting (disabled) ----------------
+  BRIGHTNESS:
+    ENABLE: False                    # No brightness-aware training
+
+# -----------------------------------------------------------------------------
+# INPUT / DATA LOADING
+# -----------------------------------------------------------------------------
+INPUT:
+  SIZE_TRAIN: [256, 256]             # Training image size
+  SIZE_TEST: [256, 256]              # Testing image size
+
+DATALOADER:
+  SAMPLER: 'softmax_triplet'         # P×K sampling for metric learning
+  NUM_INSTANCE: 8                    # K=8 (each identity has 8 images)
+  NUM_WORKERS: 8                     # Number of data loading threads
+
+# -----------------------------------------------------------------------------
+# SOLVER / OPTIMIZATION
+# -----------------------------------------------------------------------------
+SOLVER:
+  OPTIMIZER_NAME: "SGD"              # Use stochastic gradient descent
+  BASE_LR: 0.01                      # Base learning rate
+  WEIGHT_DECAY: 1e-4                 # Weight decay for regularization
+  MOMENTUM: 0.9                      # Momentum factor
+  MAX_EPOCHS: 120                    # Total number of training epochs
+  STEPS: (40, 70)                    # LR decay milestones
+  WARMUP_EPOCHS: 5                   # Linear warmup stage
+  IMS_PER_BATCH: 64                  # Batch size per iteration
+
+# -----------------------------------------------------------------------------
+# TEST / EVALUATION
+# -----------------------------------------------------------------------------
+TEST:
+  IMS_PER_BATCH: 256                 # Batch size during evaluation
+  FEAT_NORM: 'yes'                   # Normalize features before distance computation
+  EVAL: True                         # Enable evaluation after training
+
+# -----------------------------------------------------------------------------
+# DATASET CONFIGURATION
+# -----------------------------------------------------------------------------
+DATASETS:
+  NAMES: 'veri'                      # Dataset name (VeRi-776)
+  ROOT_DIR: '../datasets'            # Dataset path
+
+# -----------------------------------------------------------------------------
+# OUTPUT CONFIGURATION
+# -----------------------------------------------------------------------------
+OUTPUT_DIR: './logs/deit_transreid_stride_ce_tripletx_pk8_prebn_supcon_prebn'
