@@ -698,7 +698,6 @@ def make_loss(cfg, num_classes):
                     phase_use_tx = False  # logged as Split
             # === Single-path (fallback / brightness OFF / split disabled) ===
             if not did_split and (sampler != "random"):
-                # ---- 新逻辑开始：优先用 PHASED 表，其次回退 TRIPLETX_END ----
                 desired_kind = None
                 desired_w = 0.0
                 if phased_on and (epoch is not None):
@@ -709,10 +708,18 @@ def make_loss(cfg, num_classes):
                 if desired_kind is None:
                     if phased_on and (epoch is not None) and (TripletXLoss is not None) and tripletx_cfg_enabled:
                         phase_use_tx = (int(epoch) <= int(tripletx_end))
+                        desired_kind = ("tripletx" if phase_use_tx else "triplet")
+                        desired_w    = (tx_w if phase_use_tx else tri_w)
                     else:
-                        phase_use_tx = False
-                    desired_kind = ("tripletx" if phase_use_tx else "triplet")
-                    desired_w = (tx_w if phase_use_tx else tri_w)
+                        if (TripletXLoss is not None) and tripletx_cfg_enabled and (tx_w > 0.0) and (tri_w == 0.0):
+                            phase_use_tx = True
+                            desired_kind = "tripletx"
+                            desired_w    = tx_w
+                        else:
+                            phase_use_tx = False
+                            desired_kind = "triplet"
+                            desired_w    = tri_w
+
                 else:
                     phase_use_tx = (desired_kind == "tripletx")
 
@@ -744,7 +751,11 @@ def make_loss(cfg, num_classes):
                         TRI_LOSS = _call_triplet_core(tri_in)
                     total += metric_w_eff * TRI_LOSS
                     metric_w_eff_for_log = metric_w_eff
-
+                else:
+                    if _combo_logged.get("metric_off_once", False) is False:
+                        print("[make_loss][info] Metric off (tri_w=%.3f, tx_enabled=%s, tx_w=%.3f)"
+                            % (tri_w, str(tripletx_cfg_enabled), tx_w))
+                        _combo_logged["metric_off_once"] = True
 
         # --- SupCon ---
         if supcon_enabled and eff_w > 0.0:
