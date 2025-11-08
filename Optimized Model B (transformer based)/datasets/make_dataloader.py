@@ -1,6 +1,12 @@
 # ==========================================
 # Change Log
-# [2025-09-21 | Zeyu Yang] Add random sampling method
+# [2025-09-21 | Zeyu Yang] Add random sampling method for ssl learning
+# [2025-11-08 | Hang Zhang]
+        # PATCH: Added phased-K adjustment for TripletX / SupCon stages
+        # - Dynamically switches cfg.DATALOADER.NUM_INSTANCE according to
+        #   currently active loss type (TripletX / SupCon / Other)
+        # - Enables K_WHEN_SUPCON to take effect in non-independent SupCon phases
+        # - Prints debug info to verify the applied K at runtime
 # ==========================================
 
 import torch
@@ -87,13 +93,34 @@ def make_dataloader(cfg):
                 pin_memory=True,
             )
         else:
+            # --- [PATCH] Phased K adjustment (TripletX / SupCon) ---
+            if getattr(cfg.DATALOADER, "PHASED", None) and cfg.DATALOADER.PHASED.ENABLE:
+                # Dynamically adjust K based on the currently active loss type
+                if cfg.LOSS.TRIPLETX.ENABLE:
+                    cfg.DATALOADER.NUM_INSTANCE = cfg.DATALOADER.PHASED.K_WHEN_TRIPLETX
+                elif cfg.LOSS.SUPCON.ENABLE:
+                    cfg.DATALOADER.NUM_INSTANCE = cfg.DATALOADER.PHASED.K_WHEN_SUPCON
+                else:
+                    cfg.DATALOADER.NUM_INSTANCE = cfg.DATALOADER.PHASED.K_OTHER
+
+                # Debug message for verification during runtime
+                print(f"[phased_K] active_loss: "
+                      f"TripletX={cfg.LOSS.TRIPLETX.ENABLE}, "
+                      f"SupCon={cfg.LOSS.SUPCON.ENABLE}, "
+                      f"K={cfg.DATALOADER.NUM_INSTANCE}")
+
+            # === Build DataLoader ===
             train_loader = DataLoader(
                 train_set,
                 batch_size=cfg.SOLVER.IMS_PER_BATCH,
-                sampler=RandomIdentitySampler(dataset.train, cfg.SOLVER.IMS_PER_BATCH, cfg.DATALOADER.NUM_INSTANCE),
+                sampler=RandomIdentitySampler(
+                    dataset.train,
+                    cfg.SOLVER.IMS_PER_BATCH,
+                    cfg.DATALOADER.NUM_INSTANCE),
                 num_workers=num_workers,
                 collate_fn=train_collate_fn
             )
+
 
     elif cfg.DATALOADER.SAMPLER == 'softmax':
         print('using softmax sampler')
@@ -106,7 +133,6 @@ def make_dataloader(cfg):
         )
 
     elif cfg.DATALOADER.SAMPLER == 'random':
-        # 严格SSL：不依赖标签的随机采样
         if cfg.MODEL.DIST_TRAIN:
             print('DIST_TRAIN START (random)')
             world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
