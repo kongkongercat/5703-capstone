@@ -1,0 +1,155 @@
+# -------------------------------------------------------------------------
+# Model B (TransReID + DeiT stride) — Phased Loss Schedule
+#  A: CE + Triplet (0–40 epochs)
+#  B: CE + TripletX + SupCon (40–80 epochs)
+#  C: CE + Triplet + SupCon (80–120 epochs; SupCon linearly decays to 0)
+# -------------------------------------------------------------------------
+
+MODEL:
+  NAME: 'transformer'
+  TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
+  STRIDE_SIZE: [12, 12]
+  PRETRAIN_CHOICE: 'imagenet'
+  PRETRAIN_PATH: ''
+  NECK: 'bnneck'
+  ID_LOSS_TYPE: 'softmax'
+  ID_LOSS_WEIGHT: 1.0
+  METRIC_LOSS_TYPE: 'triplet'
+  TRIPLET_LOSS_WEIGHT: 1.0
+  NO_MARGIN: True
+  IF_LABELSMOOTH: 'off'
+  COS_LAYER: False
+  JPM: True
+  SHIFT_NUM: 8
+  SHUFFLE_GROUP: 2
+  DEVIDE_LENGTH: 4
+  RE_ARRANGE: True
+  SIE_COE: 3.0
+  SIE_CAMERA: True
+  SIE_VIEW: True
+  TRAINING_MODE: 'supervised'
+  USE_CLIP: False
+
+# -------------------------------------------------------------------------
+# Data and augmentation
+# -------------------------------------------------------------------------
+INPUT:
+  SIZE_TRAIN: [256, 256]
+  SIZE_TEST: [256, 256]
+  PROB: 0.5
+  RE_PROB: 0.8
+  PIXEL_MEAN: [0.485, 0.456, 0.406]
+  PIXEL_STD: [0.229, 0.224, 0.225]
+  PADDING: 10
+
+DATASETS:
+  NAMES: 'veri'
+  ROOT_DIR: '../datasets'
+
+# -------------------------------------------------------------------------
+# Dataloader configuration (phased K sampling)
+# -------------------------------------------------------------------------
+DATALOADER:
+  NUM_WORKERS: 8
+  SAMPLER: 'softmax_triplet'
+  NUM_INSTANCE: 4
+  PHASED:
+    ENABLE: True
+    K_WHEN_TRIPLETX: 8        # stronger mining during TripletX stage
+    K_WHEN_SUPCON: 8          # same expansion during SupCon stage
+    K_OTHER: 4                # smaller K for early/late stable stages
+
+# -------------------------------------------------------------------------
+# Solver setup
+# -------------------------------------------------------------------------
+SOLVER:
+  OPTIMIZER_NAME: 'SGD'
+  MAX_EPOCHS: 120
+  BASE_LR: 0.01
+  LARGE_FC_LR: False
+  BIAS_LR_FACTOR: 2
+  MOMENTUM: 0.9
+  WEIGHT_DECAY: 1.0e-4
+  WEIGHT_DECAY_BIAS: 1.0e-4
+  GAMMA: 0.1
+  STEPS: (40, 70)
+  MARGIN: 0.3
+  WARMUP_FACTOR: 0.01
+  WARMUP_EPOCHS: 5
+  WARMUP_METHOD: 'linear'
+  CHECKPOINT_PERIOD: 120
+  LOG_PERIOD: 50
+  EVAL_PERIOD: 120
+  IMS_PER_BATCH: 64
+  COSINE_MARGIN: 0.5
+  COSINE_SCALE: 30
+  CENTER_LR: 0.5
+  CENTER_LOSS_WEIGHT: 0.0005
+  SEED: 0
+
+# -------------------------------------------------------------------------
+# Loss configuration with phased scheduling
+# -------------------------------------------------------------------------
+LOSS:
+  # --- Base Triplet ---
+  TRIPLET:
+    FEAT_SRC: 'pre_bn'
+
+  # --- Enhanced TripletX (activated in mid-phase) ---
+  TRIPLETX:
+    ENABLE: True
+    W: 1.0
+    MARGIN: 0.30
+    SOFT_WARMUP: True
+    WARMUP_EPOCHS: 5
+    K: 5
+    ALPHA: 2.0
+    CROSS_CAM_POS: True
+    SAME_CAM_NEG_BOOST: 1.2
+    NORM_FEAT: True
+    FEAT_SRC: 'pre_bn'
+
+  # --- SupCon loss (active in mid and late phases) ---
+  SUPCON:
+    ENABLE: True
+    W: 0.30                  # nominal; actual weight controlled by PHASED.W_SUP_SPEC
+    T: 0.07
+    CAM_AWARE: True
+    POS_RULE: 'class'
+    FEAT_SRC: 'bnneck'
+    W0: 0.30
+    DECAY_TYPE: 'linear'
+    DECAY_START: 80
+    DECAY_END: 120
+
+  # --- Brightness gating (disabled; time-based schedule only) ---
+  BRIGHTNESS:
+    ENABLE: False
+    THRESH: 0.35
+    K: 0.08
+
+  # --- Phased scheduling definition ---
+  PHASED:
+    ENABLE: True
+    BOUNDARIES: [40, 80]          # early: 0–40, middle: 40–80, late: 80–120
+    METRIC_SEQ: ['triplet', 'tripletx', 'triplet']
+    W_METRIC_SEQ: [1.0, 1.0, 1.0]
+    W_SUP_SPEC: ['const:0.0', 'const:0.30', 'const:0.30']
+    TRIPLETX_END: 80
+
+# -------------------------------------------------------------------------
+# Evaluation
+# -------------------------------------------------------------------------
+TEST:
+  IMS_PER_BATCH: 256
+  RE_RANKING: False
+  WEIGHT: ''
+  NECK_FEAT: 'before'
+  FEAT_NORM: 'yes'
+  DIST_MAT: 'dist_mat.npy'
+  EVAL: True
+
+# -------------------------------------------------------------------------
+# Output directory
+# -------------------------------------------------------------------------
+OUTPUT_DIR: ''

@@ -181,6 +181,7 @@ _C.DATALOADER.NUM_INSTANCE = 4
 _C.DATALOADER.PHASED = CN()
 _C.DATALOADER.PHASED.ENABLE = False
 _C.DATALOADER.PHASED.K_WHEN_TRIPLETX = 8
+_C.DATALOADER.PHASED.K_WHEN_SUPCON = 8     # NEW
 _C.DATALOADER.PHASED.K_OTHER = 4
 
 # -----------------------------------------------------------------------------
