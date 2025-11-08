@@ -1,12 +1,6 @@
 # ==========================================
 # Change Log
-# [2025-09-21 | Zeyu Yang] Add random sampling method for ssl learning
-# [2025-11-08 | Hang Zhang]
-        # PATCH: Added phased-K adjustment for TripletX / SupCon stages
-        # - Dynamically switches cfg.DATALOADER.NUM_INSTANCE according to
-        #   currently active loss type (TripletX / SupCon / Other)
-        # - Enables K_WHEN_SUPCON to take effect in non-independent SupCon phases
-        # - Prints debug info to verify the applied K at runtime
+# [2025-09-21 | Zeyu Yang] Add random sampling method
 # ==========================================
 
 import torch
@@ -93,45 +87,10 @@ def make_dataloader(cfg):
                 pin_memory=True,
             )
         else:
-            # --- [PATCH] Improved Phased-K adjustment (auto-detect active losses) ---
-            if getattr(cfg.DATALOADER, "PHASED", None) and cfg.DATALOADER.PHASED.ENABLE:
-                # Check both the dataloader-phase flag and the current activation state of TripletX / SupCon losses
-                loss_phased = getattr(cfg.LOSS, "PHASED", None)
-                tripletx_active = cfg.LOSS.TRIPLETX.ENABLE
-                supcon_active = cfg.LOSS.SUPCON.ENABLE
-
-                # If LOSS.PHASED is enabled, further detect active loss types in the current phase (A/B/C)
-                if loss_phased and loss_phased.ENABLE:
-                    try:
-                        # Read the active phase string (e.g., "tripletx_supcon") and check for keywords
-                        phase_active = getattr(cfg.LOSS.PHASED, "ACTIVE", "")
-                        if "tripletx" in phase_active.lower():
-                            tripletx_active = True
-                        if "supcon" in phase_active.lower():
-                            supcon_active = True
-                    except Exception:
-                        pass
-
-                # Determine K based on the combined active-loss status
-                if tripletx_active or supcon_active:
-                    num_instance = cfg.DATALOADER.PHASED.K_WHEN_SUPCON
-                else:
-                    num_instance = cfg.DATALOADER.PHASED.K_OTHER
-            else:
-                num_instance = cfg.DATALOADER.NUM_INSTANCE
-
-            # Debug message for runtime verification
-            print(f"[phased_K] active_loss: TripletX={tripletx_active}, "
-                f"SupCon={supcon_active}, K={num_instance}")
-
-            # === Build DataLoader ===
             train_loader = DataLoader(
                 train_set,
                 batch_size=cfg.SOLVER.IMS_PER_BATCH,
-                sampler=RandomIdentitySampler(
-                    dataset.train,
-                    cfg.SOLVER.IMS_PER_BATCH,
-                    num_instance),   # <-- use the local variable here
+                sampler=RandomIdentitySampler(dataset.train, cfg.SOLVER.IMS_PER_BATCH, cfg.DATALOADER.NUM_INSTANCE),
                 num_workers=num_workers,
                 collate_fn=train_collate_fn
             )
@@ -147,6 +106,7 @@ def make_dataloader(cfg):
         )
 
     elif cfg.DATALOADER.SAMPLER == 'random':
+        # 严格SSL：不依赖标签的随机采样
         if cfg.MODEL.DIST_TRAIN:
             print('DIST_TRAIN START (random)')
             world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1

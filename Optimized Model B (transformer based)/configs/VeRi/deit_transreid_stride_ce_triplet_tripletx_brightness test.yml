@@ -1,0 +1,66 @@
+# -------------------------------------------------------------------------
+# Model B — CE + Triplet (bright) + TripletX (dark)
+# Brightness-aware training without SupCon.
+# Automatically increases P×K to K=8 when TripletX is active.
+# -------------------------------------------------------------------------
+
+# -------------------------------------------------------------------------
+# Dataset and Dataloader
+# -------------------------------------------------------------------------
+DATASETS:
+  NAMES: 'veri'
+
+DATALOADER:
+  SAMPLER: 'softmax_triplet'
+  NUM_INSTANCE: 4              # Baseline K when no special loss is active
+  PHASED:
+    ENABLE: True               # Enable dynamic K-switching (not epoch-based)
+    K_WHEN_TRIPLETX: 8         # Use K=8 when TripletX is enabled
+    K_WHEN_SUPCON: 8           # Reserved for SupCon configs
+    K_OTHER: 4                 # Default K for CE+Triplet baseline
+
+# -------------------------------------------------------------------------
+# Optimization and Training
+# -------------------------------------------------------------------------
+SOLVER:
+  MAX_EPOCHS: 120
+  BASE_LR: 0.01
+  IMS_PER_BATCH: 64
+  SEED: 0
+
+# -------------------------------------------------------------------------
+# Loss Configuration
+# -------------------------------------------------------------------------
+LOSS:
+  PHASED:
+    ENABLE: False              # Disable epoch-phased scheduling
+
+  TRIPLET:
+    FEAT_SRC: 'pre_bn'         # Use pre-BN features for metric learning
+
+  TRIPLETX:
+    ENABLE: True               # Enable TripletX for dark samples
+    W: 1.2                     # Higher weight for dark subset
+    MARGIN: 0.30
+    NORM_FEAT: True
+    SOFT_WARMUP: True
+    WARMUP_EPOCHS: 10
+    K: 5
+    ALPHA: 2.0
+    CROSS_CAM_POS: True
+    SAME_CAM_NEG_BOOST: 1.2
+
+  SUPCON:
+    ENABLE: False              # SupCon disabled in this configuration
+
+  BRIGHTNESS:
+    ENABLE: True               # Enable brightness-based routing
+    THRESH: 0.35               # BT.709 brightness threshold
+    K: 0.08                    # Smoothing factor for soft dark weighting
+
+# -------------------------------------------------------------------------
+# Evaluation
+# -------------------------------------------------------------------------
+TEST:
+  IMS_PER_BATCH: 256
+  EVAL: True

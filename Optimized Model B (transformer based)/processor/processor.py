@@ -7,29 +7,36 @@
 # -----------------------------------------------------------------------------
 # [2025-08-30 | Hang Zhang] Added start_epoch/resume & AMP scaler plumbing.
 # [2025-09-12 | Hang Zhang] SupCon integration in trainer (external add).
-# [2025-10-14 | Hang Zhang] Phased-loss integration (B2_phased_loss)  # [NEW]
-#   - Pass current `epoch` into loss_func(...) to enable phased weights.  # [NEW]
-#   - Route `z_supcon` into loss_func(...) and REMOVE external SupCon add  # [NEW]
-#     (SupCon weighting now handled inside make_loss by dynamic schedule).  # [NEW]
-#   - Simplify logs (no separate "SupCon+" piece) to avoid double counting. # [NEW]
+# [2025-10-14 | Hang Zhang] Phased-loss integration (B2_phased_loss)
+#   - Pass current `epoch` into loss_func(...) to enable phased weights.
+#   - Route `z_supcon` into loss_func(...) and REMOVE external SupCon add
+#     (SupCon weighting now handled inside make_loss by dynamic schedule).
 # [2025-10-14 | Hang Zhang] Epoch-aware PK-sampler K: rebuild train_loader at phase boundaries.
 #                           from datasets import make_dataloader
 # [2025-10-19 | Hang Zhang]  **Make phased boundary configurable & random-sampler guard**
 #   - _tripletx_stage(epoch,cfg) reads cfg.LOSS.PHASED.TRIPLETX_END instead of hard-coded 30.
-#   - When DATALOADER.SAMPLER=='random', skip PK-K rebuild (no P×K semantics).               # [NEW]
+#   - When DATALOADER.SAMPLER=='random', skip PK-K rebuild (no P×K semantics).
 # [2025-10-19 | Hang Zhang]  **Pass BNNeck feature into loss_func & safe acc**
-#   - Forward path unpacks (score, feat, feat_bn, z_supcon) and passes feat_bn to loss_func.  # [NEW]
-#   - When score is None (e.g., SupCon-only), accuracy metric is safely set to 0.            # [NEW]
-# [2025-10-22 | Hang Zhang] **Brightness-aware training (minimal change)**                   # [NEW]
-#   - Compute per-batch `dark_mask` and `dark_weight` in trainer (no Dataset/Collate change).# [NEW]
-#   - Pass `dark_mask` / `dark_weight` to loss_func(...) as OPTIONAL kwargs.                 # [NEW]
-#   - Keep loss composition inside make_loss; trainer remains thin.                          # [NEW]
-# [2025-10-23 | Hang Zhang]  **Fix brightness domain**                                        # [NEW]
-#   - Before BT.709 brightness, denormalize images using cfg.INPUT.PIXEL_MEAN/STD            # [NEW]
-#     to ~[0,1] domain; threshold 0.35 is now consistent with image domain.                  # [NEW]
-# [2025-10-23 | Hang Zhang]  **Brightness toggle via cfg**                                    # [NEW]
-#   - Guard brightness-aware training by cfg.LOSS.BRIGHTNESS.ENABLE (default False).          # [NEW]
-#   - Threshold/softness configurable via THRESH (default 0.35), K (default 0.08).            # [NEW]
+#   - Forward path unpacks (score, feat, feat_bn, z_supcon) and passes feat_bn to loss_func.
+#   - When score is None (e.g., SupCon-only), accuracy metric is safely set to 0.
+# [2025-10-22 | Hang Zhang] **Brightness-aware training (minimal change)**
+#   - Compute per-batch `dark_mask` and `dark_weight` in trainer (no Dataset/Collate change).
+#   - Pass `dark_mask` / `dark_weight` to loss_func(...) as OPTIONAL kwargs.
+#   - Keep loss composition inside make_loss; trainer remains thin.
+# [2025-10-23 | Hang Zhang] **Fix brightness domain**
+#   - Before BT.709 brightness, denormalize images using cfg.INPUT.PIXEL_MEAN/STD
+#     to ~[0,1] domain; threshold 0.35 is now consistent with image domain.
+# [2025-10-23 | Hang Zhang] **Brightness toggle via cfg**
+#   - Guard brightness-aware training by cfg.LOSS.BRIGHTNESS.ENABLE (default False).
+#   - Threshold/softness configurable via THRESH (default 0.35), K (default 0.08).
+# [2025-11-09 | Hang Zhang] **办法B: PK-switch guard loosened**
+#   - _phased_pk_enabled() now only requires DATALOADER.PHASED.ENABLE=True
+#     (decoupled from LOSS.PHASED.ENABLE) to support "non-epoch, loss-activated K".
+# [2025-11-09 | Hang Zhang] **TripletX / SupCon aware K switching (final)**
+#   - Replace _tripletx_stage() with half-open interval [0, TRIPLETX_END)
+#   - Add _supcon_eff_w() (PHASED.W_SUP_SPEC -> DECAY_* -> static W)
+#   - Replace _desired_pk_k(): TX or SupCon(w>0) -> expand K (8), else K_OTHER (4)
+#   - Add optional debug print for K decision per epoch.
 # =============================================================================
 
 import os
@@ -99,47 +106,125 @@ def _validate_once(
     # return Rank-1, Rank-5, mAP
     return float(cmc[0]), float(cmc[4]), float(mAP)
 
-# ===== Helpers for phased PK-sampler K ======================================  # [NEW]
+# ===== Helpers for phased PK-sampler K ======================================
+
 def _phased_pk_enabled(cfg) -> bool:
     """
-    [NEW] Guard for epoch-aware PK-sampler K.
-    Works only when BOTH switches are ON:
-      - cfg.LOSS.PHASED.ENABLE == True
-      - cfg.DATALOADER.PHASED.ENABLE == True
+    Enable epoch-begin PK (P×K) K-switching when dataloader-phased is ON.
+    办法B：只要 DATALOADER.PHASED.ENABLE=True 即启用按“当前激活loss”切 K，
+    不再要求 LOSS.PHASED.ENABLE。
     """
-    return (
-        hasattr(cfg, "LOSS") and hasattr(cfg.LOSS, "PHASED")
-        and bool(getattr(cfg.LOSS.PHASED, "ENABLE", False))
-        and hasattr(cfg, "DATALOADER") and hasattr(cfg.DATALOADER, "PHASED")
-        and bool(getattr(cfg.DATALOADER.PHASED, "ENABLE", False))
+    return bool(
+        hasattr(cfg, "DATALOADER")
+        and hasattr(cfg.DATALOADER, "PHASED")
+        and getattr(cfg.DATALOADER.PHASED, "ENABLE", False)
     )
 
-
 def _tripletx_stage(epoch: int, cfg) -> bool:
-    """[NEW] TripletX active only in Stage A (epoch <= cfg.LOSS.PHASED.TRIPLETX_END)."""
-    tripletx_end = int(getattr(cfg.LOSS.PHASED, "TRIPLETX_END", 30))
-    return int(epoch) <= tripletx_end
+    """TripletX active only in Stage A (half-open interval): [0, TRIPLETX_END)"""
+    try:
+        tx_end = int(getattr(getattr(cfg.LOSS, "PHASED", object()), "TRIPLETX_END", 40))
+    except Exception:
+        tx_end = 40
+    return int(epoch) < int(tx_end)
 
+def _supcon_eff_w(cfg, epoch: int) -> float:
+    """
+    Compute SupCon effective weight at this epoch.
+    Priority:
+      1) LOSS.PHASED.W_SUP_SPEC（const:x / linear:x->y, 按 BOUNDARIES 选段）
+      2) LOSS.SUPCON 的 DECAY_*（linear/const/exp）
+      3) 静态 LOSS.SUPCON.W
+    """
+    phased = getattr(getattr(cfg, "LOSS", object()), "PHASED", None)
+    sup    = getattr(getattr(cfg, "LOSS", object()), "SUPCON", None)
+
+    if phased and getattr(phased, "ENABLE", False) and epoch is not None:
+        spec = getattr(phased, "W_SUP_SPEC", None)
+        bounds = list(getattr(phased, "BOUNDARIES", []))
+        if isinstance(spec, (list, tuple)) and len(spec) > 0:
+            # select phase by half-open segments
+            i = 0
+            for j, b in enumerate(bounds):
+                if int(epoch) < int(b):
+                    i = j
+                    break
+            else:
+                i = len(bounds)
+            i = max(0, min(i, len(spec) - 1))
+            s = str(spec[i]).strip().lower()
+            if s.startswith("const:"):
+                return float(s.split("const:")[1])
+            if s.startswith("linear:"):
+                body = s.split("linear:")[1]
+                x, y = body.split("->")
+                start = 0 if i == 0 else int(bounds[i - 1])
+                end   = int(bounds[i]) if i < len(bounds) else int(getattr(getattr(cfg, "SOLVER", object()), "MAX_EPOCHS", 120))
+                end   = max(end, start + 1)
+                t = (int(epoch) - start) / float(end - start)
+                t = min(max(t, 0.0), 1.0)
+                return (1.0 - t) * float(x) + t * float(y)
+        # fallback: DECAY_*
+        if sup:
+            try:
+                w0 = float(getattr(sup, "W0", getattr(sup, "W", 0.0)))
+            except Exception:
+                w0 = float(getattr(sup, "W", 0.0))
+            decay_type = str(getattr(sup, "DECAY_TYPE", "linear")).lower()
+            ds = int(getattr(sup, "DECAY_START", 0))
+            de = int(getattr(sup, "DECAY_END", getattr(getattr(cfg, "SOLVER", object()), "MAX_EPOCHS", 120)))
+            if decay_type == "linear":
+                if epoch <= ds: return max(0.0, w0)
+                if epoch >= de: return 0.0
+                frac = (epoch - ds) / float(max(de - ds, 1))
+                return max(0.0, w0 * (1.0 - frac))
+            elif decay_type == "const":
+                return max(0.0, w0)
+            elif decay_type == "exp":
+                import math
+                return max(0.0, w0 if epoch < ds else w0 * math.exp(-0.05 * (epoch - ds)))
+
+    # static SupCon weight
+    try:
+        return float(getattr(getattr(cfg.LOSS, "SUPCON", object()), "W", 0.0))
+    except Exception:
+        return 0.0
+
+def _sampler_is_random(cfg) -> bool:
+    """Whether SAMPLER is 'random' (SupCon-only / SSL)."""
+    return str(getattr(cfg.DATALOADER, "SAMPLER", "softmax_triplet")).lower() == "random"
+
+def _phased_pk_other(cfg) -> int:
+    """Default fallback K when no special loss is active."""
+    try:
+        return int(getattr(getattr(cfg.DATALOADER, "PHASED", object()), "K_OTHER", 4))
+    except Exception:
+        return int(getattr(cfg.DATALOADER, "NUM_INSTANCE", 4))
 
 def _desired_pk_k(epoch: int, cfg) -> int:
     """
-    [NEW] Return desired K for PK-sampler given epoch & config.
-    A-stage (TripletX): K_WHEN_TRIPLETX, else K_OTHER.
-    Falls back to cfg.DATALOADER.NUM_INSTANCE when phased is disabled.
+    TripletX 阶段或 SupCon(w>0) ⇒ 扩 K；
+    否则 K_OTHER。PHASED 关闭时返回当前 NUM_INSTANCE。
     """
     if not _phased_pk_enabled(cfg):
         return int(getattr(cfg.DATALOADER, "NUM_INSTANCE", 4))
-    return int(
-        getattr(
-            cfg.DATALOADER.PHASED,
-            "K_WHEN_TRIPLETX" if _tripletx_stage(epoch, cfg) else "K_OTHER",
-            8 if _tripletx_stage(epoch, cfg) else 4,
-        )
-    )
 
-def _sampler_is_random(cfg) -> bool:
-    """[NEW] Whether SAMPLER is 'random' (SupCon-only / SSL)."""
-    return str(getattr(cfg.DATALOADER, "SAMPLER", "softmax_triplet")).lower() == "random"
+    # A 段 TripletX → K_WHEN_TRIPLETX
+    if _tripletx_stage(epoch, cfg):
+        try:
+            return int(getattr(cfg.DATALOADER.PHASED, "K_WHEN_TRIPLETX", 8))
+        except Exception:
+            return 8
+
+    # 非 A 段：若 SupCon 有效权重大于 0 → K_WHEN_SUPCON
+    if _supcon_eff_w(cfg, int(epoch)) > 0.0:
+        try:
+            return int(getattr(cfg.DATALOADER.PHASED, "K_WHEN_SUPCON", 8))
+        except Exception:
+            return 8
+
+    # 其他阶段 → K_OTHER
+    return _phased_pk_other(cfg)
 
 def _brightness_enabled(cfg) -> bool:
     """Return True if brightness-aware training is enabled by config."""
@@ -164,8 +249,8 @@ def do_train(
     start_epoch: int = 1,  # [2025-08-30 | Hang Zhang] Added start_epoch for seamless resume
 
     # =====================================================================================
-    # (Kept for backward-compatibility) SupCon flags from entrypoint.                    # [CHG]
-    # NOTE: SupCon weighting is now handled INSIDE make_loss via phased schedule.        # [NEW]
+    # (Kept for backward-compatibility) SupCon flags from entrypoint.
+    # NOTE: SupCon weighting is now handled INSIDE make_loss via phased schedule.
     # =====================================================================================
     use_supcon: bool = False,
     supcon_criterion=None,
@@ -180,27 +265,26 @@ def do_train(
     - Here we start from `start_epoch` and save both model weights and training state at each epoch.
     - SupCon handling:
         * z_supcon is forwarded to loss_func(..., z_supcon=...) and weighted INSIDE make_loss
-          according to the current epoch (phased schedule).                                           # [NEW]
-    - PK-sampler K scheduling:
-        * If enabled (LOSS.PHASED & DATALOADER.PHASED), rebuild train_loader at epoch boundaries:
-          - A-stage (epoch <= TRIPLETX_END): K=cfg.DATALOADER.PHASED.K_WHEN_TRIPLETX
-          - B/C-stage (epoch > TRIPLETX_END): K=cfg.DATALOADER.PHASED.K_OTHER
-        * When SAMPLER=='random', skip PK-K switching (no P×K semantics).                             # [NEW]
+          according to the current epoch (phased schedule).
+    - PK-sampler K scheduling (办法B):
+        * If DATALOADER.PHASED.ENABLE=True, rebuild train_loader at epoch boundaries:
+          - A-stage TripletX ([0, TRIPLETX_END)): K=K_WHEN_TRIPLETX
+          - Else if SupCon weight > 0:        K=K_WHEN_SUPCON
+          - Else:                              K=K_OTHER
+        * When SAMPLER=='random', skip PK-K switching (no P×K semantics).
     """
 
     # ------------------------------------------------------------------
-    # [NEW] Minimal logger fix to prevent duplicate prints
+    # Minimal logger fix to prevent duplicate prints
     # ------------------------------------------------------------------
     import sys
     train_logger = logging.getLogger("transreid.train")
-    train_logger.propagate = False            # do NOT bubble up to parent/root
+    train_logger.propagate = False
     train_logger.setLevel(logging.INFO)
 
-    # clear old handlers (avoid stacking if do_train is called again)
     for h in list(train_logger.handlers):
         train_logger.removeHandler(h)
 
-    # attach exactly one clean StreamHandler with timestamp format
     _stream = logging.StreamHandler(stream=sys.stdout)
     _formatter = logging.Formatter(
         "%(asctime)s %(name)s %(levelname)s: %(message)s",
@@ -209,11 +293,9 @@ def do_train(
     _stream.setFormatter(_formatter)
     train_logger.addHandler(_stream)
 
-    # optional: quiet root so it doesn't re-print INFO lines
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.WARNING)
 
-    # from here on, just use `logger`
     logger = train_logger
 
     log_period = cfg.SOLVER.LOG_PERIOD
@@ -228,7 +310,6 @@ def do_train(
 
     logger.info(f"start training (device={device_str})")
     if use_supcon:
-        # visibility only; real weighting is inside make_loss
         logger.info(f"[SupCon] training flag=True (note: weighted inside make_loss)")
 
     # Move model to device
@@ -245,28 +326,33 @@ def do_train(
     acc_meter = AverageMeter()
     evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
 
-    # AMP scaler (CUDA only). On MPS/CPU this is disabled automatically.
-    # [2025-08-30 | Hang Zhang] AMP scaler kept for state saving during seamless resume.
+    # AMP scaler (CUDA only).
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
 
-    # Track current K (for phased PK switching)                                         # [NEW]
-    current_K = int(getattr(cfg.DATALOADER, "NUM_INSTANCE", 4))                         # [NEW]
+    # Track current K (for phased PK switching)
+    current_K = int(getattr(cfg.DATALOADER, "NUM_INSTANCE", 4))
 
     # =========================
-    # [2025-08-30 | Hang Zhang] Training loop now starts from `start_epoch`
+    # Training loop (start_epoch inclusive)
     # =========================
     for epoch in range(start_epoch, start_epoch + epochs_this_run):
 
-        # ----- Epoch-aware PK-sampler K switch (rebuild train_loader) -----           # [NEW]
+        # ----- Epoch-aware PK-sampler K switch (rebuild train_loader) -----
         if not _sampler_is_random(cfg):
             desired_K = _desired_pk_k(epoch, cfg)
-            if desired_K != current_K:
-                logging.getLogger("transreid.train").info(
-                    f"[PK-sampler] Rebuilding train_loader: NUM_INSTANCE {current_K} → {desired_K} (epoch {epoch})"
+
+            # Optional debug print: show decision factors (TripletX stage / SupCon weight)
+            if _phased_pk_enabled(cfg):
+                _sup_w_dbg = _supcon_eff_w(cfg, int(epoch))
+                logger.info(
+                    f"[PK-sampler] epoch={epoch} | TX_A={_tripletx_stage(epoch,cfg)} "
+                    f"| SupConW={_sup_w_dbg:.3f} | K(target)={desired_K}"
                 )
+
+            if desired_K != current_K:
+                logger.info(f"[PK-sampler] Rebuilding train_loader: NUM_INSTANCE {current_K} → {desired_K} (epoch {epoch})")
                 cfg.defrost()
                 cfg.DATALOADER.NUM_INSTANCE = desired_K
-                # Rebuild only train_loader; keep val_loader unchanged
                 (train_loader,
                  _train_loader_normal,
                  _val_loader,
@@ -316,13 +402,7 @@ def do_train(
             target_view = target_view.to(device, non_blocking=use_cuda)
             camids = camids.to(device, non_blocking=use_cuda)
 
-            # ---------------------------------------------------------------------------------
-            # Forward & total loss (SupCon + Triplet(X) handled INSIDE make_loss).            # [CHG][NEW]
-            # make_loss will:
-            #   * choose TripletX (A-stage) or Triplet (B/C) based on `epoch`
-            #   * apply dynamic w_metric and w_sup (SupCon) per epoch
-            #   * safely fallback when z_supcon is None (use feat)
-            # ---------------------------------------------------------------------------------
+            # Forward & total loss (SupCon + Triplet(X) handled INSIDE make_loss)
             with torch.amp.autocast("cuda", enabled=use_cuda):
                 out = model(img, target, cam_label=target_cam, view_label=target_view)
 
@@ -351,9 +431,7 @@ def do_train(
                     score = out
                     feat = out  # best-effort fallback
 
-                # ========================= BRIGHTNESS (FIXED: denorm first) ====================
-                # Compute per-image brightness in ~[0,1] domain by denormalizing with
-                # cfg.INPUT.PIXEL_MEAN/STD, then derive dark_mask and a soft weight.
+                # ===== BRIGHTNESS (denorm first) =====
                 dark_mask = None
                 dark_weight = None
                 if _brightness_enabled(cfg):
@@ -370,16 +448,15 @@ def do_train(
                     _K = float(getattr(getattr(cfg.LOSS, "BRIGHTNESS", object()), "K", 0.08))
                     dark_mask = (_brightness < _THRESH)            # (N,) bool
                     dark_weight = torch.sigmoid((_THRESH - _brightness) / max(_K, 1e-6)).detach()  # (N,) 0..1
-                # ==============================================================================
 
-                # === The ONLY loss call (includes SupCon & phased weights) ===                 # [NEW]
+                # === The ONLY loss call (includes SupCon & phased weights) ===
                 loss = loss_func(
                     score,
                     feat,
                     target,
                     camids=camids,        # TripletX/SupCon need camera ids
                     z_supcon=z_supcon,    # may be None; make_loss will fallback to feat
-                    epoch=epoch,          # critical: enable phased scheduling
+                    epoch=epoch,          # critical: enable phased scheduling (even if PHASED.ENABLE=False, impl is safe)
                     feat_bn=feat_bn,      # BNNeck feature routing for losses that request bnneck
                     # Brightness-aware OPTIONAL hints (consumed in make_loss if supported)
                     dark_mask=dark_mask,
@@ -419,8 +496,7 @@ def do_train(
                 except Exception:
                     lr_val = 0.0
 
-                # Unified log (SupCon already included inside total loss).
-                logging.getLogger("transreid.train").info(
+                logger.info(
                     "Epoch[{}] Iter[{}/{}] Loss: {:.3f}, Acc: {:.3f}, LR: {:.2e}".format(
                         epoch, (n_iter + 1), len(train_loader),
                         loss_meter.avg, acc_meter.avg, lr_val
