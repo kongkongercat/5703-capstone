@@ -97,7 +97,8 @@ LOSS:
 
   # --- Enhanced TripletX (activated in mid-phase) ---
   TRIPLETX:
-    ENABLE: True
+    ENABLE: False  # Initially disabled (activated later by PHASED scheduler)
+
     W: 1.0
     MARGIN: 0.30
     SOFT_WARMUP: True
