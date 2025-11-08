@@ -1,0 +1,91 @@
+MODEL:
+  PRETRAIN_CHOICE: 'imagenet'                        # Use ImageNet pretrained weights
+  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
+  NAME: 'transformer'                                # TransReID transformer model
+  TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
+  STRIDE_SIZE: [12, 12]                              # Official stride for TransReID
+  SIE_CAMERA: True                                   # Enable SIE (camera-aware tokens)
+  SIE_VIEW: True                                     # Enable SIE (view-aware tokens)
+  SIE_COE: 3.0                                       # SIE coefficient
+  JPM: True                                          # Enable JPM locals
+  SHIFT_NUM: 8                                       # JPM shift steps
+  RE_ARRANGE: True                                   # Token rearrangement for JPM
+
+  # Keep baseline plumbing but disable legacy Triplet by weight=0.0
+  METRIC_LOSS_TYPE: 'triplet'                        # Kept for compatibility in make_loss()
+  NO_MARGIN: True                                    # Soft-margin mode by default
+  IF_LABELSMOOTH: 'off'
+  IF_WITH_CENTER: 'no'
+  ID_LOSS_WEIGHT: 1.0
+  TRIPLET_LOSS_WEIGHT: 0.0                           # Explicitly disable legacy Triplet branch
+
+INPUT:
+  SIZE_TRAIN: [256, 256]
+  SIZE_TEST:  [256, 256]
+  PROB: 0.5
+  RE_PROB: 0.8
+  PADDING: 10
+
+DATASETS:
+  NAMES: 'veri'                                      # VeRi-776
+  ROOT_DIR: '../datasets'
+
+DATALOADER:
+  SAMPLER: 'softmax_triplet'                         # P×K sampler (good for SupCon too)
+  NUM_INSTANCE: 4                                    # K in P×K (baseline pk=4)
+  NUM_WORKERS: 8
+  PHASED:
+    ENABLE: False                                    # No epoch-phase switching in this config
+
+SOLVER:
+  OPTIMIZER_NAME: 'SGD'
+  MAX_EPOCHS: 120
+  BASE_LR: 0.01
+  IMS_PER_BATCH: 64
+  WARMUP_METHOD: 'linear'
+  LARGE_FC_LR: False
+  CHECKPOINT_PERIOD: 3                               # Save checkpoint every 3 epochs (optional)
+  LOG_PERIOD: 50
+  EVAL_PERIOD: 3                                     # Evaluate every 3 epochs (optional)
+  WEIGHT_DECAY: 1e-4
+  WEIGHT_DECAY_BIAS: 1e-4
+  BIAS_LR_FACTOR: 2
+  MARGIN: 0.3                                        # Kept for legacy compatibility
+
+TEST:
+  EVAL: True
+  IMS_PER_BATCH: 256
+  RE_RANKING: False
+  WEIGHT: ''
+  NECK_FEAT: 'before'                                # Use pre-BN features for testing
+  FEAT_NORM: 'yes'
+
+LOSS:
+  PHASED:
+    ENABLE: False                                    # Not using phased loss schedule here
+
+  TRIPLET:
+    FEAT_SRC: 'pre_bn'                               # Only meaningful if Triplet is enabled
+
+  TRIPLETX:
+    ENABLE: False                                    # TripletX is OFF in this config
+    FEAT_SRC: 'pre_bn'
+    NORM_FEAT: True
+    MARGIN: 0.30
+    SOFT_WARMUP: True
+    WARMUP_EPOCHS: 10
+    K: 5                                             # Default value (unused while disabled)
+    ALPHA: 2.0
+    CROSS_CAM_POS: True
+    SAME_CAM_NEG_BOOST: 1.2
+    W: 1.0
+
+  SUPCON:
+    ENABLE: True                                     # Enable SupCon
+    W: 0.30                                          # Static weight
+    T: 0.07                                          # Temperature
+    CAM_AWARE: True                                  # Camera-aware positives
+    POS_RULE: 'class'
+    FEAT_SRC: 'bnneck'                               # Use BNNeck features for SupCon
+
+OUTPUT_DIR: './logs/veri_transreid_ce_supcon_bnneck_pk4'   # Clear, consistent folder name

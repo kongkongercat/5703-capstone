@@ -1,0 +1,61 @@
+MODEL:
+  PRETRAIN_CHOICE: 'imagenet'
+  # Use local pretrained weights first
+  PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
+  # Fallback path (on Google Drive) if local file is missing
+
+  # Metric learning loss type
+  METRIC_LOSS_TYPE: 'triplet'
+  IF_LABELSMOOTH: 'off'       # Label smoothing (off = disabled)
+  IF_WITH_CENTER: 'no'         # Center loss (no = disabled)
+  NAME: 'transformer'
+  NO_MARGIN: True               # Use soft-margin triplet loss
+  DEVICE_ID: ('0')               # GPU device ID
+  TRANSFORMER_TYPE: 'deit_base_patch16_224_TransReID'
+  STRIDE_SIZE: [12, 12]          # Stride size for patch embedding
+  SIE_CAMERA: True               # Enable SIE (camera)
+  SIE_VIEW: True                 # Enable SIE (view)
+  SIE_COE: 3.0                    # Coefficient for SIE
+  JPM: True                       # Enable JPM module
+  SHIFT_NUM: 8                    # Number of patch shifts (for JPM)
+  RE_ARRANGE: True                # Enable patch rearrangement
+
+INPUT:
+  SIZE_TRAIN: [256, 256]          # Image size during training
+  SIZE_TEST: [256, 256]            # Image size during testing
+  PROB: 0.5                        # Probability of random horizontal flip
+  RE_PROB: 0.8                     # Probability of random erasing
+  PADDING: 10                      # Padding size
+
+DATASETS:
+  NAMES: ('veri')                  # Dataset name
+  ROOT_DIR: ('../../datasets')     # Root directory containing the veri dataset
+
+DATALOADER:
+  SAMPLER: 'softmax_triplet'       # Sampler type
+  NUM_INSTANCE: 4                  # Number of instances per identity (P*K sampling)
+  NUM_WORKERS: 8                    # Number of data loading workers
+
+SOLVER:
+  OPTIMIZER_NAME: 'SGD'             # Optimizer type
+  MAX_EPOCHS: 120                    # Total training epochs
+  BASE_LR: 0.01                       # Base learning rate
+  IMS_PER_BATCH: 64                    # Batch size
+  WARMUP_METHOD: 'linear'                # Warmup strategy
+  LARGE_FC_LR: False                       # Large LR for FC layers (False = off)
+  CHECKPOINT_PERIOD: 120                      # Save checkpoint every X epochs
+  LOG_PERIOD: 50                                # Print log every X iterations
+  EVAL_PERIOD: 120                                # Evaluate model every X epochs
+  WEIGHT_DECAY: 1e-4                                 # Weight decay for parameters
+  WEIGHT_DECAY_BIAS: 1e-4                              # Weight decay for bias
+  BIAS_LR_FACTOR: 2                                      # Learning rate factor for bias
+
+TEST:
+  EVAL: True                                               # Enable evaluation mode
+  IMS_PER_BATCH: 256                                        # Batch size during testing
+  RE_RANKING: False                                           # Use re-ranking (False = disabled)
+  WEIGHT: ''                                                    # Path to test weights (empty = latest)
+  NECK_FEAT: 'before'                                              # Feature extraction stage
+  FEAT_NORM: 'yes'                                                     # Normalize features before evaluation
+
+OUTPUT_DIR: '../logs/veri_deit_transreid_stride'                         # Log and checkpoint output directory
