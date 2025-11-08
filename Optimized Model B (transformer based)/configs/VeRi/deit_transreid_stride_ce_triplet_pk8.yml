@@ -32,7 +32,7 @@ DATASETS:
 
 DATALOADER:
   SAMPLER: 'softmax_triplet'                         # P×K sampler
-  NUM_INSTANCE: 8                                    # ✅ K in P×K = 8
+  NUM_INSTANCE: 8                                    # K in P×K = 8
   NUM_WORKERS: 8
   PHASED:
     ENABLE: False
@@ -68,7 +68,7 @@ LOSS:
     FEAT_SRC: 'pre_bn'                               # Triplet uses pre-BN features
 
   TRIPLETX:
-    ENABLE: False                                    # ❌ Disabled (CE + Triplet only)
+    ENABLE: False                                    # Disabled (CE + Triplet only)
     FEAT_SRC: 'pre_bn'
     NORM_FEAT: True
     MARGIN: 0.30
@@ -81,7 +81,7 @@ LOSS:
     W: 1.0
 
   SUPCON:
-    ENABLE: False                                    # ❌ Disabled
+    ENABLE: False                                    # Disabled
     W: 0.30
     T: 0.07
     CAM_AWARE: True

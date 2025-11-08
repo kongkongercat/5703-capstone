@@ -13,7 +13,7 @@ LOSS:
     MARGIN: 0.30                                     # TripletX margin
     SOFT_WARMUP: True                                # Use soft-margin warmup
     WARMUP_EPOCHS: 10                                # Warmup epochs
-    K: 8                                             # Top-k hard mining
+    K: 5                                             # Top-k hard mining
     ALPHA: 2.0                                       # Hardness-aware weighting
     CROSS_CAM_POS: True                              # Allow cross-camera positives
     SAME_CAM_NEG_BOOST: 1.2                          # Boost same-camera negatives
