@@ -97,7 +97,7 @@ LOSS:
 
   # --- Enhanced TripletX (activated in mid-phase) ---
   TRIPLETX:
-    ENABLE: False  # Initially disabled (activated later by PHASED scheduler)
+    ENABLE: True 
 
     W: 1.0
     MARGIN: 0.30
@@ -112,7 +112,7 @@ LOSS:
 
   # --- SupCon loss (active in mid and late phases) ---
   SUPCON:
-    ENABLE: False    # Initially disabled (activated later by PHASED scheduler)
+    ENABLE: True  
     W: 0.30                  # nominal; actual weight controlled by PHASED.W_SUP_SPEC
     T: 0.07
     CAM_AWARE: True
