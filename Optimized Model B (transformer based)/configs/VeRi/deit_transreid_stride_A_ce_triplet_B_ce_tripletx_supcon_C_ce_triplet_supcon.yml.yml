@@ -116,7 +116,7 @@ LOSS:
     T: 0.07
     CAM_AWARE: True
     POS_RULE: 'class'
-    FEAT_SRC: 'bnneck'
+    FEAT_SRC: 'pre_bn'
     W0: 0.30
     DECAY_TYPE: 'linear'
     DECAY_START: 80
