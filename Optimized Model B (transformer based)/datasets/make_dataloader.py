@@ -97,17 +97,19 @@ def make_dataloader(cfg):
             if getattr(cfg.DATALOADER, "PHASED", None) and cfg.DATALOADER.PHASED.ENABLE:
                 # Dynamically adjust K based on the currently active loss type
                 if cfg.LOSS.TRIPLETX.ENABLE:
-                    cfg.DATALOADER.NUM_INSTANCE = cfg.DATALOADER.PHASED.K_WHEN_TRIPLETX
+                    num_instance = cfg.DATALOADER.PHASED.K_WHEN_TRIPLETX
                 elif cfg.LOSS.SUPCON.ENABLE:
-                    cfg.DATALOADER.NUM_INSTANCE = cfg.DATALOADER.PHASED.K_WHEN_SUPCON
+                    num_instance = cfg.DATALOADER.PHASED.K_WHEN_SUPCON
                 else:
-                    cfg.DATALOADER.NUM_INSTANCE = cfg.DATALOADER.PHASED.K_OTHER
+                    num_instance = cfg.DATALOADER.PHASED.K_OTHER
+            else:
+                num_instance = cfg.DATALOADER.NUM_INSTANCE
 
-                # Debug message for verification during runtime
-                print(f"[phased_K] active_loss: "
-                      f"TripletX={cfg.LOSS.TRIPLETX.ENABLE}, "
-                      f"SupCon={cfg.LOSS.SUPCON.ENABLE}, "
-                      f"K={cfg.DATALOADER.NUM_INSTANCE}")
+            # Debug message for verification during runtime
+            print(f"[phased_K] active_loss: "
+                  f"TripletX={cfg.LOSS.TRIPLETX.ENABLE}, "
+                  f"SupCon={cfg.LOSS.SUPCON.ENABLE}, "
+                  f"K={num_instance}")
 
             # === Build DataLoader ===
             train_loader = DataLoader(
@@ -116,11 +118,10 @@ def make_dataloader(cfg):
                 sampler=RandomIdentitySampler(
                     dataset.train,
                     cfg.SOLVER.IMS_PER_BATCH,
-                    cfg.DATALOADER.NUM_INSTANCE),
+                    num_instance),   # <-- use the local variable here
                 num_workers=num_workers,
                 collate_fn=train_collate_fn
             )
-
 
     elif cfg.DATALOADER.SAMPLER == 'softmax':
         print('using softmax sampler')
