@@ -39,7 +39,7 @@ LOSS:
     FEAT_SRC: 'pre_bn'         # Use pre-BN features for metric learning
 
   TRIPLETX:
-    ENABLE: True               # Enable TripletX for dark samples
+    ENABLE: False               # 
     W: 1.2                     # Higher weight for dark subset
     MARGIN: 0.30
     NORM_FEAT: True
