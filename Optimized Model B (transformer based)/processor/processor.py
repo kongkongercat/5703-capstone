@@ -428,6 +428,29 @@ def do_train(
             target_cam = target_cam.to(device, non_blocking=use_cuda)
             target_view = target_view.to(device, non_blocking=use_cuda)
             camids = camids.to(device, non_blocking=use_cuda)
+            
+            # ---- DEBUG: verify P×K sampler on first few iters ----
+            DEBUG_PK = True          # set False to disable
+            DEBUG_PK_MAX_PRINT = 3   # print first 3 iterations only
+            if DEBUG_PK and n_iter < DEBUG_PK_MAX_PRINT:
+                # `target` contains ID labels
+                ids_cpu = target.detach().cpu().numpy()
+                import numpy as np
+                vals, counts = np.unique(ids_cpu, return_counts=True)
+                P = len(vals)
+                unique_counts = sorted(set(counts.tolist()))
+                try:
+                    K_cfg = int(getattr(cfg.DATALOADER, "NUM_INSTANCE", 4))
+                except Exception:
+                    K_cfg = 4
+                print(f"[PK-check] epoch={epoch} iter={n_iter} | P={P} | counts_per_ID={unique_counts} | K_cfg={K_cfg}")
+
+                # If using PK sampler (not random), enforce each ID appears exactly K times
+                if not _sampler_is_random(cfg):
+                    assert len(unique_counts) == 1 and unique_counts[0] == K_cfg, \
+                        f"PK violation: expected each ID appears {K_cfg} times, got counts={unique_counts}"
+            # ---- END DEBUG ----
+
 
             with torch.amp.autocast("cuda", enabled=use_cuda):
                 out = model(img, target, cam_label=target_cam, view_label=target_view)
