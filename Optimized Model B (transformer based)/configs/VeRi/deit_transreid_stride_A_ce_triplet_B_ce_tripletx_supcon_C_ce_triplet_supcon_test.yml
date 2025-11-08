@@ -132,7 +132,7 @@ LOSS:
   # --- Phased scheduling definition ---
   PHASED:
     ENABLE: True
-    BOUNDARIES: [4, 8]          # early: 0–4, middle: 4–8, late: 8–120
+    BOUNDARIES: [2, 4]          
     METRIC_SEQ: ['triplet', 'tripletx', 'triplet']
     W_METRIC_SEQ: [1.0, 1.0, 1.0]
     W_SUP_SPEC: ['const:0.0', 'const:0.30', 'const:0.30']
