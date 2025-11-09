@@ -173,7 +173,7 @@ PY
 * W4 → `VeRi_DeiT-B16_256_EpochPhased_A-T_B-TX+S_C-T+S_PK8x8-or-8x4_k5_E120_s0.pth`
 * W5 → `VeRi_DeiT-B16_256_OpenCLIP-MinFusion_CE+Triplet_PK8x4_E120_s0.pth`
 * B0 → `VeRi_DeiT-B16_256_Baseline_CE+Triplet_PK8x4_E120_s0.pth`
-
+```
 
 ## 4.1 Quick Start (Generic Launcher)
 
