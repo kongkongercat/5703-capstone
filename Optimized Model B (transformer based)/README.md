@@ -1,7 +1,7 @@
 # Model B — Optimizations for TransReID (Losses, Sampling & Optional CLIP)
 
 > This repo extends **TransReID (DeiT/ViT + SIE + JPM)** primarily with **training-side** improvements: loss functions and sampling.
-> **Additionally**, we provide **optional CLIP semantic fusion** that can be enabled **at train and/or test time** without changing the backbone or heads.
+> **Additionally**, we provide **optional CLIP semantic fusion**.
 
 ---
 
