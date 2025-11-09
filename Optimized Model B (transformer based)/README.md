@@ -5,6 +5,7 @@
 
 ---
 
+
 ## 1) Method Overview (aligned with Report §7.2.1)
 
 **Runtime behavior (important).** Using `run_phased_loss.py` will, by default, **train and then automatically run external `test.py`** for each newly saved checkpoint (per-epoch backfill; already tested epochs are skipped).
@@ -108,6 +109,50 @@
 
 ---
 
+
+## 4) Environment & Requirements
+
+### Install with `requirements.txt`
+
+```bash
+# from the repo root (where requirements.txt lives)
+pip install -r requirements.txt
+```
+
+**Notes**
+
+* **Apple Silicon (M1/M2/M3, macOS + MPS):** if PyTorch isn’t pinned in `requirements.txt`, install it first:
+
+  ```bash
+  pip install torch torchvision torchaudio
+  ```
+* **NVIDIA GPU (CUDA):** install the matching wheel for your CUDA version, e.g. CUDA 12.1:
+
+  ```bash
+  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+  ```
+
+**Optional (only if you run CLIP/TinyCLIP configs):**
+
+```bash
+# OpenCLIP
+pip install open-clip-torch==2.24.0
+# TinyCLIP / HF
+pip install "transformers>=4.41" "huggingface-hub>=0.23" accelerate
+```
+
+**Verify install**
+
+```bash
+python - <<'PY'
+import torch
+print("Torch:", torch.__version__,
+      "| CUDA:", torch.cuda.is_available(),
+      "| MPS:", torch.backends.mps.is_available())
+PY
+```
+
+
 ## 4.1 Quick Start (Generic Launcher)
 
 All training runs use the same launcher:
@@ -129,27 +174,33 @@ python run_phased_loss.py \
 
 ---
 
-## 4.2 SupCon-Only (constant W/T; bnneck; camera-aware)
+## 4.2 Triplet + SupCon (pre_bn routing, PK=8, joint losses)
 
 ```bash
 python run_phased_loss.py \
-  --config configs/VeRi/deit_transreid_stride_ce_triplet_supcon.yml \
-  --seeds 0 --epochs 120 --save-every 3 --supcon \
+  --config configs/VeRi/deit_transreid_stride_ce_triplet_pk8_prebn_supcon_prebn.yml \
+  --seeds 0 --epochs 120 --save-every 3 \
   --output-root ./logs
-# Optional overrides:
-#  --opts LOSS.SUPCON.T 0.07 LOSS.SUPCON.W 0.30 LOSS.SUPCON.FEAT_SRC bnneck \
-#        DATASETS.ROOT_DIR ./datasets
+# Optional:
+#  --opts DATASETS.ROOT_DIR ./datasets
 ```
 
-> Enables SupCon on **bnneck** features (default `T=0.07`, `W=0.30`) with **camera-aware positives**.
+**What this config demonstrates**
+
+* **Feature routing**: both **Triplet** and **SupCon** use `FEAT_SRC=pre_bn` (explicitly aligned feature paths).
+* **Joint losses**: Triplet × SupCon trained together (weights as in YAML).
+* **Conditional P×K**: K auto-switching to **8** when structured losses are active.
+* **Default behavior**: per-epoch external tests are run automatically after training.
+
+
 
 ---
 
-## 4.3 Conditional P×K Sampling (auto K=8 with TripletX/SupCon)
+## 4.3 Conditional P×K Sampling (auto K=8 with TripletX/SupCon) & Phase Schedule A→B→C 
 
 ```bash
 python run_phased_loss.py \
-  --config configs/VeRi/deit_transreid_stride_ce_triplet_pk8.yml \
+  --config configs/VeRi/deit_transreid_stride_A_ce_triplet_B_ce_tripletx_supcon_C_ce_triplet_supcon.yml \
   --seeds 0 --epochs 120 --save-every 3 \
   --output-root ./logs
 # Optional overrides:
@@ -160,30 +211,16 @@ python run_phased_loss.py \
 ```
 
 > When **TripletX** or **SupCon** is active, the loader switches to **K=8**; otherwise **K=4**.
-
----
-
-## 4.4 Phase Schedule A→B→C (optional)
-
-```bash
-python run_phased_loss.py \
-  --config configs/VeRi/deit_transreid_stride_A_ce_triplet_B_ce_tripletx_supcon_C_ce_triplet_supcon.yml \
-  --seeds 0 --epochs 120 --save-every 3 --phased \
-  --output-root ./logs
-# Optional overrides:
-#  --opts DATASETS.ROOT_DIR ./datasets
-```
-
 *A: Triplet → B: TripletX + SupCon → C: Triplet + SupCon.*
 The DataLoader is rebuilt at phase boundaries to enforce the P×K policy.
 
 ---
 
-## 4.5 Threshold-Driven Multi-Loss Routing (Triplet / TripletX)
+## 4.4 Threshold-Driven Multi-Loss Routing (Triplet / TripletX)
 
 ```bash
 python run_phased_loss.py \
-  --config configs/VeRi/deit_transreid_stride_ce_triplet_tripletx.yml \
+  --config configs/VeRi/deit_transreid_stride_ce_triplet_tripletx_supcon_prebn_brightness.yml \
   --seeds 0 --epochs 120 --save-every 3 --tripletx \
   --output-root ./logs
 # Optional overrides:
@@ -214,7 +251,7 @@ python run_phased_loss.py \
 
 ```bash
 python run_phased_loss.py \
-  --config configs/VeiRi/deit_transreid_stride_ce_triplet_tinyclip_quickwin.yml \
+  --config configs/VeiRi/deit_transreid_stride_ce_triplet_320tinyclip0.2_noafem.yml \
   --seeds 0 --epochs 120 --save-every 3 \
   --output-root ./logs
 # Optional overrides:
@@ -267,17 +304,8 @@ losses/*    processor/*    models/*   # training-side changes (losses / PK rebui
 
 ---
 
-## 8) Repro Tips (to match the report)
 
-* Start with **SupCon-only** (constant W/T) to gauge compactness & stability.
-* Turn on **Conditional P×K** (K=8 with TripletX/SupCon) for better hard-sample coverage.
-* Compare **Phase vs Non-Phase** for convergence behavior and best-epoch spread.
-* Add **Threshold-Driven Routing** to isolate illumination effects.
-* Optionally enable **CLIP fusion**; track early stability and final mAP.
-
----
-
-## 9) License & Acknowledgements
+## 8) License & Acknowledgements
 
 * Base license: **MIT License** (TransReID).
 * Addendum for training-side additions (put in `LICENSE-ADDENDUM` or file headers):
@@ -292,7 +320,7 @@ Thanks to **TransReID** (He et al., ICCV 2021), **reid-strong-baseline**, **timm
 
 ---
 
-## 10) Citation
+## 9) Citation
 
 ```bibtex
 @InProceedings{He_2021_ICCV,
