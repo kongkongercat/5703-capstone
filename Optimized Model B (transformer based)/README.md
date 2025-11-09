@@ -153,9 +153,7 @@ print("Torch:", torch.__version__,
 PY
 ```
 
-可以！我把表格做成**单列链接“[W][T]”**（W=权重，T=Test 日志），宽度几乎不变，依旧能一页横屏放下。你只需把 `URL_W` 和 `URL_T` 替换为真实地址。
 
-```md
 ## Pretrained Weights (Model B · 256×256 · DeiT-B/16 · SIE+JPM)
 
 | ID | Recipe (简述) | P×K | k | Ep | mAP / R1 | Link |
