@@ -84,35 +84,36 @@
 
 ## 3) Environment & Data
 
-* Python ≥ 3.8, PyTorch ≥ 1.10 (AMP supported).
-* Pretrained DeiT/ViT as in official TransReID.
-* Example layout:
-* Project Root
-  ├─ configs/
-  │  └─ VeRi/                # YAMLs (baseline, pk=8, SupCon/TripletX, CLIP, phased schedule)
-  ├─ datasets/               # Dataset loaders (VeRi-776, Market, Duke, VehicleID)
-  ├─ losses/                 # Loss implementations (triplet, tripletx, supcon, make_loss)
-  ├─ model/                  # TransReID backbones & make_model
-  ├─ processor/              # Training loop, phase scheduling & PK rebuild hooks
-  ├─ solver/                 # LR schedulers, optimizers
-  ├─ utils/                  # Logger, metrics, reranking, plotting
-  ├─ figs/                   # (optional) figures
-  ├─ pretrained/             # (placeholder) ImageNet/CLIP weights
-  ├─ logs/                   # (placeholder) training & eval outputs
-  ├─ run_modelB_deit.py      # Model B training entry
-  ├─ run_phased_loss.py      # Multi-seed launcher + best-epoch summarizer (**defaults to train+test**)
-  ├─ test.py                 # Standalone evaluation
-  ├─ requirements.txt
-  ├─ LICENSE
-  └─ README.md
-  If you use auxiliary labels (e.g., viewpoint files), keep the paths used in code (e.g., `datasets/keypoint_train.txt`, `datasets/keypoint_test.txt`).
+- Example layout:
+
+```text
+Project Root
+├─ configs/
+│  └─ VeRi/           # YAMLs (baseline, pk=8, SupCon/TripletX, CLIP, phased)
+├─ datasets/          # Dataset loaders (VeRi-776, Market, Duke, VehicleID)
+├─ losses/            # Loss implementations (triplet, tripletx, supcon, make_loss)
+├─ model/             # TransReID backbones & make_model
+├─ processor/         # Training loop, phase scheduling & PK rebuild hooks
+├─ solver/            # LR schedulers, optimizers
+├─ utils/             # Logger, metrics, reranking, plotting
+├─ figs/              # (optional) figures
+├─ pretrained/        # (placeholder) ImageNet/CLIP weights
+├─ logs/              # training & eval outputs
+├─ run_modelB_deit.py # Model B training entry
+├─ run_phased_loss.py # Multi-seed launcher + best-epoch summarizer
+├─ test.py            # Standalone evaluation
+├─ requirements.txt
+├─ LICENSE
+└─ README.md
+````
 
 ---
-
 
 ## 4) Environment & Requirements
 
 ### Install with `requirements.txt`
+
+
 
 ```bash
 # from the repo root (where requirements.txt lives)
