@@ -1,3 +1,6 @@
+# Model B config (TransReID-based, DeiT stride=12)
+# Author: Hang Zhang
+# Contact: kongkongercat@gmail.com
 ## [2025-10-21 | Hang Zhang] Removed LOSS.SUPCON.CAM_AWARE and POS_RULE from YAML.
 #                           These options are now correctly defaulted in defaults.py 
 #                           (CAM_AWARE=True, POS_RULE='class') to reflect actual behavior 

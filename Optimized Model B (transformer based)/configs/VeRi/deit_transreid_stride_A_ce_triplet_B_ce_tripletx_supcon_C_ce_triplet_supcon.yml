@@ -1,3 +1,7 @@
+# Model B config (TransReID-based, DeiT stride=12)
+# Author: Hang Zhang
+# Contact: kongkongercat@gmail.com
+
 # -------------------------------------------------------------------------
 # Model B (TransReID + DeiT stride) — Phased Loss Schedule
 #  A: CE + Triplet (0–40 epochs)

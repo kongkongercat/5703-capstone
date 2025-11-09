@@ -260,6 +260,35 @@ figs/*
 *.err
 # macOS system files
 *.DS_Store
+# ===== Tool/IDE caches =====
+.vscode/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== Experiment trackers & TB logs =====
+wandb/
+mlruns/
+runs/
+events.out.tfevents*
+
+# ===== HuggingFace / OpenCLIP / misc caches =====
+.cache/
+cache/
+huggingface/
+open_clip_cache/
+
+# ===== Colab / Jupyter side files =====
+.ipynb_checkpoints/
+*.ipynb~      
+
+# ===== Large numpy/tensors produced during eval=====
+logs/**/*.npy
+logs/**/*.npz
+
+# ===== Local env / OS =====
+*.pid
+.DS_Store        # 再保一遍无妨
 
 
 

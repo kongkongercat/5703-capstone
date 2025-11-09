@@ -1,3 +1,6 @@
+# Model B config (TransReID-based, DeiT stride=12)
+# Author: Hang Zhang
+# Contact: kongkongercat@gmail.com
 # -------------------------------------------------------------------------
 # Model B — CE + Triplet (bright) + TripletX (dark)
 # Brightness-aware training without SupCon.

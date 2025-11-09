@@ -17,7 +17,7 @@ MODEL:
   IF_LABELSMOOTH: 'off'
   IF_WITH_CENTER: 'no'
   ID_LOSS_WEIGHT: 1.0
-  TRIPLET_LOSS_WEIGHT: 1.0                           # ✅ Enable legacy Triplet branch
+  TRIPLET_LOSS_WEIGHT: 1.0                           # Enable legacy Triplet branch
 
 INPUT:
   SIZE_TRAIN: [256, 256]
@@ -88,4 +88,4 @@ LOSS:
     POS_RULE: 'class'
     FEAT_SRC: 'bnneck'
 
-OUTPUT_DIR: './logs/veri_transreid_ce_triplet_pk8'   # ✅ renamed
+OUTPUT_DIR: './logs/veri_transreid_ce_triplet_pk8'   # renamed

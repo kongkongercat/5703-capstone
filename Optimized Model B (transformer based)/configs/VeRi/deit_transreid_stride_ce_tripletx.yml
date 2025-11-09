@@ -1,3 +1,6 @@
+# Model B config (TransReID-based, DeiT stride=12)
+# Author: Hang Zhang
+# Contact: kongkongercat@gmail.com
 MODEL:
   PRETRAIN_CHOICE: 'imagenet'                        # Use ImageNet pretrained weights
   PRETRAIN_PATH: './pretrained/deit_base_distilled_patch16_224-df68dfff.pth'
