@@ -150,7 +150,7 @@ _C.LOSS.PHASED.BOUNDARIES = [30, 60]
 _C.LOSS.PHASED.METRIC_SEQ = ['triplet', 'triplet', 'triplet']
 _C.LOSS.PHASED.W_METRIC_SEQ = [1.0, 1.0, 1.0]
 _C.LOSS.PHASED.W_SUP_SPEC = ['const:0.30', 'linear:0.30->0.15', 'const:0.0']
-_C.LOSS.PHASED.TRIPLETX_END = 30
+_C.LOSS.PHASED.TRIPLETX_END = 9999
 
 # -----------------------------------------------------------------------------
 # INPUT / AUGMENTATION
