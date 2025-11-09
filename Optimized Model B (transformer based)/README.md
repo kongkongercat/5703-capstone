@@ -153,6 +153,29 @@ print("Torch:", torch.__version__,
 PY
 ```
 
+可以！我把表格做成**单列链接“[W][T]”**（W=权重，T=Test 日志），宽度几乎不变，依旧能一页横屏放下。你只需把 `URL_W` 和 `URL_T` 替换为真实地址。
+
+```md
+## Pretrained Weights (Model B · 256×256 · DeiT-B/16 · SIE+JPM)
+
+| ID | Recipe (简述) | P×K | k | Ep | mAP / R1 | Link |
+|----|---------------|-----|---|----|----------|------|
+| W1 | Brightness-aware: Triplet/TripletX + SupCon (pre-BN) | 8×8 | 5 | 120 | **83.5 / 97.6** | [W](https://drive.google.com/file/d/1AgF4-1Ciotqsrp5rrfHkH0RDo_KE2voQ/view?usp=drive_link) [T](https://drive.google.com/file/d/1qxJTsQ3wDWBUWohAVM9DszmQJ5-0Oxmo/view?usp=drive_link) |
+| W2 | Triplet + SupCon (no brightness routing) | 8×8 | 5 | 120 | **83.3 / 97.6** | [W](https://drive.google.com/file/d/1O2GevQnIKzMjpRdsRU3cuki0t3uBMjWG/view?usp=drive_link) [T](https://drive.google.com/file/d/1qAjPsq-RnBe_X-u6ZgLxKgUm38U3iHXu/view?usp=drive_link) |
+| W3 | Brightness-aware: Triplet/TripletX (no SupCon) | 8×8 | – | 120 | **82.8 / 97.6** | [W](https://drive.google.com/file/d/1c70TrqP9CZUy6_5N4ThC9XzeXhNmAGVp/view?usp=drive_link) [T](https://drive.google.com/file/d/1SQqInG-HM6GCXypb2HTw4yqU-3-JRTOn/view?usp=drive_link) |
+| W4 | Epoch-phased: A-Triplet → B-TripletX+SupCon → C-Triplet+SupCon | 8×8/8×4 | 5 | 120 | **82.8 / 97.1** | [W](https://drive.google.com/file/d/1clm3TtEFupoWGAfH21DpY8cczas-oaqX/view?usp=drive_link) [T](https://drive.google.com/file/d/1Mo9_oavAkyI6nX2EbTiT6KfTTocINGHb/view?usp=drive_link) |
+| W5 | OpenCLIP minimal fusion (CE + Triplet) | 8×4 | – | 120 | **82.7 / 97.0** | [W](https://drive.google.com/file/d/1PkHZ2cLmFMmmmNpORoWjlWg-ahlNH9ei/view?usp=drive_link) [T](https://drive.google.com/file/d/1BFUIm8Mw2u-Y0UUqUawn5sBqDBuP--Fw/view?usp=drive_link) |
+| B0 | Baseline (CE + Triplet) | 8×4 | – | 120 | ≈**82.7 / 97.3** | [W](https://drive.google.com/file/d/1Za2nVgo1S2euYf2A5pxqfnCQmZQu2dic/view?usp=drive_link) [T](https://drive.google.com/file/d/16vmUIw7x1u0V7NkDHgYKNn7R4CyNA-le/view?usp=drive_link) |
+```
+
+
+* W1 → `VeRi_DeiT-B16_256_BrightRoute-TX+SupCon_preBN_PK8x8_k5_E120_s0.pth`
+* W2 → `VeRi_DeiT-B16_256_Triplet+SupCon_noBright_preBN_PK8x8_k5_E120_s0.pth`
+* W3 → `VeRi_DeiT-B16_256_BrightRoute-TX_noSupCon_PK8x8_E120_s0.pth`
+* W4 → `VeRi_DeiT-B16_256_EpochPhased_A-T_B-TX+S_C-T+S_PK8x8-or-8x4_k5_E120_s0.pth`
+* W5 → `VeRi_DeiT-B16_256_OpenCLIP-MinFusion_CE+Triplet_PK8x4_E120_s0.pth`
+* B0 → `VeRi_DeiT-B16_256_Baseline_CE+Triplet_PK8x4_E120_s0.pth`
+
 
 ## 4.1 Quick Start (Generic Launcher)
 
